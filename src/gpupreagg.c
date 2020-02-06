@@ -3,8 +3,8 @@
  *
  * Aggregate Pre-processing with GPU acceleration
  * ----
- * Copyright 2011-2019 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2019 (C) The PG-Strom Development Team
+ * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2020 (C) The PG-Strom Development Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -4153,15 +4153,14 @@ ExecInitGpuPreAgg(CustomScanState *node, EState *estate, int eflags)
 											   &gpas->gts.css.ss.ps,
 											   outer_tupdesc);
 	/* Template of kds_slot */
-	length = KDS_calculateHeadSize(gpreagg_tupdesc, false);
+	length = KDS_calculateHeadSize(gpreagg_tupdesc);
 	gpas->kds_slot_head = MemoryContextAllocZero(CurTransactionContext,
 												 length);
 	init_kernel_data_store(gpas->kds_slot_head,
 						   gpreagg_tupdesc,
 						   INT_MAX,		/* to be set individually */
 						   KDS_FORMAT_SLOT,
-						   INT_MAX,		/* to be set individually */
-						   false);
+						   INT_MAX);	/* to be set individually */
 
 	/* Save the plan-time estimations */
 	gpas->plan_nrows_per_chunk =

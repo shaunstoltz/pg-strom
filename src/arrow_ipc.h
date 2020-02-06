@@ -3,8 +3,8 @@
  *
  * Definitions for Apache Arrow IPC stuff.
  * ----
- * Copyright 2011-2019 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2019 (C) The PG-Strom Development Team
+ * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2020 (C) The PG-Strom Development Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -27,12 +27,15 @@
 
 #include "arrow_defs.h"
 
-#define	ARROWALIGN(LEN)		TYPEALIGN(64, (LEN))
+#define	ARROWALIGN(LEN)			TYPEALIGN(64, (LEN))
 
 typedef struct SQLbuffer		SQLbuffer;
 typedef struct SQLtable			SQLtable;
-typedef struct SQLattribute		SQLattribute;
+typedef struct SQLfield			SQLfield;
 typedef struct SQLdictionary	SQLdictionary;
+typedef union  SQLtype			SQLtype;
+typedef struct SQLtype__pgsql	SQLtype__pgsql;
+typedef struct SQLtype__mysql	SQLtype__mysql;
 
 struct SQLbuffer
 {
@@ -41,41 +44,58 @@ struct SQLbuffer
 	uint32		length;
 };
 
-struct SQLattribute
+struct SQLtype__pgsql
 {
-	char	   *attname;
-	Oid			atttypid;
-	int			atttypmod;
-	short		attlen;
-	bool		attbyval;
-	uint8		attalign;		/* 1, 2, 4 or 8 */
-	SQLattribute *element;		/* valid, if array type */
+	Oid			typeid;
+	int			typmod;
+	const char *typname;
+	const char *typnamespace;
+	short		typlen;
+	bool		typbyval;
+	char		typtype;
+	uint8		typalign;
+};
+
+struct SQLtype__mysql
+{
+	const char *typname;
+};
+
+union SQLtype
+{
+	SQLtype__pgsql	pgsql;
+	SQLtype__mysql	mysql;
+};
+
+struct SQLfield
+{
+	char	   *field_name;		/* name of the column, element or sub-field */
+	SQLtype		sql_type;		/* attributes of SQL type */
+	SQLfield   *element;		/* valid, if array type */
 	int			nfields;		/* # of sub-fields of composite type */
-	SQLattribute *subfields;	/* valid, if composite type */
+	SQLfield   *subfields;	/* valid, if composite type */
 	SQLdictionary *enumdict;	/* valid, if enum type */
-	const char *typnamespace;	/* name of pg_type.typnamespace */
-	const char *typname;		/* pg_type.typname */
-	char		typtype;		/* pg_type.typtype */
+
 	ArrowType	arrow_type;		/* type in apache arrow */
 	const char *arrow_typename;	/* typename in apache arrow */
-	/* data buffer and handlers */
-	void   (*put_value)(SQLattribute *attr,
-						const char *addr, int sz);
-	size_t (*buffer_usage)(SQLattribute *attr);
-	int	   (*setup_buffer)(SQLattribute *attr,
-						   ArrowBuffer *node,
-						   size_t *p_offset);
-	void   (*write_buffer)(SQLattribute *attr, int fdesc);
-
+	/* data save as Apache Arrow datum */
+	size_t	(*put_value)(SQLfield *attr, const char *addr, int sz);
+	/* data buffers of the field */
 	long		nitems;			/* number of rows */
 	long		nullcount;		/* number of null values */
 	SQLbuffer	nullmap;		/* null bitmap */
 	SQLbuffer	values;			/* main storage of values */
 	SQLbuffer	extra;			/* extra buffer for varlena */
+	size_t		__curr_usage__;	/* current buffer usage */
 	/* custom metadata(optional) */
 	ArrowKeyValue *customMetadata;
 	int			numCustomMetadata;
 };
+static inline size_t
+sql_field_put_value(SQLfield *column, const char *addr, int sz)
+{
+	return (column->__curr_usage__ = column->put_value(column, addr, sz));
+}
 
 struct SQLtable
 {
@@ -91,9 +111,9 @@ struct SQLtable
 	int			numCustomMetadata;
 	SQLdictionary *sql_dict_list; /* list of SQLdictionary */
 	size_t		segment_sz;		/* threshold of the memory usage */
-	size_t		nitems;			/* current number of rows */
+	size_t		nitems;			/* number of items */
 	int			nfields;		/* number of attributes */
-	SQLattribute attrs[FLEXIBLE_ARRAY_MEMBER];
+	SQLfield columns[FLEXIBLE_ARRAY_MEMBER];
 };
 
 typedef struct hashItem		hashItem;
@@ -122,20 +142,34 @@ struct SQLdictionary
 /* arrow_write.c */
 extern ssize_t	writeArrowSchema(SQLtable *table);
 extern void		writeArrowDictionaryBatches(SQLtable *table);
-extern void		writeArrowRecordBatch(SQLtable *table);
+extern int		writeArrowRecordBatch(SQLtable *table);
 extern ssize_t	writeArrowFooter(SQLtable *table);
-
+extern size_t	estimateArrowBufferLength(SQLfield *column, size_t nitems);
 
 /* arrow_nodes.c */
-extern int		assignArrowType(SQLattribute *attr);
 extern void		__initArrowNode(ArrowNode *node, ArrowNodeTag tag);
 #define initArrowNode(PTR,NAME)					\
 	__initArrowNode((ArrowNode *)(PTR),ArrowNodeTag__##NAME)
-extern void		readArrowFileDesc(int fdesc, ArrowFileInfo *af_info);
 extern char	   *dumpArrowNode(ArrowNode *node);
+extern void		copyArrowNode(ArrowNode *dest, const ArrowNode *src);
+extern void		readArrowFileDesc(int fdesc, ArrowFileInfo *af_info);
+extern char	   *arrowTypeName(ArrowField *field);
 
+/* arrow_pgsql.c */
+extern int		assignArrowTypePgSQL(SQLfield *column,
+									 const char *field_name,
+									 Oid typeid,
+									 int typmod,
+									 const char *typname,
+									 const char *typnamespace,
+									 short typlen,
+									 bool typbyval,
+									 char typtype,
+									 char typalign,
+									 Oid typrelid,
+									 Oid typelem);
 /*
- * Error message and exit
+ * Error messages, and misc definitions for pg2arrow
  */
 #ifndef __PG2ARROW__
 #define Elog(fmt, ...)		elog(ERROR,(fmt),##__VA_ARGS__)
@@ -147,6 +181,7 @@ extern char	   *dumpArrowNode(ArrowNode *node);
 		exit(1);									\
 	} while(0)
 #endif
+
 /*
  * SQLbuffer related routines
  */
@@ -168,26 +203,25 @@ sql_buffer_expand(SQLbuffer *buf, size_t required)
 
 		if (buf->data == NULL)
 		{
-			length = (1UL << 21);	/* start from 2MB */
+			length = (1UL << 20);	/* start from 1MB */
 			while (length < required)
 				length *= 2;
-			data = mmap(NULL, length, PROT_READ | PROT_WRITE,
-						MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-			if (data == MAP_FAILED)
-				Elog("failed on mmap(len=%zu): %m", length);
+			data = palloc(length);
+			if (!data)
+				Elog("palloc: out of memory (sz=%zu)", length);
 			buf->data   = data;
 			buf->usage  = 0;
 			buf->length = length;
 		}
 		else
 		{
-			length = 2 * buf->length;
+			length = buf->length;
 			while (length < required)
 				length *= 2;
-			data = mremap(buf->data, buf->length, length, MREMAP_MAYMOVE);
-			if (data == MAP_FAILED)
-				Elog("failed on mremap(len=%zu): %m", length);
-			buf->data   = data;
+			data = repalloc(buf->data, length);
+			if (!data)
+				Elog("repalloc: out of memory (sz=%zu)", length);
+			buf->data = data;
 			buf->length = length;
 		}
 	}
@@ -295,10 +329,6 @@ sql_buffer_write(int fdesc, SQLbuffer *buf)
 /*
  * Misc functions
  */
-extern void initStringInfo(StringInfo buf);
-extern void resetStringInfo(StringInfo buf);
-extern void appendStringInfo(StringInfo buf,
-							 const char *fmt,...) pg_attribute_printf(2, 3);
 extern Datum hash_any(const unsigned char *k, int keylen);
 
 #endif	/* ARROW_IPC_H */

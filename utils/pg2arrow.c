@@ -9,14 +9,8 @@
 #include "postgres.h"
 #include <assert.h>
 #include <getopt.h>
-
 #include <libpq-fe.h>
-
-typedef struct SQLbuffer		StringInfoData;
-typedef struct SQLbuffer	   *StringInfo;
-
 #include "arrow_ipc.h"
-//#include "arrow_nodes.c"
 
 /* static functions */
 #define CURSOR_NAME		"curr_pg2arrow"
@@ -25,13 +19,13 @@ static PGresult *pgsql_next_result(PGconn *conn);
 static void      pgsql_end_query(PGconn *conn);
 static void      pgsql_setup_composite_type(PGconn *conn,
 											SQLtable *root,
-											SQLattribute *attr,
+											SQLfield *attr,
 											Oid comptype_relid,
 											int *p_numFieldNodes,
 											int *p_numBuffers);
 static void      pgsql_setup_array_element(PGconn *conn,
 										   SQLtable *root,
-										   SQLattribute *attr,
+										   SQLfield *attr,
 										   Oid array_elemid,
 										   int *p_numFieldNode,
 										   int *p_numBuffers);
@@ -563,7 +557,7 @@ pgsql_duplicate_dictionary(SQLtable *root,
 static void
 pgsql_setup_attribute(PGconn *conn,
 					  SQLtable *root,
-					  SQLattribute *attr,
+					  SQLfield *column,
 					  const char *attname,
 					  Oid atttypid,
 					  int atttypmod,
@@ -571,58 +565,45 @@ pgsql_setup_attribute(PGconn *conn,
 					  char attbyval,
 					  char attalign,
 					  char typtype,
-					  Oid comp_typrelid,
-					  Oid array_elemid,
+					  Oid typrelid,		/* valid, if composite type */
+					  Oid typelemid,	/* valid, if array type */
 					  const char *nspname,
 					  const char *typname,
 					  int *p_numFieldNodes,
 					  int *p_numBuffers)
 {
-	attr->attname   = pstrdup(attname);
-	attr->atttypid  = atttypid;
-	attr->atttypmod = atttypmod;
-	attr->attlen    = attlen;
-	attr->attbyval  = attbyval;
-
-	if (attalign == 'c')
-		attr->attalign = sizeof(char);
-	else if (attalign == 's')
-		attr->attalign = sizeof(short);
-	else if (attalign == 'i')
-		attr->attalign = sizeof(int);
-	else if (attalign == 'd')
-		attr->attalign = sizeof(double);
-	else
-		Elog("unknown state of attalign: %c", attalign);
-
-	attr->typnamespace = pstrdup(nspname);
-	attr->typname = pstrdup(typname);
-	attr->typtype = typtype;
-	if (typtype == 'b')
+	*p_numFieldNodes += 1;
+	*p_numBuffers += assignArrowTypePgSQL(column,
+										  attname,
+										  atttypid,
+										  atttypmod,
+										  typname,
+										  nspname,
+										  attlen,
+										  attbyval,
+										  typtype,
+										  attalign,
+										  typrelid,
+										  typelemid);
+	if (typrelid != InvalidOid)
 	{
-		if (array_elemid != InvalidOid)
-			pgsql_setup_array_element(conn, root, attr,
-									  array_elemid,
-									  p_numFieldNodes,
-									  p_numBuffers);
-	}
-	else if (typtype == 'c')
-	{
-		pgsql_setup_composite_type(conn, root, attr,
-								   comp_typrelid,
+		assert(typtype == 'c');
+		pgsql_setup_composite_type(conn, root, column,
+								   typrelid,
 								   p_numFieldNodes,
 								   p_numBuffers);
 	}
+	else if (typelemid != InvalidOid)
+	{
+		pgsql_setup_array_element(conn, root, column,
+								  typelemid,
+								  p_numFieldNodes,
+								  p_numBuffers);
+	}
 	else if (typtype == 'e')
 	{
-		attr->enumdict = pgsql_create_dictionary(conn, root, atttypid);
+		column->enumdict = pgsql_create_dictionary(conn, root, atttypid);
 	}
-	else
-		Elog("unknown state pf typtype: %c", typtype);
-
-	/* assign properties of Apache Arrow Type */
-	*p_numBuffers += assignArrowType(attr);
-	*p_numFieldNodes += 1;
 }
 
 /*
@@ -631,13 +612,13 @@ pgsql_setup_attribute(PGconn *conn,
 static void
 pgsql_setup_composite_type(PGconn *conn,
 						   SQLtable *root,
-						   SQLattribute *attr,
+						   SQLfield *attr,
 						   Oid comptype_relid,
 						   int *p_numFieldNodes,
 						   int *p_numBuffers)						   
 {
 	PGresult   *res;
-	SQLattribute *subfields;
+	SQLfield *subfields;
 	char		query[4096];
 	int			j, nfields;
 
@@ -657,7 +638,7 @@ pgsql_setup_composite_type(PGconn *conn,
 			 PQresultErrorMessage(res));
 
 	nfields = PQntuples(res);
-	subfields = palloc0(sizeof(SQLattribute) * nfields);
+	subfields = palloc0(sizeof(SQLfield) * nfields);
 	for (j=0; j < nfields; j++)
 	{
 		const char *attname   = PQgetvalue(res, j, 0);
@@ -688,7 +669,8 @@ pgsql_setup_composite_type(PGconn *conn,
 							  pg_strtochar(typtype),
 							  atooid(typrelid),
 							  atooid(typelem),
-							  nspname, typname,
+							  nspname,
+							  typname,
 							  p_numFieldNodes,
 							  p_numBuffers);
 	}
@@ -699,12 +681,12 @@ pgsql_setup_composite_type(PGconn *conn,
 static void
 pgsql_setup_array_element(PGconn *conn,
 						  SQLtable *root,
-						  SQLattribute *attr,
-						  Oid array_elemid,
+						  SQLfield *attr,
+						  Oid typelemid,
 						  int *p_numFieldNode,
 						  int *p_numBuffers)
 {
-	SQLattribute   *element = palloc0(sizeof(SQLattribute));
+	SQLfield	   *element = palloc0(sizeof(SQLfield));
 	PGresult	   *res;
 	char			query[4096];
 	const char     *nspname;
@@ -723,7 +705,7 @@ pgsql_setup_array_element(PGconn *conn,
 			 "  FROM pg_catalog.pg_type t,"
 			 "       pg_catalog.pg_namespace n"
 			 " WHERE t.typnamespace = n.oid"
-			 "   AND t.oid = %u", array_elemid);
+			 "   AND t.oid = %u", typelemid);
 	res = PQexec(conn, query);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		Elog("failed on pg_type system catalog query: %s",
@@ -743,7 +725,7 @@ pgsql_setup_array_element(PGconn *conn,
 						  root,
 						  element,
 						  typname,
-						  array_elemid,
+						  typelemid,
 						  -1,
 						  atoi(typlen),
 						  pg_strtobool(typbyval),
@@ -770,7 +752,7 @@ pgsql_create_buffer(PGconn *conn, PGresult *res,
 	SQLtable   *table;
 	ArrowKeyValue *kv;
 
-	table = palloc0(offsetof(SQLtable, attrs[nfields]));
+	table = palloc0(offsetof(SQLtable, columns[nfields]));
 	table->segment_sz = segment_sz;
 	table->nitems = 0;
 	table->nfields = nfields;
@@ -813,7 +795,7 @@ pgsql_create_buffer(PGconn *conn, PGresult *res,
 		typname  = PQgetvalue(__res, 0, 7);
 		pgsql_setup_attribute(conn,
 							  table,
-							  &table->attrs[j],
+							  &table->columns[j],
                               attname,
 							  atttypid,
 							  atttypmod,
@@ -823,7 +805,8 @@ pgsql_create_buffer(PGconn *conn, PGresult *res,
 							  *typtype,
 							  atoi(typrelid),
 							  atoi(typelem),
-							  nspname, typname,
+							  nspname,
+							  typname,
 							  &table->numFieldNodes,
 							  &table->numBuffers);
 		PQclear(__res);
@@ -845,7 +828,7 @@ pgsql_create_buffer(PGconn *conn, PGresult *res,
 
 static int
 __arrow_type_is_compatible(SQLtable *root,
-						   SQLattribute *attr,
+						   SQLfield *attr,
 						   ArrowField *field)
 {
 	ArrowType  *sql_type = &attr->arrow_type;
@@ -972,7 +955,7 @@ initial_setup_append_file(SQLtable *table)
 	for (i=0; i < table->nfields; i++)
 	{
 		if (!__arrow_type_is_compatible(table,
-										table->attrs + i,
+										&table->columns[i],
 										af_schema->fields + i))
 			Elog("--append is given, but attribute %d is not compatible", i+1);
 	}
@@ -1015,7 +998,7 @@ pgsql_writeout_buffer(SQLtable *table)
 {
 	size_t		nitems = table->nitems;
 
-	if (nitems == 0)
+	if (table->nitems == 0)
 		return;
 
 	writeArrowRecordBatch(table);
@@ -1043,18 +1026,19 @@ pgsql_writeout_buffer(SQLtable *table)
 void
 pgsql_append_results(SQLtable *table, PGresult *res)
 {
+	SQLfield *columns = table->columns;
 	int		i, ntuples = PQntuples(res);
 	int		j, nfields = PQnfields(res);
-	size_t	usage;
 
-	assert(nfields == table->nfields);
+	assert(table->nfields == nfields);
 	for (i=0; i < ntuples; i++)
 	{
-		usage = 0;
+		size_t	usage = 0;
+		size_t	nitems = columns[0].nitems;
 
 		for (j=0; j < nfields; j++)
 		{
-			SQLattribute   *attr = &table->attrs[j];
+			SQLfield   *column = &columns[j];
 			const char	   *addr;
 			size_t			sz;
 			/* data must be binary format */
@@ -1069,15 +1053,14 @@ pgsql_append_results(SQLtable *table, PGresult *res)
 				addr = PQgetvalue(res, i, j);
 				sz = PQgetlength(res, i, j);
 			}
-			assert(attr->nitems == table->nitems);
-			attr->put_value(attr, addr, sz);
-			usage += attr->buffer_usage(attr);
+			assert(column->nitems == nitems);
+			usage += sql_field_put_value(column, addr, sz);
 		}
 		table->nitems++;
 		/* exceeds the threshold to write? */
 		if (usage > table->segment_sz)
 		{
-			if (table->nitems == 0)
+			if (nitems == 0)
 				Elog("A result row is larger than size of record batch!!");
 			pgsql_writeout_buffer(table);
 		}
@@ -1088,7 +1071,7 @@ pgsql_append_results(SQLtable *table, PGresult *res)
  * pgsql_dump_attribute
  */
 static void
-pgsql_dump_attribute(SQLattribute *attr, const char *label, int indent)
+pgsql_dump_attribute(SQLfield *column, const char *label, int indent)
 {
 	int		j;
 
@@ -1097,28 +1080,28 @@ pgsql_dump_attribute(SQLattribute *attr, const char *label, int indent)
 	printf("%s {attname='%s', atttypid=%u, atttypmod=%d, attlen=%d,"
 		   " attbyval=%s, attalign=%d, typtype=%c, arrow_type=%s}\n",
 		   label,
-		   attr->attname,
-		   attr->atttypid,
-		   attr->atttypmod,
-		   attr->attlen,
-		   attr->attbyval ? "true" : "false",
-		   attr->attalign,
-		   attr->typtype,
-		   attr->arrow_typename);
+		   column->field_name,
+		   column->sql_type.pgsql.typeid,
+		   column->sql_type.pgsql.typmod,
+		   column->sql_type.pgsql.typlen,
+		   column->sql_type.pgsql.typbyval ? "true" : "false",
+		   column->sql_type.pgsql.typalign,
+		   column->sql_type.pgsql.typtype,
+		   column->arrow_typename);
 
-	if (attr->typtype == 'b')
+	if (column->sql_type.pgsql.typtype == 'b')
 	{
-		if (attr->element)
-			pgsql_dump_attribute(attr->element, "element", indent+2);
+		if (column->element)
+			pgsql_dump_attribute(column->element, "element", indent+2);
 	}
-	else if (attr->typtype == 'c')
+	else if (column->sql_type.pgsql.typtype == 'c')
 	{
 		char		label[64];
 
-		for (j=0; j < attr->nfields; j++)
+		for (j=0; j < column->nfields; j++)
 		{
 			snprintf(label, sizeof(label), "subfields[%d]", j);
-			pgsql_dump_attribute(&attr->subfields[j], label, indent+2);
+			pgsql_dump_attribute(&column->subfields[j], label, indent+2);
 		}
 	}
 }
@@ -1129,8 +1112,8 @@ pgsql_dump_attribute(SQLattribute *attr, const char *label, int indent)
 void
 pgsql_dump_buffer(SQLtable *table)
 {
-	int		j;
 	char	label[64];
+	int		j;
 
 	printf("Dump of SQL buffer:\n"
 		   "nfields: %d\n"
@@ -1140,7 +1123,7 @@ pgsql_dump_buffer(SQLtable *table)
 	for (j=0; j < table->nfields; j++)
 	{
 		snprintf(label, sizeof(label), "attr[%d]", j);
-		pgsql_dump_attribute(&table->attrs[j], label, 0);
+		pgsql_dump_attribute(&table->columns[j], label, 0);
 	}
 }
 
@@ -1206,7 +1189,6 @@ int main(int argc, char * const argv[])
 			Elog("failed on write(2): %m");
 		nbytes = writeArrowSchema(table);
 	}
-	//pgsql_dump_buffer(table);
 	writeArrowDictionaryBatches(table);
 	do {
 		pgsql_append_results(table, res);
@@ -1218,46 +1200,6 @@ int main(int argc, char * const argv[])
 	nbytes = writeArrowFooter(table);
 
 	return 0;
-}
-
-/*
- * Misc server functions
- */
-void
-initStringInfo(StringInfo buf)
-{
-	sql_buffer_init(buf);
-}
-
-void
-resetStringInfo(StringInfo buf)
-{
-	buf->usage = 0;
-}
-
-void
-appendStringInfo(StringInfo buf, const char *fmt,...)
-{
-	if (!buf->data)
-		sql_buffer_expand(buf, 0);
-	for (;;)
-	{
-		char	   *pos = buf->data + buf->usage;
-		size_t		len = buf->length - buf->usage;
-		int			nbytes;
-		va_list		args;
-
-		va_start(args, fmt);
-		nbytes = vsnprintf(pos, len, fmt, args);
-		va_end(args);
-
-		if (nbytes < len)
-		{
-			buf->usage += nbytes;
-			break;
-		}
-		sql_buffer_expand(buf, 2 * nbytes + 1024);
-	}
 }
 
 /*

@@ -3,8 +3,8 @@
  *
  * Routines for CUDA code generator
  * ----
- * Copyright 2011-2019 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2019 (C) The PG-Strom Development Team
+ * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2020 (C) The PG-Strom Development Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -538,7 +538,7 @@ pg_numeric_devtype_hashfunc(devtype_info *dtype, Datum datum)
 			 DatumGetCString(DirectFunctionCall1(numeric_out, datum)));
 
 	return hash_any((cl_uchar *)&temp.value,
-					offsetof(pg_numeric_t, precision) + sizeof(cl_short));
+					offsetof(pg_numeric_t, weight) + sizeof(cl_short));
 }
 
 static cl_uint

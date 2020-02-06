@@ -82,6 +82,7 @@
 #include "lib/stringinfo.h"
 #include "libpq/be-fsstubs.h"
 #include "libpq/libpq-fs.h"
+#include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "nodes/extensible.h"
@@ -182,6 +183,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <float.h>
+#include <libgen.h>
 #include <limits.h>
 #include <math.h>
 #include <sys/ioctl.h>
@@ -658,6 +660,13 @@ extern CUresult gpuOptimalBlockSize(int *p_grid_sz,
 									size_t dyn_shmem_per_block,
 									size_t dyn_shmem_per_thread);
 /*
+ * shmbuf.c
+ */
+extern MemoryContext	SharedMemoryContextCreate(const char *name);
+extern void				pgstrom_init_shmbuf(void);
+extern MemoryContext	TopSharedMemoryContext;
+
+/*
  * gpu_mmgr.c
  */
 extern CUresult __gpuMemAllocRaw(GpuContext *gcontext,
@@ -980,7 +989,7 @@ extern void pgstrom_init_gputasks(void);
  */
 extern Size	nvme_strom_threshold(void);
 extern int	nvme_strom_ioctl(int cmd, void *arg);
-extern int	GetOptimalGpuForFile(const char *fname, File fdesc);
+extern int	GetOptimalGpuForFile(File fdesc);
 extern int	GetOptimalGpuForRelation(PlannerInfo *root,
 									 RelOptInfo *rel);
 extern bool ScanPathWillUseNvmeStrom(PlannerInfo *root,
@@ -1103,21 +1112,13 @@ extern pgstrom_data_store *__PDS_clone(pgstrom_data_store *pds,
 extern pgstrom_data_store *PDS_retain(pgstrom_data_store *pds);
 extern void PDS_release(pgstrom_data_store *pds);
 
-extern size_t	KDS_calculateHeadSize(TupleDesc tupdesc, bool has_attnames);
-#if 0
-extern size_t	KDS_calculateRowSize(TupleDesc tupdesc,
-									 size_t nitems, size_t dataLen);
-extern size_t	KDS_calculateHashSize(TupleDesc tupdesc,
-									  size_t nitems, size_t dataLen);
-extern size_t	KDS_calculateSlotSz(TupleDesc tupdesc,
-									size_t nitems);
-#endif
+extern size_t	KDS_calculateHeadSize(TupleDesc tupdesc);
+
 extern void init_kernel_data_store(kern_data_store *kds,
 								   TupleDesc tupdesc,
 								   Size length,
 								   int format,
-								   uint nrooms,
-								   bool has_attnames);
+								   uint nrooms);
 
 extern pgstrom_data_store *__PDS_create_row(GpuContext *gcontext,
 											TupleDesc tupdesc,
@@ -1391,11 +1392,6 @@ extern GstoreIpcHandle *__pgstrom_gstore_export_ipchandle(Oid ftable_oid);
 extern bool baseRelIsArrowFdw(RelOptInfo *baserel);
 extern cl_int GetOptimalGpuForArrowFdw(PlannerInfo *root,
 									   RelOptInfo *baserel);
-
-extern void readArrowFileDesc(int fdesc, ArrowFileInfo *af_info);
-extern char *dumpArrowNode(ArrowNode *node);
-extern void copyArrowNode(ArrowNode *dest, const ArrowNode *src);
-extern char *arrowTypeName(ArrowField *field);
 extern bool KDS_fetch_tuple_arrow(TupleTableSlot *slot,
 								  kern_data_store *kds,
 								  size_t row_index);
@@ -1807,6 +1803,55 @@ pmemdup(const void *src, Size sz)
 	memcpy(dst, src, sz);
 
 	return dst;
+}
+
+
+/*
+ * Simple wrapper for read(2) and write(2) to ensure full-buffer read and
+ * write, regardless of i/o-size and signal interrupts.
+ */
+static inline ssize_t
+__read(int fdesc, void *buffer, size_t nbytes)
+{
+	ssize_t		rv, count = 0;
+	do {
+		rv = read(fdesc, (char *)buffer + count, nbytes - count);
+		if (rv <= 0)
+		{
+			if (errno == EINTR)
+			{
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+			return -1;
+		}
+		else if (rv == 0)
+			break;
+		count += rv;
+	} while (count < nbytes);
+	return count;
+}
+
+static inline ssize_t
+__write(int fdesc, const void *buffer, size_t nbytes)
+{
+	ssize_t		rv, count = 0;
+	do {
+		rv = write(fdesc, (const char *)buffer + count, nbytes - count);
+		if (rv <= 0)
+		{
+			if (errno == EINTR)
+			{
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+			return -1;
+		}
+		else if (rv == 0)
+			break;
+		count += rv;
+	} while (count < nbytes);
+	return count;
 }
 
 /*

@@ -8,10 +8,6 @@
  */
 #include "postgres.h"
 #include <assert.h>
-
-typedef struct SQLbuffer		StringInfoData;
-typedef struct SQLbuffer	   *StringInfo;
-
 #include "arrow_ipc.h"
 
 typedef struct
@@ -895,14 +891,15 @@ writeFlatBufferFooter(int fdesc, ArrowFooter *footer)
 
 static void
 setupArrowDictionaryEncoding(ArrowDictionaryEncoding *dict,
-							 SQLattribute *attr)
+							 SQLfield *column)
 {
 	initArrowNode(dict, DictionaryEncoding);
-	if (attr->enumdict)
+	if (column->enumdict)
 	{
+		SQLdictionary  *enumdict = column->enumdict;
 		ArrowTypeInt   *indexType = &dict->indexType;
 
-		dict->id = attr->enumdict->dict_id;
+		dict->id = enumdict->dict_id;
 		/* dictionary index must be Int32 */
 		initArrowNode(indexType, Int);
 		indexType->bitWidth  = 32;
@@ -912,34 +909,34 @@ setupArrowDictionaryEncoding(ArrowDictionaryEncoding *dict,
 }
 
 static void
-setupArrowField(ArrowField *field, SQLattribute *attr)
+setupArrowField(ArrowField *field, SQLfield *column)
 {
 	initArrowNode(field, Field);
-	field->name = attr->attname;
-	field->_name_len = strlen(attr->attname);
+	field->name = column->field_name;
+	field->_name_len = strlen(column->field_name);
 	field->nullable = true;
-	field->type = attr->arrow_type;
-	setupArrowDictionaryEncoding(&field->dictionary, attr);
+	field->type = column->arrow_type;
+	setupArrowDictionaryEncoding(&field->dictionary, column);
 	/* array type */
-	if (attr->element)
+	if (column->element)
 	{
 		field->children = palloc0(sizeof(ArrowField));
 		field->_num_children = 1;
-		setupArrowField(field->children, attr->element);
+		setupArrowField(field->children, column->element);
 	}
 	/* composite type */
-	if (attr->subfields)
+	if (column->subfields)
 	{
 		int		j;
 
-		field->children = palloc0(sizeof(ArrowField) * attr->nfields);
-		field->_num_children = attr->nfields;
-		for (j=0; j < attr->nfields; j++)
-			setupArrowField(&field->children[j], &attr->subfields[j]);
+		field->children = palloc0(sizeof(ArrowField) * column->nfields);
+		field->_num_children = column->nfields;
+		for (j=0; j < column->nfields; j++)
+			setupArrowField(&field->children[j], &column->subfields[j]);
 	}
 	/* custom metadata, if any */
-	field->_num_custom_metadata = attr->numCustomMetadata;
-	field->custom_metadata = attr->customMetadata;
+	field->_num_custom_metadata = column->numCustomMetadata;
+	field->custom_metadata = column->customMetadata;
 }
 
 ssize_t
@@ -958,7 +955,7 @@ writeArrowSchema(SQLtable *table)
 	schema->fields = alloca(sizeof(ArrowField) * table->nfields);
 	schema->_num_fields = table->nfields;
 	for (i=0; i < table->nfields; i++)
-		setupArrowField(&schema->fields[i], &table->attrs[i]);
+		setupArrowField(&schema->fields[i], &table->columns[i]);
 	schema->custom_metadata = table->customMetadata;
 	schema->_num_custom_metadata = table->numCustomMetadata;
 	/* serialization */
@@ -1063,53 +1060,325 @@ writeArrowDictionaryBatches(SQLtable *table)
 }
 
 /*
- * reset_sql_attribute
- */
-static void
-reset_sql_attribute(SQLattribute *attr)
-{
-	attr->nitems = 0;
-	attr->nullcount = 0;
-	sql_buffer_clear(&attr->nullmap);
-	sql_buffer_clear(&attr->values);
-	sql_buffer_clear(&attr->extra);
-
-	if (attr->subfields)
-	{
-		int		j;
-
-		for (j=0; j < attr->nfields; j++)
-			reset_sql_attribute(&attr->subfields[j]);
-	}
-	if (attr->element)
-		reset_sql_attribute(attr->element);
-}
-
-/*
  * setupArrowFieldNode
  */
 static int
-setupArrowFieldNode(ArrowFieldNode *fnode, SQLattribute *attr)
+setupArrowFieldNode(ArrowFieldNode *fnode, SQLfield *column)
 {
-	SQLattribute *element = attr->element;
+	SQLfield   *element = column->element;
 	int			j, count = 1;
 
 	initArrowNode(fnode, FieldNode);
-	fnode->length = attr->nitems;
-	fnode->null_count = attr->nullcount;
+	fnode->length = column->nitems;
+	fnode->null_count = column->nullcount;
 	/* array types */
 	if (element)
 		count += setupArrowFieldNode(fnode + count, element);
 	/* composite types */
-	if (attr->subfields)
+	if (column->subfields)
 	{
-		for (j=0; j < attr->nfields; j++)
-			count += setupArrowFieldNode(fnode + count, &attr->subfields[j]);
+		for (j=0; j < column->nfields; j++)
+			count += setupArrowFieldNode(fnode + count, &column->subfields[j]);
 	}
 	return count;
 }
 
-void
+/*
+ * setupArrowBuffer
+ */
+static inline size_t
+__setup_arrow_buffer(ArrowBuffer *bnode, size_t offset, size_t length)
+{
+	initArrowNode(bnode, Buffer);
+	bnode->offset = offset;
+	bnode->length = ARROWALIGN(length);
+
+	return bnode->length;
+}
+
+static int
+setupArrowBuffer(ArrowBuffer *bnode, SQLfield *column, size_t *p_offset)
+{
+	size_t		offset = *p_offset;
+	int			j, retval = -1;
+
+	if (column->enumdict)
+	{
+		/* Enum data types */
+		assert(column->arrow_type.node.tag == ArrowNodeTag__Utf8);
+		/* nullmap */
+		if (column->nullcount == 0)
+			offset += __setup_arrow_buffer(bnode, offset, 0);
+		else
+			offset += __setup_arrow_buffer(bnode, offset,
+										   column->nullmap.usage);
+		/* dictionary indexes (int32) */
+		offset += __setup_arrow_buffer(bnode+1, offset,
+									   column->values.usage);
+		retval = 2;
+	}
+	else if (column->element)
+	{
+		/* Array data types */
+		retval = 2;
+		assert(column->arrow_type.node.tag == ArrowNodeTag__List ||
+			   column->arrow_type.node.tag == ArrowNodeTag__LargeList);
+		/* nullmap */
+		if (column->nullcount == 0)
+			offset += __setup_arrow_buffer(bnode, offset, 0);
+		else
+			offset += __setup_arrow_buffer(bnode, offset,
+										   column->nullmap.usage);
+		/* array index values */
+		offset += __setup_arrow_buffer(bnode+1, offset,
+									   column->values.usage);
+		retval += setupArrowBuffer(bnode+2, column->element, &offset);
+	}
+	else if (column->subfields)
+	{
+		/* Composite data types */
+		retval = 1;
+		assert(column->arrow_type.node.tag == ArrowNodeTag__Struct);
+		/* nullmap */
+		if (column->nullcount == 0)
+			offset += __setup_arrow_buffer(bnode, offset, 0);
+		else
+			offset += __setup_arrow_buffer(bnode, offset,
+										   column->nullmap.usage);
+		/* for each sub-fields */
+		for (j=0; j < column->nfields; j++)
+			retval += setupArrowBuffer(bnode + retval,
+									   &column->subfields[j],
+									   &offset);
+	}
+	else
+	{
+		switch (column->arrow_type.node.tag)
+		{
+			/* inline type */
+			case ArrowNodeTag__Int:
+			case ArrowNodeTag__FloatingPoint:
+			case ArrowNodeTag__Bool:
+			case ArrowNodeTag__Decimal:
+			case ArrowNodeTag__Date:
+			case ArrowNodeTag__Time:
+			case ArrowNodeTag__Timestamp:
+			case ArrowNodeTag__Interval:
+			case ArrowNodeTag__FixedSizeBinary:
+				retval = 2;
+				/* nullmap */
+				if (column->nullcount == 0)
+					offset += __setup_arrow_buffer(bnode, offset, 0);
+				else
+					offset += __setup_arrow_buffer(bnode, offset,
+												   column->nullmap.usage);
+				/* inline values */
+				offset += __setup_arrow_buffer(bnode+1, offset,
+											   column->values.usage);
+				break;
+
+			/* variable length type */
+			case ArrowNodeTag__Utf8:
+			case ArrowNodeTag__Binary:
+			case ArrowNodeTag__LargeUtf8:
+			case ArrowNodeTag__LargeBinary:
+				retval = 3;
+				/* nullmap */
+				if (column->nullcount == 0)
+					offset += __setup_arrow_buffer(bnode, offset, 0);
+				else
+					offset += __setup_arrow_buffer(bnode, offset,
+												   column->nullmap.usage);
+				/* index values */
+				offset += __setup_arrow_buffer(bnode+1, offset,
+											   column->values.usage);
+				/* extra values */
+				offset += __setup_arrow_buffer(bnode+2, offset,
+											   column->extra.usage);
+				break;
+
+			default:
+				Elog("Bug? Arrow Type %s is not supported right now",
+					 column->arrow_typename);
+				break;
+		}
+	}
+	*p_offset = offset;
+	return retval;
+}
+
+size_t
+estimateArrowBufferLength(SQLfield *column, size_t nitems)
+{
+	size_t		len = 0;
+	int			j;
+
+	if (column->nitems != nitems)
+		Elog("Bug? number of items mismatch");
+	
+	if (column->enumdict)
+	{
+		/* Enum data types */
+		assert(column->arrow_type.node.tag == ArrowNodeTag__Utf8);
+		if (column->nullcount > 0)
+			len += ARROWALIGN(column->nullmap.usage);
+		len += ARROWALIGN(column->values.usage);
+		assert(column->extra.usage == 0);
+	}
+	else if (column->element)
+	{
+		/* Array data types */
+		assert(column->arrow_type.node.tag == ArrowNodeTag__List ||
+			   column->arrow_type.node.tag == ArrowNodeTag__LargeList);
+		if (column->nullcount > 0)
+			len += ARROWALIGN(column->nullmap.usage);
+		len += ARROWALIGN(column->values.usage);
+		assert(column->extra.usage == 0);
+		len += estimateArrowBufferLength(column->element, nitems);
+	}
+	else if (column->subfields)
+	{
+		/* Composite data types */
+		assert(column->arrow_type.node.tag == ArrowNodeTag__Struct);
+		if (column->nullcount > 0)
+			len += ARROWALIGN(column->nullmap.usage);
+		assert(column->values.usage == 0 ||
+			   column->extra.usage == 0);
+		for (j=0; j < column->nfields; j++)
+			len += estimateArrowBufferLength(&column->subfields[j], nitems);
+	}
+	else
+	{
+		switch (column->arrow_type.node.tag)
+		{
+			/* inline type */
+			case ArrowNodeTag__Int:
+			case ArrowNodeTag__FloatingPoint:
+			case ArrowNodeTag__Bool:
+			case ArrowNodeTag__Decimal:
+			case ArrowNodeTag__Date:
+			case ArrowNodeTag__Time:
+			case ArrowNodeTag__Timestamp:
+			case ArrowNodeTag__Interval:
+			case ArrowNodeTag__FixedSizeBinary:
+				if (column->nullcount > 0)
+					len += ARROWALIGN(column->nullmap.usage);
+				len += ARROWALIGN(column->values.usage);
+				assert(column->extra.usage == 0);
+				break;
+
+			/* variable length type */
+			case ArrowNodeTag__Utf8:
+			case ArrowNodeTag__Binary:
+			case ArrowNodeTag__LargeUtf8:
+			case ArrowNodeTag__LargeBinary:
+				if (column->nullcount > 0)
+					len += ARROWALIGN(column->nullmap.usage);
+				len += ARROWALIGN(column->values.usage);
+				len += ARROWALIGN(column->extra.usage);
+				break;
+
+			default:
+				Elog("Bug? Arrow Type %s is not supported right now",
+					 column->arrow_typename);
+				break;
+		}
+	}
+	return len;
+}
+
+static void
+writeArrowBuffer(int fdesc, SQLfield *column)
+{
+	if (column->enumdict)
+	{
+		/* Enum data types */
+		assert(column->arrow_type.node.tag == ArrowNodeTag__Utf8);
+		if (column->nullcount > 0)
+			sql_buffer_write(fdesc, &column->nullmap);
+		sql_buffer_write(fdesc, &column->values);
+	}
+	else if (column->element)
+	{
+		/* Array data types */
+		assert(column->arrow_type.node.tag == ArrowNodeTag__List ||
+			   column->arrow_type.node.tag == ArrowNodeTag__LargeList);
+		if (column->nullcount > 0)
+			sql_buffer_write(fdesc, &column->nullmap);
+		sql_buffer_write(fdesc, &column->values);
+		writeArrowBuffer(fdesc, column->element);
+	}
+	else if (column->subfields)
+	{
+		int		j;
+
+		/* Composite data types */
+		assert(column->arrow_type.node.tag == ArrowNodeTag__Struct);
+		if (column->nullcount > 0)
+			sql_buffer_write(fdesc, &column->nullmap);
+		for (j=0; j < column->nfields; j++)
+			writeArrowBuffer(fdesc, &column->subfields[j]);
+	}
+	else
+	{
+		switch (column->arrow_type.node.tag)
+		{
+			/* inline type */
+			case ArrowNodeTag__Int:
+			case ArrowNodeTag__FloatingPoint:
+			case ArrowNodeTag__Bool:
+			case ArrowNodeTag__Decimal:
+			case ArrowNodeTag__Date:
+			case ArrowNodeTag__Time:
+			case ArrowNodeTag__Timestamp:
+			case ArrowNodeTag__Interval:
+			case ArrowNodeTag__FixedSizeBinary:
+				if (column->nullcount > 0)
+					sql_buffer_write(fdesc, &column->nullmap);
+				sql_buffer_write(fdesc, &column->values);
+				break;
+
+			/* variable length type */
+			case ArrowNodeTag__Utf8:
+			case ArrowNodeTag__Binary:
+			case ArrowNodeTag__LargeUtf8:
+			case ArrowNodeTag__LargeBinary:
+				if (column->nullcount > 0)
+					sql_buffer_write(fdesc, &column->nullmap);
+				sql_buffer_write(fdesc, &column->values);
+				sql_buffer_write(fdesc, &column->extra);
+				break;
+
+			default:
+				Elog("Bug? Arrow Type %s is not supported right now",
+					 column->arrow_typename);
+				break;
+		}
+	}
+}
+
+static void
+sql_field_clear(SQLfield *column)
+{
+	int		j;
+	
+	column->nitems = 0;
+	column->nullcount = 0;
+	sql_buffer_clear(&column->nullmap);
+	sql_buffer_clear(&column->values);
+	sql_buffer_clear(&column->extra);
+	column->__curr_usage__ = 0;
+
+	if (column->element)
+		sql_field_clear(column->element);
+	if (column->nfields > 0)
+	{
+		for (j=0; j < column->nfields; j++)
+			sql_field_clear(&column->subfields[j]);
+	}
+}
+
+int
 writeArrowRecordBatch(SQLtable *table)
 {
 	ArrowMessage	message;
@@ -1123,6 +1392,7 @@ writeArrowRecordBatch(SQLtable *table)
 	size_t			metaLength;
 	size_t			bodyLength = 0;
 
+	assert(table->nitems > 0);
 	/* adjust current file position */
 	currPos = lseek(table->fdesc, 0, SEEK_CUR);
 	if (currPos < 0)
@@ -1140,9 +1410,8 @@ writeArrowRecordBatch(SQLtable *table)
 	nodes = alloca(sizeof(ArrowFieldNode) * table->numFieldNodes);
 	for (i=0, j=0; i < table->nfields; i++)
 	{
-		SQLattribute   *attr = &table->attrs[i];
-		assert(table->nitems == attr->nitems);
-		j += setupArrowFieldNode(nodes + j, attr);
+		assert(table->nitems == table->columns[i].nitems);
+		j += setupArrowFieldNode(&nodes[j], &table->columns[i]);
 	}
 	assert(j == table->numFieldNodes);
 
@@ -1150,8 +1419,8 @@ writeArrowRecordBatch(SQLtable *table)
 	buffers = alloca(sizeof(ArrowBuffer) * table->numBuffers);
 	for (i=0, j=0; i < table->nfields; i++)
 	{
-		SQLattribute   *attr = &table->attrs[i];
-		j += attr->setup_buffer(attr, buffers+j, &bodyLength);
+		j += setupArrowBuffer(&buffers[j], &table->columns[i],
+							  &bodyLength);
 	}
 	assert(j == table->numBuffers);
 
@@ -1169,11 +1438,8 @@ writeArrowRecordBatch(SQLtable *table)
 	rbatch->_num_buffers = table->numBuffers;
 	/* serialization */
 	metaLength = writeFlatBufferMessage(table->fdesc, &message);
-	for (i=0; i < table->nfields; i++)
-	{
-		SQLattribute   *attr = &table->attrs[i];
-		attr->write_buffer(attr, table->fdesc);
-	}
+	for (j=0; j < table->nfields; j++)
+		writeArrowBuffer(table->fdesc, &table->columns[j]);
 
 	/* save the offset/length at ArrowBlock */
 	index = table->numRecordBatches++;
@@ -1188,10 +1454,12 @@ writeArrowRecordBatch(SQLtable *table)
 	block->metaDataLength = metaLength;
 	block->bodyLength = bodyLength;
 
-	/* makes table/attributes empty again */
-	table->nitems = 0;
+	/* make the local buffer empty again */
 	for (j=0; j < table->nfields; j++)
-		reset_sql_attribute(&table->attrs[j]);
+		sql_field_clear(&table->columns[j]);
+	table->nitems = 0;
+
+	return index;
 }
 
 /*
@@ -1215,7 +1483,7 @@ writeArrowFooter(SQLtable *table)
 	schema->fields = alloca(sizeof(ArrowField) * table->nfields);
 	schema->_num_fields = table->nfields;
 	for (i=0; i < table->nfields; i++)
-		setupArrowField(&schema->fields[i], &table->attrs[i]);
+		setupArrowField(&schema->fields[i], &table->columns[i]);
 	schema->custom_metadata = table->customMetadata;
 	schema->_num_custom_metadata = table->numCustomMetadata;
 

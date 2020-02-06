@@ -3,8 +3,8 @@
  *
  * Routines related to NVME-SSD devices
  * ----
- * Copyright 2011-2019 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2019 (C) The PG-Strom Development Team
+ * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2020 (C) The PG-Strom Development Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -739,7 +739,7 @@ vfs_nvme_cache_callback(Datum arg, int cacheid, uint32 hashvalue)
  * GetOptimalGpuForFile
  */
 int
-GetOptimalGpuForFile(const char *fname, File fdesc)
+GetOptimalGpuForFile(File fdesc)
 {
 	StromCmd__CheckFile *uarg
 		= alloca(offsetof(StromCmd__CheckFile, rawdisks[100]));
@@ -755,7 +755,8 @@ retry:
 	{
 		ereport(DEBUG1,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("nvme_strom does not support file '%s'", fname)));
+				 errmsg("nvme_strom does not support file '%s'",
+						FilePathName(fdesc))));
 		return -1;
 	}
 	else if (uarg->ndisks > nrooms)
@@ -840,7 +841,7 @@ GetOptimalGpuForTablespace(Oid tablespace_oid)
 		}
 		else
 		{
-			entry->nvme_optimal_gpu = GetOptimalGpuForFile(pathname, fdesc);
+			entry->nvme_optimal_gpu = GetOptimalGpuForFile(fdesc);
 			FileClose(fdesc);
 		}
 	}
