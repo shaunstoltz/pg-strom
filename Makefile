@@ -2,9 +2,8 @@
 # Common definitions for PG-Strom Makefile
 #
 PG_CONFIG := pg_config
-PSQL := $(shell dirname $(shell which $(PG_CONFIG)))/psql
-CREATEDB := $(shell dirname $(shell which $(PG_CONFIG)))/createdb
-MKDOCS := mkdocs
+PSQL = $(shell dirname $(shell which $(PG_CONFIG)))/psql
+MKDOCS = mkdocs
 
 ifndef STROM_BUILD_ROOT
 STROM_BUILD_ROOT = .
@@ -16,13 +15,14 @@ endif
 #
 # PG-Strom version
 #
-PGSTROM_VERSION := 2.3
+PGSTROM_VERSION := 3.0
 PGSTROM_RELEASE := devel
 
 #
 # Installation related
 #
-__PGSTROM_SQL = pg_strom--2.2.sql pg_strom--2.2--2.3.sql
+__PGSTROM_SQL = pg_strom--2.2.sql pg_strom--2.2--2.3.sql \
+                                  pg_strom--2.3--3.0.sql
 PGSTROM_SQL := $(addprefix $(STROM_BUILD_ROOT)/sql/, $(__PGSTROM_SQL))
 
 #
@@ -31,29 +31,27 @@ PGSTROM_SQL := $(addprefix $(STROM_BUILD_ROOT)/sql/, $(__PGSTROM_SQL))
 __STROM_OBJS = main.o nvrtc.o shmbuf.o codegen.o datastore.o \
         cuda_program.o gpu_device.o gpu_context.o gpu_mmgr.o \
         nvme_strom.o relscan.o gpu_tasks.o \
-        gpuscan.o gpujoin.o inners.o gpupreagg.o \
-		aggfuncs.o pl_cuda.o gstore_buf.o gstore_fdw.o \
+        gpuscan.o gpujoin.o gpupreagg.o \
 		arrow_fdw.o arrow_nodes.o arrow_write.o arrow_pgsql.o \
-		matrix.o float2.o largeobject.o misc.o
+		gstore_fdw.o aggfuncs.o float2.o misc.o
 __STROM_HEADERS = pg_strom.h nvme_strom.h arrow_defs.h \
 		device_attrs.h cuda_filelist
-__PLCUDA_HOST = host_plcuda.o
-STROM_OBJS = $(addprefix $(STROM_BUILD_ROOT)/src/, $(__STROM_OBJS) $(__PLCUDA_HOST))
-PLCUDA_HOST = $(addprefix $(STROM_BUILD_ROOT)/src/, $(__PLCUDA_HOST:.o=.c))
+STROM_OBJS = $(addprefix $(STROM_BUILD_ROOT)/src/, $(__STROM_OBJS))
 
 #
 # Source file of GPU portion
 #
 __GPU_FATBIN := cuda_common cuda_numeric cuda_primitive \
-                cuda_timelib cuda_textlib cuda_misclib cuda_jsonlib \
+                cuda_timelib cuda_textlib cuda_misclib \
+                cuda_jsonlib cuda_rangetype cuda_postgis \
                 cuda_gpuscan cuda_gpujoin cuda_gpupreagg cuda_gpusort
-__GPU_HEADERS := $(__GPU_FATBIN) cuda_utils cuda_basetype \
-                 cuda_rangetype cuda_plcuda arrow_defs
+__GPU_HEADERS := $(__GPU_FATBIN) cuda_utils cuda_basetype cuda_gstore arrow_defs
 GPU_HEADERS := $(addprefix $(STROM_BUILD_ROOT)/src/, \
                $(addsuffix .h, $(__GPU_HEADERS)))
 GPU_FATBIN := $(addprefix $(STROM_BUILD_ROOT)/src/, \
               $(addsuffix .fatbin, $(__GPU_FATBIN)))
 GPU_DEBUG_FATBIN := $(GPU_FATBIN:.fatbin=.gfatbin)
+GSTORE_FDW_FATBIN := $(STROM_BUILD_ROOT)/src/cuda_gstore.fatbin
 
 # 32k / 128 = 256 threads per SM
 MAXREGCOUNT := 128
@@ -69,17 +67,23 @@ MAXREGCOUNT := 128
 #
 # Source file of utilities
 #
-__STROM_UTILS = gpuinfo pg2arrow dbgen-ssbm testapp_largeobject
+__STROM_UTILS = gpuinfo pg2arrow gstore_backup dbgen-ssbm
+ifdef WITH_MYSQL2ARROW
+__STROM_UTILS += mysql2arrow
+MYSQL_CONFIG = mysql_config
+endif
 STROM_UTILS = $(addprefix $(STROM_BUILD_ROOT)/utils/, $(__STROM_UTILS))
 
 GPUINFO := $(STROM_BUILD_ROOT)/utils/gpuinfo
 GPUINFO_SOURCE := $(STROM_BUILD_ROOT)/utils/gpuinfo.c
 GPUINFO_DEPEND := $(GPUINFO_SOURCE) \
                   $(STROM_BUILD_ROOT)/src/nvme_strom.h
-GPUINFO_CFLAGS = $(PGSTROM_FLAGS) -I $(IPATH) -L $(LPATH)
+GPUINFO_CFLAGS = $(PGSTROM_FLAGS) -I $(IPATH) -L $(LPATH) \
+                 $(shell $(PG_CONFIG) --ldflags)
 
 PG2ARROW = $(STROM_BUILD_ROOT)/utils/pg2arrow
-PG2ARROW_SOURCE = $(STROM_BUILD_ROOT)/utils/pg2arrow.c \
+PG2ARROW_SOURCE = $(STROM_BUILD_ROOT)/utils/sql2arrow.c \
+                  $(STROM_BUILD_ROOT)/utils/pgsql_client.c \
                   $(STROM_BUILD_ROOT)/src/arrow_nodes.c \
                   $(STROM_BUILD_ROOT)/src/arrow_write.c \
                   $(STROM_BUILD_ROOT)/src/arrow_pgsql.c
@@ -87,11 +91,41 @@ PG2ARROW_DEPEND = $(PG2ARROW_SOURCE) \
                   $(STROM_BUILD_ROOT)/src/arrow_defs.h \
                   $(STROM_BUILD_ROOT)/src/arrow_ipc.h
 PG2ARROW_CFLAGS = -D__PG2ARROW__=1 -D_GNU_SOURCE -g -Wall \
-			-I $(STROM_BUILD_ROOT)/src \
-			-I $(STROM_BUILD_ROOT)/utils \
-			-I $(shell $(PG_CONFIG) --includedir) \
-			-I $(shell $(PG_CONFIG) --includedir-server) \
-			-L $(shell $(PG_CONFIG) --libdir)
+                  -I $(STROM_BUILD_ROOT)/src \
+                  -I $(STROM_BUILD_ROOT)/utils \
+                  -I $(shell $(PG_CONFIG) --includedir) \
+                  -I $(shell $(PG_CONFIG) --includedir-server) \
+                  -L $(shell $(PG_CONFIG) --libdir) \
+                  $(shell $(PG_CONFIG) --ldflags)
+
+MYSQL2ARROW = $(STROM_BUILD_ROOT)/utils/mysql2arrow
+MYSQL2ARROW_SOURCE = $(STROM_BUILD_ROOT)/utils/sql2arrow.c \
+                     $(STROM_BUILD_ROOT)/utils/mysql_client.c \
+                     $(STROM_BUILD_ROOT)/src/arrow_nodes.c \
+                     $(STROM_BUILD_ROOT)/src/arrow_write.c
+MYSQL2ARROW_DEPEND = $(MYSQL2ARROW_SOURCE) \
+                     $(STROM_BUILD_ROOT)/src/arrow_defs.h \
+                     $(STROM_BUILD_ROOT)/src/arrow_ipc.h \
+                     $(STROM_BUILD_ROOT)/utils/sql2arrow.h
+MYSQL2ARROW_CFLAGS = -D__MYSQL2ARROW__=1 -D_GNU_SOURCE -g -Wall \
+                     -I $(STROM_BUILD_ROOT)/src \
+                     -I $(STROM_BUILD_ROOT)/utils \
+                     -I $(shell $(PG_CONFIG) --includedir-server) \
+                     $(shell $(MYSQL_CONFIG) --cflags) \
+                     $(shell $(MYSQL_CONFIG) --libs) \
+                     -Wl,-rpath,$(shell $(MYSQL_CONFIG) --variable=pkglibdir)
+
+GSTORE_BACKUP = $(STROM_BUILD_ROOT)/utils/gstore_backup
+GSTORE_BACKUP_SOURCE = $(GSTORE_BACKUP).c
+GSTORE_BACKUP_CFLAGS = -D_GNU_SOURCE -g -Wall \
+                       -I $(STROM_BUILD_ROOT)/src \
+                       -I $(STROM_BUILD_ROOT)/utils \
+                       -I $(shell $(PG_CONFIG) --includedir) \
+                       -I $(shell $(PG_CONFIG) --includedir-server) \
+                       -L $(shell $(PG_CONFIG) --libdir) \
+                       $(shell $(PG_CONFIG) --ldflags)
+GSTORE_BACKUP_DEPEND = $(GSTORE_BACKUP_SOURCE) \
+                       $(STROM_BUILD_ROOT)/src/gstore_fdw.h
 
 SSBM_DBGEN = $(STROM_BUILD_ROOT)/utils/dbgen-ssbm
 __SSBM_DBGEN_SOURCE = bcd2.c  build.c load_stub.c print.c text.c \
@@ -101,20 +135,19 @@ SSBM_DBGEN_SOURCE = $(addprefix $(STROM_BUILD_ROOT)/utils/ssbm/, \
 SSBM_DBGEN_DISTS_DSS = $(STROM_BUILD_ROOT)/utils/ssbm/dists.dss.h
 SSBM_DBGEN_CFLAGS = -DDBNAME=\"dss\" -DLINUX -DDB2 -DSSBM -DTANDEM \
                     -DSTATIC_DISTS=1 \
-                    -O2 -g -I. -I$(STROM_BUILD_ROOT)/utils/ssbm
+                    -O2 -g -I. -I$(STROM_BUILD_ROOT)/utils/ssbm \
+                    $(shell $(PG_CONFIG) --ldflags)
 __SSBM_SQL_FILES = ssbm-11.sql ssbm-12.sql ssbm-13.sql \
                    ssbm-21.sql ssbm-22.sql ssbm-23.sql \
                    ssbm-31.sql ssbm-32.sql ssbm-33.sql ssbm-34.sql \
                    ssbm-41.sql ssbm-42.sql ssbm-43.sql
-TESTAPP_LARGEOBJECT = $(STROM_BUILD_ROOT)/utils/testapp_largeobject
-TESTAPP_LARGEOBJECT_SOURCE = $(TESTAPP_LARGEOBJECT).cu
 
 #
 # Markdown (document) files
 #
 __DOC_FILES = index.md install.md partition.md \
               operations.md sys_admin.md brin.md partition.md troubles.md \
-	      ssd2gpu.md arrow_fdw.md gstore_fdw.md plcuda.md \
+	      ssd2gpu.md arrow_fdw.md python.md \
 	      ref_types.md ref_devfuncs.md ref_sqlfuncs.md ref_params.md \
 	      release_note.md
 
@@ -122,7 +155,7 @@ __DOC_FILES = index.md install.md partition.md \
 # Files to be packaged
 #
 __PACKAGE_FILES = LICENSE README.md Makefile pg_strom.control	\
-	          src sql utils test man
+	          src sql utils python test man
 ifdef PGSTROM_VERSION
 ifeq ($(PGSTROM_RELEASE),1)
 __STROM_TGZ = pg_strom-$(PGSTROM_VERSION)
@@ -162,8 +195,12 @@ CUDA_VERSION := $(shell grep -E '^\#define[ ]+CUDA_VERSION[ ]+[0-9]+$$' $(IPATH)
 #       PGSTROM_FLAGS_CUSTOM := -g -O0 -Werror
 #
 PGSTROM_FLAGS += $(PGSTROM_FLAGS_CUSTOM)
+PGSTROM_FLAGS += -D__PGSTROM_MODULE__=1
 ifdef PGSTROM_VERSION
 PGSTROM_FLAGS += "-DPGSTROM_VERSION=\"$(PGSTROM_VERSION)\""
+endif
+ifeq ($(PGSTROM_DEBUG),1)
+PGSTROM_FLAGS += -g -O0
 endif
 PGSTROM_FLAGS += -DCPU_ARCH=\"$(shell uname -m)\"
 PGSTROM_FLAGS += -DPGSHAREDIR=\"$(shell $(PG_CONFIG) --sharedir)\"
@@ -174,12 +211,12 @@ PGSTROM_FLAGS += -DCUDA_LIBRARY_PATH=\"$(LPATH)\"
 PGSTROM_FLAGS += -DCUDA_MAXREGCOUNT=$(MAXREGCOUNT)
 PGSTROM_FLAGS += -DCMD_GPUINFO_PATH=\"$(shell $(PG_CONFIG) --bindir)/gpuinfo\"
 PG_CPPFLAGS := $(PGSTROM_FLAGS) -I $(IPATH)
-SHLIB_LINK := -L $(LPATH) -lcuda
+SHLIB_LINK := -L $(LPATH) -lcuda -lpmem
 
 # also, flags to build GPU libraries
 NVCC_FLAGS := $(NVCC_FLAGS_CUSTOM)
 NVCC_FLAGS += -I $(shell $(PG_CONFIG) --includedir-server) \
-              --fatbin --relocatable-device-code=true \
+              --fatbin \
               --maxrregcount=$(MAXREGCOUNT) \
               --gpu-architecture=compute_60
 # supported device depends on CUDA version
@@ -190,6 +227,7 @@ else ifeq ($(shell test $(CUDA_VERSION) -ge 9000; echo $$?), 0)
 else
   NVCC_FLAGS += --gpu-code=sm_60,sm_61
 endif
+NVCC_FLAGS += --device-debug
 NVCC_DEBUG_FLAGS := $(NVCC_FLAGS) --source-in-ptx --device-debug
 
 #
@@ -200,18 +238,17 @@ MODULEDIR = pg_strom
 OBJS =  $(STROM_OBJS)
 EXTENSION = pg_strom
 DATA = $(GPU_HEADERS) $(PGSTROM_SQL)
-DATA_built = $(GPU_FATBIN) $(GPU_DEBUG_FATBIN)
+DATA_built = $(GPU_FATBIN) $(GPU_DEBUG_FATBIN) $(GSTORE_FDW_FATBIN)
 
 # Support utilities
 SCRIPTS_built = $(STROM_UTILS)
 # Extra files to be cleaned
-EXTRA_CLEAN = $(STROM_UTILS) $(PLCUDA_HOST) \
+EXTRA_CLEAN = $(STROM_UTILS) $(MYSQL2ARROW) \
 	$(shell ls $(STROM_BUILD_ROOT)/man/docs/*.md 2>/dev/null) \
 	$(shell ls */Makefile 2>/dev/null | sed 's/Makefile/pg_strom.control/g') \
 	$(shell ls pg-strom-*.tar.gz 2>/dev/null) \
 	$(STROM_BUILD_ROOT)/man/markdown_i18n \
-	$(SSBM_DBGEN_DISTS_DSS) \
-	$(TESTAPP_LARGEOBJECT)
+	$(SSBM_DBGEN_DISTS_DSS)
 
 #
 # Regression Test
@@ -220,15 +257,16 @@ USE_MODULE_DB := 1
 REGRESS := --schedule=$(STROM_BUILD_ROOT)/test/parallel_schedule
 REGRESS_INIT_SQL := $(STROM_BUILD_ROOT)/test/sql/init_regress.sql
 REGRESS_DBNAME := contrib_regression_$(MODULE_big)
-REGRESS_REVISION := 20191112
+REGRESS_REVISION := 20200306
 REGRESS_REVISION_QUERY := 'SELECT pgstrom.regression_testdb_revision() = $(REGRESS_REVISION)'
 REGRESS_OPTS = --inputdir=$(STROM_BUILD_ROOT)/test \
                --outputdir=$(STROM_BUILD_ROOT)/test \
                --encoding=UTF-8 \
                --load-extension=pg_strom \
+               --load-extension=plpython3u \
                --launcher="env PGDATABASE=$(REGRESS_DBNAME) PATH=$(shell dirname $(SSBM_DBGEN)):$$PATH PGAPPNAME=$(REGRESS_REVISION)" \
                $(shell test "`$(PSQL) -At -c $(REGRESS_REVISION_QUERY) $(REGRESS_DBNAME)`" = "t" && echo "--use-existing")
-REGRESS_PREP = $(SSBM_DBGEN) $(TESTAPP_LARGEOBJECT) $(REGRESS_INIT_SQL)
+REGRESS_PREP = $(SSBM_DBGEN) $(REGRESS_INIT_SQL)
 
 #
 # Build chain of PostgreSQL
@@ -244,18 +282,14 @@ endif
 #
 # GPU Libraries
 #
+$(GSTORE_FDW_FATBIN): $(GSTORE_FDW_FATBIN:.fatbin=.cu) $(GPU_HEADERS)
+	$(NVCC) $(NVCC_DEBUG_FLAGS) --relocatable-device-code=false -o $@ $<
+
 %.fatbin:  %.cu $(GPU_HEADERS)
-	$(NVCC) $(NVCC_FLAGS) -o $@ $<
+	$(NVCC) $(NVCC_FLAGS) --relocatable-device-code=true -o $@ $<
 
 %.gfatbin: %.cu $(GPU_HEADERS)
-	$(NVCC) $(NVCC_DEBUG_FLAGS) -o $@ $<
-
-# PL/CUDA Host Template
-$(PLCUDA_HOST): $(PLCUDA_HOST:.c=.cu)
-	@(echo "const char *pgsql_host_plcuda_code =";			\
-	  sed -e 's/\\/\\\\/g' -e 's/\t/\\t/g' -e 's/"/\\"/g'	\
-	      -e 's/^/  "/g'   -e 's/$$/\\n"/g' < $*.cu;		\
-	  echo ";") > $@
+	$(NVCC) $(NVCC_DEBUG_FLAGS) --relocatable-device-code=true -o $@ $<
 
 #
 # Build documentation
@@ -295,10 +329,18 @@ docs:	$(STROM_BUILD_ROOT)/man/markdown_i18n
 # Build utilities
 #
 $(GPUINFO): $(GPUINFO_DEPEND)
-	$(CC) $(GPUINFO_CFLAGS) $(GPUINFO_SOURCE) -o $@ -lcuda
+	$(CC) $(GPUINFO_CFLAGS) \
+              $(GPUINFO_SOURCE)  -o $@ -lcuda
 
 $(PG2ARROW): $(PG2ARROW_DEPEND)
-	$(CC) $(PG2ARROW_CFLAGS) $(PG2ARROW_SOURCE) -o $@ -lpq -lpgcommon -lpgport
+	$(CC) $(PG2ARROW_CFLAGS) \
+              $(PG2ARROW_SOURCE) -o $@ -lpq -lpgcommon -lpgport
+
+$(MYSQL2ARROW): $(MYSQL2ARROW_DEPEND)
+	$(CC) $(MYSQL2ARROW_SOURCE) -o $@ $(MYSQL2ARROW_CFLAGS)
+
+$(GSTORE_BACKUP): $(GSTORE_BACKUP_DEPEND)
+	$(CC) $(GSTORE_BACKUP_SOURCE) -o $@ $(GSTORE_BACKUP_CFLAGS) -lpq -lpgport
 
 $(SSBM_DBGEN): $(SSBM_DBGEN_SOURCE) $(SSBM_DBGEN_DISTS_DSS)
 	$(CC) $(SSBM_DBGEN_CFLAGS) $(SSBM_DBGEN_SOURCE) -o $@ -lm
@@ -308,12 +350,6 @@ $(SSBM_DBGEN_DISTS_DSS): $(basename $(SSBM_DBGEN_DISTS_DSS))
 	  sed -e 's/\\/\\\\/g' -e 's/\t/\\t/g' -e 's/"/\\"/g' \
 	      -e 's/^/  "/g' -e 's/$$/\\n"/g' < $^; \
 	  echo ";") > $@
-
-$(TESTAPP_LARGEOBJECT): $(TESTAPP_LARGEOBJECT_SOURCE)
-	$(NVCC) -I $(shell $(PG_CONFIG) --pkgincludedir) \
-	        -L $(shell $(PG_CONFIG) --pkglibdir) \
-	        -Xcompiler \"-Wl,-rpath,$(shell $(PG_CONFIG) --pkglibdir)\" \
-	        -lpq -o $@ $^
 
 #
 # Tarball

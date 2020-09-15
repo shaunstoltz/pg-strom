@@ -589,8 +589,6 @@ createArrowDictionaryEncoding(ArrowDictionaryEncoding *node)
 	FBTableBuf *typeInt;
 
 	assert(ArrowNodeIs(node, DictionaryEncoding));
-	if (!ArrowNodeIs(&node->indexType, Int))
-		return NULL;
 	addBufferLong(buf, 0, node->id);
 	typeInt = createArrowTypeInt(&node->indexType);
 	addBufferOffset(buf, 1, typeInt);
@@ -616,8 +614,11 @@ createArrowField(ArrowField *node)
 	addBufferChar(buf, 2, type_tag);
 	if (type)
 		addBufferOffset(buf, 3, type);
-	dictionary = createArrowDictionaryEncoding(&node->dictionary);
-	addBufferOffset(buf, 4, dictionary);
+	if (node->dictionary)
+	{
+		dictionary = createArrowDictionaryEncoding(node->dictionary);
+		addBufferOffset(buf, 4, dictionary);
+	}
 	if (node->_num_children == 0)
 		vector = NULL;
 	else
@@ -893,19 +894,15 @@ static void
 setupArrowDictionaryEncoding(ArrowDictionaryEncoding *dict,
 							 SQLfield *column)
 {
-	initArrowNode(dict, DictionaryEncoding);
-	if (column->enumdict)
-	{
-		SQLdictionary  *enumdict = column->enumdict;
-		ArrowTypeInt   *indexType = &dict->indexType;
+	SQLdictionary  *enumdict = column->enumdict;
 
-		dict->id = enumdict->dict_id;
-		/* dictionary index must be Int32 */
-		initArrowNode(indexType, Int);
-		indexType->bitWidth  = 32;
-		indexType->is_signed = true;
-		dict->isOrdered = false;
-	}
+	initArrowNode(dict, DictionaryEncoding);
+	dict->id = enumdict->dict_id;
+	/* dictionary index must be Int32 */
+	initArrowNode(&dict->indexType, Int);
+	dict->indexType.bitWidth = 32;
+	dict->indexType.is_signed = true;
+	dict->isOrdered = false;
 }
 
 static void
@@ -916,7 +913,12 @@ setupArrowField(ArrowField *field, SQLfield *column)
 	field->_name_len = strlen(column->field_name);
 	field->nullable = true;
 	field->type = column->arrow_type;
-	setupArrowDictionaryEncoding(&field->dictionary, column);
+	/* dictionary */
+	if (column->enumdict)
+	{
+		field->dictionary = palloc0(sizeof(ArrowDictionaryEncoding));
+		setupArrowDictionaryEncoding(field->dictionary, column);
+	}
 	/* array type */
 	if (column->element)
 	{
@@ -985,11 +987,11 @@ __writeArrowDictionaryBatch(int fdesc, SQLdictionary *dict)
 	dbatch = &message.body.dictionaryBatch;
 	initArrowNode(dbatch, DictionaryBatch);
 	dbatch->id = dict->dict_id;
-	dbatch->isDelta = false;
+	dbatch->isDelta = (dict->nloaded > 0);
 
 	/* ArrowFieldNode of RecordBatch */
 	initArrowNode(&fnodes[0], FieldNode);
-	fnodes[0].length = dict->nitems;
+	fnodes[0].length = dict->nitems - dict->nloaded;
 	fnodes[0].null_count = 0;
 
 	/* ArrowBuffer[0] of RecordBatch -- nullmap */
@@ -1012,7 +1014,7 @@ __writeArrowDictionaryBatch(int fdesc, SQLdictionary *dict)
 	/* RecordBatch portion */
 	rbatch = &dbatch->data;
 	initArrowNode(rbatch, RecordBatch);
-	rbatch->length = dict->nitems;
+	rbatch->length = dict->nitems - dict->nloaded;
 	rbatch->_num_nodes = 1;
     rbatch->nodes = fnodes;
 	rbatch->_num_buffers = 3;	/* empty nullmap + offset + extra buffer */
@@ -1042,19 +1044,21 @@ void
 writeArrowDictionaryBatches(SQLtable *table)
 {
 	SQLdictionary  *dict;
-	int				index = 0;
+	ArrowBlock		block;
+	int				index = table->numDictionaries;
 
-	for (dict = table->sql_dict_list, index=0;
-		 dict != NULL;
-		 dict = dict->next, index++)
+	for (dict = table->sql_dict_list; dict; dict = dict->next)
 	{
+		if (dict->nloaded > 0 && dict->nloaded == dict->nitems)
+			continue;		/* nothing to be written */
+
 		if (!table->dictionaries)
-			table->dictionaries = palloc0(sizeof(ArrowBlock) * 32);
+			table->dictionaries = palloc0(sizeof(ArrowBlock) * (index+1));
 		else
 			table->dictionaries = repalloc(table->dictionaries,
-										   sizeof(ArrowBlock) * index);
-		table->dictionaries[index]
-			= __writeArrowDictionaryBatch(table->fdesc, dict);
+										   sizeof(ArrowBlock) * (index+1));
+		block = __writeArrowDictionaryBatch(table->fdesc, dict);
+		table->dictionaries[index++] = block;
 	}
 	table->numDictionaries = index;
 }

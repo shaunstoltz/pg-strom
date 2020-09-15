@@ -8,6 +8,7 @@
  */
 #include "postgres.h"
 #include <assert.h>
+#include <endian.h>
 #include <getopt.h>
 #include <libpq-fe.h>
 #include "arrow_ipc.h"
@@ -29,6 +30,14 @@ static void      pgsql_setup_array_element(PGconn *conn,
 										   Oid array_elemid,
 										   int *p_numFieldNode,
 										   int *p_numBuffers);
+/* for --set option */
+typedef struct userConfigOption		userConfigOption;
+struct userConfigOption
+{
+	userConfigOption *next;
+	char		query[1];		/* SET xxx='xxx' command */
+};
+
 /* command options */
 static char	   *sql_command = NULL;
 static char	   *output_filename = NULL;
@@ -41,8 +50,18 @@ static int		pgsql_password_prompt = 0;
 static char	   *pgsql_database = NULL;
 static char	   *dump_arrow_filename = NULL;
 static int		shows_progress = 0;
+static userConfigOption *session_preset_commands = NULL;
+/* server settings */
+static char	   *server_timezone = NULL;
 /* dictionary batches */
 SQLdictionary  *pgsql_dictionary_list = NULL;
+
+/* ntohll() */
+#if __BYTE_ORDER == __BIG_ENDIAN
+#define ntohll(x)		(x)
+#else
+#define ntohll(x)		__bswap_64(x)
+#endif
 
 static void
 usage(void)
@@ -72,9 +91,10 @@ usage(void)
 		  "  -w, --no-password       never prompt for password\n"
 		  "  -W, --password          force password prompt\n"
 		  "\n"
-		  "Debug options:\n"
+		  "Other options:\n"
 		  "      --dump=FILENAME     dump information of arrow file\n"
-		  "      --progress          shows progress of the job.\n"
+		  "      --progress          shows progress of the job\n"
+		  "      --set=NAME:VALUE    GUC option to set before SQL execution\n"
 		  "\n"
 		  "Report bugs to <pgstrom@heterodb.com>.\n",
 		  stderr);
@@ -129,12 +149,14 @@ parse_options(int argc, char * const argv[])
 		{"dump",         required_argument,  NULL, 1000 },
 		{"progress",     no_argument,        NULL, 1001 },
 		{"append",       required_argument,  NULL, 1002 },
+		{"set",          required_argument,  NULL, 1003 },
 		{"help",         no_argument,        NULL, 9999 },
 		{NULL, 0, NULL, 0},
 	};
 	int			c;
 	char	   *pos;
 	char	   *sql_file = NULL;
+	userConfigOption *last_user_config = NULL;
 
 	while ((c = getopt_long(argc, argv, "d:c:f:o:s:n:dh:p:U:wW",
 							long_options, NULL)) >= 0)
@@ -222,12 +244,38 @@ parse_options(int argc, char * const argv[])
 					Elog("--progress option specified twice");
 				shows_progress = 1;
 				break;
-			case 1002:
+			case 1002:		/* --append */
 				if (append_filename)
 					Elog("--append option specified twice");
 				if (output_filename)
 					Elog("-o and --append are exclusive");
 				append_filename = optarg;
+				break;
+			case 1003:		/* --set */
+				{
+					userConfigOption *conf;
+					char   *pos, *tail;
+
+					pos = strchr(optarg, ':');
+					if (!pos)
+						Elog("--set option should take NAME:VALUE");
+					*pos++ = '\0';
+					while (isspace(*pos))
+						pos++;
+					tail = pos + strlen(pos) - 1;
+					while (tail > pos && isspace(*tail))
+						tail--;
+					conf = calloc(1, sizeof(userConfigOption) +
+								  strlen(optarg) + strlen(pos) + 40);
+					if (!conf)
+						Elog("out of memory");
+					sprintf(conf->query, "SET %s = '%s'", optarg, pos);
+					if (last_user_config)
+						last_user_config->next = conf;
+					else
+						session_preset_commands = conf;
+					last_user_config = conf;
+				}
 				break;
 			case 9999:		/* --help */
 			default:
@@ -350,6 +398,58 @@ pgsql_server_connect(void)
 		Elog("failed on PostgreSQL connection: %s",
 			 PQerrorMessage(conn));
 	return conn;
+}
+
+/*
+ * pgsql_init_session
+ */
+static void
+pgsql_init_session(PGconn *conn)
+{
+	PGresult   *res;
+	const char *query;
+	userConfigOption *conf;
+
+	/*
+	 * Preset user's config option
+	 */
+	for (conf = session_preset_commands; conf != NULL; conf = conf->next)
+	{
+		res = PQexec(conn, conf->query);
+		if (PQresultStatus(res) != PGRES_COMMAND_OK)
+			Elog("failed on setting user's config option: %s", conf->query);
+		PQclear(res);
+	}
+	
+	/*
+	 * ensure client encoding is UTF-8
+	 *
+	 * Even if user config tries to change client_encoding, pg2arrow
+	 * must ensure text encoding is UTF-8.
+	 */
+	query = "set client_encoding = 'UTF8'";
+	res = PQexec(conn, query);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		Elog("failed to change client_encoding to UTF-8: %s", query);
+	PQclear(res);
+
+	/*
+	 * collect server timezone info
+	 */
+#if 0
+	res = PQexec(conn, "SET timezone='ASIA/TOKYO'");
+	PQclear(res);
+#endif
+	query = "show timezone";
+	res = PQexec(conn, query);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK ||
+		PQntuples(res) != 1 ||
+		PQgetisnull(res, 0, 0))
+		Elog("failed on getting server timezone configuration: %s", query);
+	server_timezone = strdup(PQgetvalue(res, 0, 0));
+	if (!server_timezone)
+		Elog("out of memory");
+	PQclear(res);
 }
 
 /*
@@ -584,7 +684,8 @@ pgsql_setup_attribute(PGconn *conn,
 										  typtype,
 										  attalign,
 										  typrelid,
-										  typelemid);
+										  typelemid,
+										  server_timezone);
 	if (typrelid != InvalidOid)
 	{
 		assert(typtype == 'c');
@@ -1026,7 +1127,7 @@ pgsql_writeout_buffer(SQLtable *table)
 void
 pgsql_append_results(SQLtable *table, PGresult *res)
 {
-	SQLfield *columns = table->columns;
+	SQLfield  *columns = table->columns;
 	int		i, ntuples = PQntuples(res);
 	int		j, nfields = PQnfields(res);
 
@@ -1038,7 +1139,7 @@ pgsql_append_results(SQLtable *table, PGresult *res)
 
 		for (j=0; j < nfields; j++)
 		{
-			SQLfield   *column = &columns[j];
+			SQLfield	   *column = &columns[j];
 			const char	   *addr;
 			size_t			sz;
 			/* data must be binary format */
@@ -1144,6 +1245,8 @@ int main(int argc, char * const argv[])
 
 	/* open PostgreSQL connection */
 	conn = pgsql_server_connect();
+	/* initialize the session */
+	pgsql_init_session(conn);
 	/* run SQL command */
 	res = pgsql_begin_query(conn, sql_command);
 	if (!res)

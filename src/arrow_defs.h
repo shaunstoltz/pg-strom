@@ -130,6 +130,9 @@ typedef union		ArrowTypeOptions
 		ArrowTimeUnit		unit;
 	} time;
 	struct {
+		ArrowTimeUnit		unit;
+	} timestamp;
+	struct {
 		ArrowIntervalUnit	unit;
 	} interval;
 } ArrowTypeOptions;
@@ -389,7 +392,7 @@ typedef struct		ArrowField
 	int				_name_len;
 	bool			nullable;
 	ArrowType		type;
-	ArrowDictionaryEncoding dictionary;
+	ArrowDictionaryEncoding *dictionary;
 	/* vector of nested data types */
 	struct ArrowField *children;
 	int				_num_children;

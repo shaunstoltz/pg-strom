@@ -23,8 +23,8 @@ PG_MODULE_MAGIC;
  * miscellaneous GUC parameters
  */
 bool		pgstrom_enabled;
-bool		pgstrom_debug_kernel_source;
 bool		pgstrom_cpu_fallback_enabled;
+bool		pgstrom_regression_test_mode;
 static int	pgstrom_chunk_size_kb;
 
 /* cost factors */
@@ -33,6 +33,7 @@ double		pgstrom_gpu_dma_cost;
 double		pgstrom_gpu_operator_cost;
 
 /* misc static variables */
+static HTAB				   *gpu_path_htable = NULL;
 static planner_hook_type	planner_hook_next;
 static CustomPathMethods	pgstrom_dummy_path_methods;
 static CustomScanMethods	pgstrom_dummy_plan_methods;
@@ -54,7 +55,7 @@ pgstrom_chunk_size(void)
 }
 
 static void
-pgstrom_init_misc_guc(void)
+pgstrom_init_common_guc(void)
 {
 	/* turn on/off PG-Strom feature */
 	DefineCustomBoolVariable("pg_strom.enabled",
@@ -70,15 +71,6 @@ pgstrom_init_misc_guc(void)
 							 "Enables CPU fallback if GPU required re-run",
 							 NULL,
 							 &pgstrom_cpu_fallback_enabled,
-							 false,
-							 PGC_USERSET,
-							 GUC_NOT_IN_SAMPLE,
-							 NULL, NULL, NULL);
-	/* turn on/off cuda kernel source saving */
-	DefineCustomBoolVariable("pg_strom.debug_kernel_source",
-							 "Turn on/off to display the kernel source path",
-							 NULL,
-							 &pgstrom_debug_kernel_source,
 							 false,
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
@@ -127,6 +119,143 @@ pgstrom_init_misc_guc(void)
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
+	/* disables some platform specific EXPLAIN output */
+	DefineCustomBoolVariable("pg_strom.regression_test_mode",
+							 "Disables some platform specific output in EXPLAIN; that can lead undesired test failed but harmless",
+							 NULL,
+							 &pgstrom_regression_test_mode,
+							 false,
+							 PGC_USERSET,
+							 GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+							 NULL, NULL, NULL);
+}
+
+/*
+ * GPU-aware path tracker
+ *
+ * motivation: add_path() and add_partial_path() keeps only cheapest paths.
+ * Once some other dominates GpuXXX paths, it shall be wiped out, even if
+ * it potentially has a chance for more optimization (e.g, GpuJoin outer
+ * pull-up, GpuPreAgg + GpuJoin combined mode).
+ * So, we preserve PG-Strom related Path-nodes for the later referenced.
+ */
+typedef struct
+{
+	PlannerInfo	   *root;
+	Relids			relids;
+	bool			outer_parallel;
+	bool			inner_parallel;
+	const Path	   *cheapest_gpu_path;
+} gpu_path_entry;
+
+static uint32
+gpu_path_entry_hashvalue(const void *key, Size keysize)
+{
+	gpu_path_entry *gent = (gpu_path_entry *)key;
+	uint32		hash;
+	uint32		flags = 0;
+
+	Assert(keysize == 0);
+	hash = hash_uint32(((uintptr_t)gent->root & 0xffffffffUL) ^
+					   ((uintptr_t)gent->root >> 32));
+	if (gent->relids != NULL)
+	{
+		Bitmapset  *relids = gent->relids;
+		
+		hash ^= hash_any((unsigned char *)relids,
+						 offsetof(Bitmapset, words[relids->nwords]));
+	}
+	if (gent->outer_parallel)
+		flags |= 0x01;
+	if (gent->inner_parallel)
+		flags |= 0x02;
+	hash ^= hash_uint32(flags);
+
+	return hash;
+}
+
+static int
+gpu_path_entry_compare(const void *key1, const void *key2, Size keysize)
+{
+	gpu_path_entry *gent1 = (gpu_path_entry *)key1;
+	gpu_path_entry *gent2 = (gpu_path_entry *)key2;
+
+	Assert(keysize == 0);
+
+	if (gent1->root == gent2->root &&
+		bms_equal(gent1->relids, gent2->relids) &&
+		gent1->outer_parallel == gent2->outer_parallel &&
+		gent1->inner_parallel == gent2->inner_parallel)
+		return 0;
+	/* not equal */
+	return 1;
+}
+
+static void *
+gpu_path_entry_keycopy(void *dest, const void *src, Size keysize)
+{
+	gpu_path_entry *dent = (gpu_path_entry *)dest;
+	const gpu_path_entry *sent = (const gpu_path_entry *)src;
+
+	Assert(keysize == 0);
+	dent->root = sent->root;
+	dent->relids = bms_copy(sent->relids);
+	dent->outer_parallel = sent->outer_parallel;
+	dent->inner_parallel = sent->inner_parallel;
+
+	return dest;
+}
+
+const Path *
+gpu_path_find_cheapest(PlannerInfo *root, RelOptInfo *rel,
+					   bool outer_parallel,
+					   bool inner_parallel)
+{
+	gpu_path_entry	hkey;
+	gpu_path_entry *gent;
+
+	memset(&hkey, 0, sizeof(gpu_path_entry));
+	hkey.root = root;
+	hkey.relids = rel->relids;
+	hkey.outer_parallel = outer_parallel;
+	hkey.inner_parallel = inner_parallel;
+
+	gent = hash_search(gpu_path_htable, &hkey, HASH_FIND, NULL);
+	if (!gent)
+		return NULL;
+	return gent->cheapest_gpu_path;
+}
+
+bool
+gpu_path_remember(PlannerInfo *root, RelOptInfo *rel,
+				  bool outer_parallel,
+				  bool inner_parallel,
+				  const Path *gpu_path)
+{
+	gpu_path_entry	hkey;
+	gpu_path_entry *gent;
+	bool			found;
+
+	memset(&hkey, 0, sizeof(gpu_path_entry));
+	hkey.root = root;
+	hkey.relids = rel->relids;
+	hkey.outer_parallel = outer_parallel;
+	hkey.inner_parallel = inner_parallel;
+
+	gent = hash_search(gpu_path_htable, &hkey, HASH_ENTER, &found);
+	if (found)
+	{
+		/* new path is more expensive than prior one! */
+		if (gent->cheapest_gpu_path->total_cost < gpu_path->total_cost)
+			return false;
+	}
+	Assert(gent->root == root &&
+		   bms_equal(gent->relids, rel->relids) &&
+		   gent->outer_parallel == outer_parallel &&
+		   gent->inner_parallel == inner_parallel);
+	gent->cheapest_gpu_path = pgstrom_copy_pathnode(gpu_path);
+
+	return true;
 }
 
 /*
@@ -341,13 +470,44 @@ pgstrom_post_planner(Query *parse,
 					 int cursorOptions,
 					 ParamListInfo boundParams)
 {
+	HTAB		   *gpu_path_htable_saved = gpu_path_htable;
 	PlannedStmt	   *pstmt;
 	ListCell	   *lc;
 
-	if (planner_hook_next)
-		pstmt = planner_hook_next(parse, cursorOptions, boundParams);
-	else
-		pstmt = standard_planner(parse, cursorOptions, boundParams);
+	PG_TRY();
+	{
+		HASHCTL		hctl;
+
+		/* make hash-table to preserve GPU-aware path-nodes */
+		memset(&hctl, 0, sizeof(HASHCTL));
+		hctl.hcxt = CurrentMemoryContext;
+		hctl.keysize = 0;
+		hctl.entrysize = sizeof(gpu_path_entry);
+		hctl.hash = gpu_path_entry_hashvalue;
+		hctl.match = gpu_path_entry_compare;
+		hctl.keycopy = gpu_path_entry_keycopy;
+		gpu_path_htable = hash_create("GPU-aware Path-nodes table",
+									  512,
+									  &hctl,
+									  HASH_CONTEXT |
+									  HASH_ELEM |
+									  HASH_FUNCTION |
+									  HASH_COMPARE |
+									  HASH_KEYCOPY);
+		if (planner_hook_next)
+			pstmt = planner_hook_next(parse, cursorOptions, boundParams);
+		else
+			pstmt = standard_planner(parse, cursorOptions, boundParams);
+	}
+	PG_CATCH();
+	{
+		hash_destroy(gpu_path_htable);
+		gpu_path_htable = gpu_path_htable_saved;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	hash_destroy(gpu_path_htable);
+	gpu_path_htable = gpu_path_htable_saved;
 
 	pgstrom_post_planner_recurse(pstmt, &pstmt->planTree);
 	foreach (lc, pstmt->subplans)
@@ -557,27 +717,22 @@ _PG_init(void)
 	PHYS_PAGES = sysconf(_SC_PHYS_PAGES);
 
 	/* init GPU/CUDA infrastracture */
-	pgstrom_init_misc_guc();
+	pgstrom_init_common_guc();
 	pgstrom_init_shmbuf();
 	pgstrom_init_gpu_device();
 	pgstrom_init_gpu_mmgr();
 	pgstrom_init_gpu_context();
 	pgstrom_init_cuda_program();
 	pgstrom_init_nvme_strom();
+	pgstrom_init_codegen();
 
-	/* registration of custom-scan providers */
+	/* init custom-scan providers/FDWs */
 	pgstrom_init_gputasks();
 	pgstrom_init_gpuscan();
 	pgstrom_init_gpujoin();
-	pgstrom_init_inners();
 	pgstrom_init_gpupreagg();
 	pgstrom_init_relscan();
-
-	/* miscellaneous initializations */
-	pgstrom_init_codegen();
-	pgstrom_init_plcuda();
 	pgstrom_init_arrow_fdw();
-	pgstrom_init_gstore_buf();
 	pgstrom_init_gstore_fdw();
 
 	/* check commercial license, if any */

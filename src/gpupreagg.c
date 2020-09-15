@@ -1492,9 +1492,10 @@ try_add_gpupreagg_append_paths(PlannerInfo *root,
 							   double num_groups,
 							   AggClauseCosts *agg_final_costs,
 							   bool can_pullup_outerscan,
-							   bool try_parallel_path)
+							   bool try_outer_parallel)
 {
 #if PG_VERSION_NUM >= 110000
+	bool		try_inner_parallel = false;
 	List	   *append_paths_list = NIL;
 	List	   *sub_paths_list;
 	List	   *partitioned_rels;
@@ -1504,9 +1505,11 @@ try_add_gpupreagg_append_paths(PlannerInfo *root,
 	Path	   *partial_path;
 	ListCell   *lc;
 
+retry:
 	sub_paths_list = extract_partitionwise_pathlist(root,
 													input_path,
-													try_parallel_path,
+													try_outer_parallel,
+													false,
 													&append_path,
 													&parallel_nworkers,
 													&discount_cost);
@@ -1527,8 +1530,8 @@ try_add_gpupreagg_append_paths(PlannerInfo *root,
 		AppendRelInfo **appinfos;
 		int				nappinfos;
 
-		appinfos = __find_appinfos_by_relids(root, sub_rel->relids,
-											 &nappinfos);
+		appinfos = find_appinfos_by_relids_nofail(root, sub_rel->relids,
+												  &nappinfos);
 		/* fixup varno */
 		curr_partial->exprs = (List *)
 			adjust_appendrel_attrs(root, (Node *)curr_partial->exprs,
@@ -1553,7 +1556,7 @@ try_add_gpupreagg_append_paths(PlannerInfo *root,
 	}
 	/* also see create_append_path(), some fields must be fixed up */
 	partitioned_rels = copyObject(append_path->partitioned_rels);
-	if (try_parallel_path)
+	if (try_outer_parallel)
 		append_path = create_append_path(root, input_path->parent,
 										 NIL, append_paths_list,
 										 NIL, NULL,
@@ -1569,7 +1572,7 @@ try_add_gpupreagg_append_paths(PlannerInfo *root,
 	append_path->path.total_cost -= discount_cost;
 
 	/* prepend Gather on demand */
-	if (try_parallel_path &&
+	if (try_outer_parallel &&
 		append_path->path.parallel_safe &&
 		append_path->path.parallel_workers > 0)
 	{
@@ -1584,7 +1587,10 @@ try_add_gpupreagg_append_paths(PlannerInfo *root,
 												  &total_groups);
 	}
 	else
+	{
 		partial_path = &append_path->path;
+		try_outer_parallel = false;		/* never retry again */
+	}
 
 	try_add_final_aggregation_paths(root,
 									group_rel,
@@ -1593,6 +1599,11 @@ try_add_gpupreagg_append_paths(PlannerInfo *root,
 									(List *) havingQual,
 									num_groups,
 									agg_final_costs);
+	if (try_outer_parallel && !try_inner_parallel)
+	{
+		try_inner_parallel = true;
+		goto retry;
+	}
 #endif	/* PG_VERSION_NUM >= 110000 */
 }
 
@@ -2936,6 +2947,14 @@ make_tlist_device_projection(List *tlist_dev,
  *                            cl_uint src_index,
  *                            Datum *dst_values,
  *                            cl_char *dst_isnull);
+ * and
+ * DEVICE_FUNCTION(void)
+ * gpupreagg_projection_column(kern_context *kcxt,
+ *                             kern_data_store *kds,
+ *                             kern_data_extra *extra,
+ *                             cl_uint rowid,
+ *                             cl_char *dst_dclass,
+ *                             Datum   *dst_values);
  */
 static Expr *
 codegen_projection_partial_funcion(FuncExpr *f,
@@ -3088,9 +3107,10 @@ gpupreagg_codegen_projection_row(StringInfo kern,
 {
 	PlannerInfo	   *root = context->root;
 	StringInfoData	decl;
-	StringInfoData	tbody;
-	StringInfoData	sbody;
-	StringInfoData	cbody;
+	StringInfoData	tbody;		/* Row/Block */
+	StringInfoData	sbody;		/* Slot */
+	StringInfoData	abody;		/* Arrow */
+	StringInfoData	cbody;		/* Column */
 	StringInfoData	temp;
 	Relation		outer_rel = NULL;
 	TupleDesc		outer_desc = NULL;
@@ -3101,6 +3121,7 @@ gpupreagg_codegen_projection_row(StringInfo kern,
 	initStringInfo(&decl);
 	initStringInfo(&tbody);
 	initStringInfo(&sbody);
+	initStringInfo(&abody);
 	initStringInfo(&cbody);
 	initStringInfo(&temp);
 	context->param_refs = NULL;
@@ -3140,7 +3161,7 @@ gpupreagg_codegen_projection_row(StringInfo kern,
 		appendStringInfoString(
 			&tbody,
 			"  /* extract the given htup and load variables */\n"
-			"  EXTRACT_HEAP_TUPLE_BEGIN(addr, kds_src, htup);\n");
+			"  EXTRACT_HEAP_TUPLE_BEGIN(addr,kds_src,htup);\n");
 		for (i=1; i <= nattrs; i++)
 		{
 			bool	referenced = false;
@@ -3214,7 +3235,7 @@ gpupreagg_codegen_projection_row(StringInfo kern,
 
 					/* arrow */
 					appendStringInfo(
-						&cbody,
+						&abody,
 						"  pg_datum_ref_arrow(kcxt,temp.%s_v,kds_src,%d,src_index);\n"
 						"  pg_datum_store(kcxt, temp.%s_v,\n"
 						"                 dst_dclass[%d],\n"
@@ -3223,6 +3244,24 @@ gpupreagg_codegen_projection_row(StringInfo kern,
 						dtype->type_name,
 						tle->resno-1,
 						tle->resno-1);
+					/* column */
+					appendStringInfo(
+						&cbody,
+						"  addr = kern_get_datum_column(kds,extra,%d,rowid);\n"
+						"  if (!addr)\n"
+						"    dst_dclass[%d] = DATUM_CLASS__NULL;\n"
+						"  else\n"
+						"  {\n"
+						"    dst_dclass[%d] = DATUM_CLASS__NORMAL;\n"
+						"    dst_values[%d] = %s(addr);\n"
+						"  }\n",
+						i-1, tle->resno-1, tle->resno-1, tle->resno-1,
+						dtype->type_byval
+						? (dtype->type_length == 1 ? "READ_INT8_PTR"  :
+						   dtype->type_length == 2 ? "READ_INT16_PTR" :
+						   dtype->type_length == 4 ? "READ_INT32_PTR" :
+						   dtype->type_length == 8 ? "READ_INT64_PTR" : "NO_SUCH_TYPLEN")
+						: "PointerGetDatum");
 					referenced = true;
 				}
 
@@ -3251,17 +3290,26 @@ gpupreagg_codegen_projection_row(StringInfo kern,
 					if (referenced)
 					{
 						appendStringInfo(
-							&cbody,
+							&abody,
 							"  KVAR_%u = temp.%s_v;\n",
 							i, dtype->type_name);
 					}
 					else
 					{
 						appendStringInfo(
-							&cbody,
+							&abody,
 							"  pg_datum_ref_arrow(kcxt,KVAR_%u,kds_src,%d,src_index);\n",
 							i, i-1);
 					}
+					/* column */
+					if (!referenced)
+						appendStringInfo(
+							&cbody,
+							"  addr = kern_get_datum_column(kds,extra,%d,rowid);\n",
+							i-1);
+					appendStringInfo(
+						&cbody,
+						"  pg_datum_ref(kcxt, KVAR_%u, addr);\n", i);
 				}
 				context->varlena_bufsz += MAXALIGN(dtype->extra_sz);
 				type_oid_list = list_append_unique_oid(type_oid_list,
@@ -3271,7 +3319,7 @@ gpupreagg_codegen_projection_row(StringInfo kern,
 			}
 			appendStringInfoString(
 				&temp,
-				"  EXTRACT_HEAP_TUPLE_NEXT(addr);\n");
+				"  EXTRACT_HEAP_TUPLE_NEXT(addr,kds_src);\n");
 		}
 		appendStringInfoString(
 			&tbody,
@@ -3349,6 +3397,7 @@ gpupreagg_codegen_projection_row(StringInfo kern,
 	}
 	appendStringInfoString(&tbody, temp.data);
 	appendStringInfoString(&sbody, temp.data);
+	appendStringInfoString(&abody, temp.data);
 	appendStringInfoString(&cbody, temp.data);
 
 	/* const/params and temporary variable */
@@ -3386,11 +3435,23 @@ gpupreagg_codegen_projection_row(StringInfo kern,
 		"                           Datum   *dst_values)\n"
 		"{\n"
 		"%s%s\n%s"
+		"}\n\n"
+		"DEVICE_FUNCTION(void)\n"
+		"gpupreagg_projection_column(kern_context *kcxt,\n"
+		"                            kern_data_store *kds,\n"
+		"                            kern_data_extra *extra,\n"
+		"                            cl_uint rowid,\n"
+		"                            cl_char *dst_dclass,\n"
+		"                            Datum   *dst_values)\n"
+		"{\n"
+		"%s%s\n%s"
 		"}\n\n",
 		decl.data, context->decl_temp.data,
 		tbody.data,
 		decl.data, context->decl_temp.data,
 		sbody.data,
+		decl.data, context->decl_temp.data,
+		abody.data,
 		decl.data, context->decl_temp.data,
 		cbody.data);
 
@@ -3400,7 +3461,7 @@ gpupreagg_codegen_projection_row(StringInfo kern,
 	pfree(decl.data);
 	pfree(tbody.data);
 	pfree(sbody.data);
-	pfree(cbody.data);
+	pfree(abody.data);
 	pfree(temp.data);
 }
 
@@ -4094,7 +4155,7 @@ ExecInitGpuPreAgg(CustomScanState *node, EState *estate, int eflags)
 							gpa_info->used_params,
 							gpa_info->optimal_gpu,
 							gpa_info->outer_nrows_per_block,
-							estate);
+							eflags);
 	gpas->gts.cb_next_task       = gpupreagg_next_task;
 	gpas->gts.cb_terminator_task = gpupreagg_terminator_task;
 	gpas->gts.cb_next_tuple      = gpupreagg_next_tuple;
@@ -4118,7 +4179,7 @@ ExecInitGpuPreAgg(CustomScanState *node, EState *estate, int eflags)
 		}
 		outerPlanState(gpas) = outer_ps;
 		/* GpuPreAgg don't need re-initialization of projection info */
-		outer_tupdesc = outer_ps->ps_ResultTupleSlot->tts_tupleDescriptor;
+		outer_tupdesc = planStateResultTupleDesc(outer_ps);
 		/* should not have any usage of BRIN-index */
 		Assert(!OidIsValid(gpa_info->index_oid));
 	}
@@ -4738,6 +4799,8 @@ gpupreagg_next_task(GpuTaskState *gts)
 	{
 		if (gpas->gts.af_state)
 			pds = ExecScanChunkArrowFdw(&gpas->gts);
+		else if (gpas->gts.gs_state)
+			pds = ExecScanChunkGstoreFdw(&gpas->gts);
 		else
 			pds = pgstromExecScanChunk(&gpas->gts);
 	}
@@ -4807,18 +4870,10 @@ gpupreagg_terminator_task(GpuTaskState *gts, cl_bool *task_is_ready)
 		cl_int			outer_depth;
 
 		/* Has RIGHT/FULL OUTER JOIN? */
-		if (gpujoinHasRightOuterJoin(outer_gts))
-		{
-			gpujoinSyncRightOuterJoin(outer_gts);
-			if (!IsParallelWorker() &&
-				(outer_depth = gpujoinNextRightOuterJoin(outer_gts)) > 0)
-			{
-				if (GpuJoinInnerPreload(outer_gts, &m_kmrels))
-					return gpupreagg_create_task(gpas, NULL,
-												 m_kmrels,
-												 outer_depth);
-			}
-		}
+		outer_depth = gpujoinNextRightOuterJoinIfAny(outer_gts);
+		if (outer_depth > 0 &&
+			GpuJoinInnerPreload(outer_gts, &m_kmrels))
+			return gpupreagg_create_task(gpas, NULL, m_kmrels, outer_depth);
 	}
 	/* setup a terminator task */
 	gpas->terminator_done = true;
@@ -5079,11 +5134,11 @@ gpupreagg_throw_partial_result(GpuPreAggTask *gpreagg,
 		   gresp->kern.row_inval_map_size);
 
 	/* Back GpuTask to GTS */
-	pthreadMutexLock(gcontext->mutex);
+	pthreadMutexLock(&gcontext->worker_mutex);
 	dlist_push_tail(&gts->ready_tasks,
 					&gresp->task.chain);
 	gts->num_ready_tasks++;
-	pthreadMutexUnlock(gcontext->mutex);
+	pthreadMutexUnlock(&gcontext->worker_mutex);
 
 	SetLatch(MyLatch);
 }
@@ -5107,6 +5162,7 @@ gpupreagg_process_reduction_task(GpuPreAggTask *gpreagg,
 	CUdeviceptr		m_gpreagg = (CUdeviceptr)&gpreagg->kern;
 	CUdeviceptr		m_nullptr = 0UL;
 	CUdeviceptr		m_kds_src = 0UL;
+	CUdeviceptr		m_kds_extra = 0UL;
 	CUdeviceptr		m_kds_slot = 0UL;
 	CUdeviceptr		m_kds_final = (CUdeviceptr)&pds_final->kds;
 	CUdeviceptr		m_fhash = gpas->m_fhash;
@@ -5137,6 +5193,9 @@ gpupreagg_process_reduction_task(GpuPreAggTask *gpreagg,
 			break;
 		case KDS_FORMAT_ARROW:
 			kfunc_setup = "kern_gpupreagg_setup_arrow";
+			break;
+		case KDS_FORMAT_COLUMN:
+			kfunc_setup = "kern_gpupreagg_setup_column";
 			break;
 		default:
 			werror("GpuPreAgg: unknown PDS format: %d", pds_src->kds.format);
@@ -5199,6 +5258,11 @@ gpupreagg_process_reduction_task(GpuPreAggTask *gpreagg,
 		else
 			werror("failed on gpuMemAllocIOMap: %s", errorText(rc));
 	}
+	else if (pds_src->kds.format == KDS_FORMAT_COLUMN)
+	{
+		m_kds_src = pds_src->m_kds_base;
+		m_kds_extra = pds_src->m_kds_extra;
+	}
 	else
 	{
 		m_kds_src = (CUdeviceptr)&pds_src->kds;
@@ -5237,7 +5301,7 @@ gpupreagg_process_reduction_task(GpuPreAggTask *gpreagg,
 		if (rc != CUDA_SUCCESS)
 			werror("failed on cuMemcpyHtoD: %s", errorText(rc));
 	}
-	else
+	else if (pds_src->kds.format != KDS_FORMAT_COLUMN)
 	{
 		rc = cuMemPrefetchAsync(m_kds_src,
 								pds_src->kds.length,
@@ -5269,7 +5333,8 @@ resume_kernel:
 
 	kern_args[0] = &m_gpreagg;
 	kern_args[1] = &m_kds_src;
-	kern_args[2] = &m_kds_slot;
+	kern_args[2] = &m_kds_extra;
+	kern_args[3] = &m_kds_slot;
 	rc = cuLaunchKernel(kern_setup,
 						gpreagg->kern.grid_sz, 1, 1,
 						gpreagg->kern.block_sz, 1, 1,
@@ -5465,6 +5530,7 @@ gpupreagg_process_combined_task(GpuPreAggTask *gpreagg, CUmodule cuda_module)
 	CUdeviceptr		m_kgjoin = (CUdeviceptr)kgjoin;
 	CUdeviceptr		m_kmrels = gpreagg->m_kmrels;
 	CUdeviceptr		m_kds_src = 0UL;
+	CUdeviceptr		m_kds_extra = 0UL;
 	CUdeviceptr		m_kds_slot = 0UL;
 	CUdeviceptr		m_kds_final = (CUdeviceptr)&pds_final->kds;
 	CUdeviceptr		m_fhash = gpas->m_fhash;
@@ -5597,12 +5663,6 @@ gpupreagg_process_combined_task(GpuPreAggTask *gpreagg, CUmodule cuda_module)
 				werror("failed on cuMemPrefetchAsync: %s", errorText(rc));
 		}
 	}
-	else
-	{
-		GpuTaskState   *outer_gts = (GpuTaskState *)
-			outerPlanState(gpreagg->task.gts);
-		gpujoinColocateOuterJoinMaps(outer_gts, cuda_module);
-	}
 resume_kernel:
 	/* make kds_slot empty again */
 	((kern_data_store *)m_kds_slot)->nitems = 0;
@@ -5614,6 +5674,7 @@ resume_kernel:
 	 * gpujoin_main(kern_gpujoin *kgjoin,
 	 *              kern_multirels *kmrels,
 	 *              kern_data_store *kds_src,
+	 *              kern_data_extra *kds_extra,
 	 *              kern_data_store *kds_slot,
 	 *              kern_parambuf *kparams_gpreagg)
 	 * OR
@@ -5638,12 +5699,18 @@ resume_kernel:
 	kern_args[0] = &m_kgjoin;
 	kern_args[1] = &m_kmrels;
 	if (pds_src != NULL)
+	{
 		kern_args[2] = &m_kds_src;
+		kern_args[3] = &m_kds_extra;
+		kern_args[4] = &m_kds_slot;
+		kern_args[5] = &m_kparams;
+	}
 	else
+	{
 		kern_args[2] = &gpreagg->outer_depth;
-	kern_args[3] = &m_kds_slot;
-	kern_args[4] = &m_kparams;
-
+		kern_args[3] = &m_kds_slot;
+		kern_args[4] = &m_kparams;
+	}
 	rc = cuLaunchKernel(kern_gpujoin_main,
 						grid_sz, 1, 1,
 						block_sz, 1, 1,
@@ -5833,13 +5900,34 @@ static int
 gpupreagg_process_task(GpuTask *gtask, CUmodule cuda_module)
 {
 	GpuPreAggTask  *gpreagg = (GpuPreAggTask *) gtask;
-	int		retval;
+	pgstrom_data_store *pds_src = gpreagg->pds_src;
+	volatile bool	gstore_mapped = false;
+	int				retval;
+	CUresult		rc;
 
-	if (!gpreagg->kgjoin)
-		retval = gpupreagg_process_reduction_task(gpreagg, cuda_module);
-	else
-		retval = gpupreagg_process_combined_task(gpreagg, cuda_module);
-
+	STROM_TRY();
+	{
+		if (pds_src->kds.format == KDS_FORMAT_COLUMN)
+		{
+			rc = gstoreFdwMapDeviceMemory(GpuWorkerCurrentContext, pds_src);
+			if (rc != CUDA_SUCCESS)
+				werror("failed on gstoreFdwMapDeviceMemory: %s", errorText(rc));
+			gstore_mapped = true;
+		}
+		if (!gpreagg->kgjoin)
+			retval = gpupreagg_process_reduction_task(gpreagg, cuda_module);
+		else
+			retval = gpupreagg_process_combined_task(gpreagg, cuda_module);
+	}
+	STROM_CATCH();
+	{
+		if (gstore_mapped)
+			gstoreFdwUnmapDeviceMemory(GpuWorkerCurrentContext, pds_src);
+		STROM_RE_THROW();
+	}
+	STROM_END_TRY();
+	if (gstore_mapped)
+		gstoreFdwUnmapDeviceMemory(GpuWorkerCurrentContext, pds_src);
 	return retval;
 }
 

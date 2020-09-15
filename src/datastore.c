@@ -18,6 +18,7 @@
  */
 #include "pg_strom.h"
 #include "cuda_numeric.h"
+#include "cuda_gstore.h"
 #include "nvme_strom.h"
 
 /*
@@ -64,15 +65,16 @@ KDS_fetch_tuple_row(TupleTableSlot *slot,
 {
 	if (row_index < kds->nitems)
 	{
+		HeapTupleData	tupleData;
 		kern_tupitem   *tup_item = KERN_DATA_STORE_TUPITEM(kds, row_index);
 
 		ExecClearTuple(slot);
-		tuple_buf->t_len  = tup_item->t_len;
-		tuple_buf->t_self = tup_item->t_self;
-		tuple_buf->t_tableOid = kds->table_oid;
-		tuple_buf->t_data = &tup_item->htup;
+		tupleData.t_len  = tup_item->t_len;
+		tupleData.t_self = tup_item->htup.t_ctid;
+		tupleData.t_tableOid = kds->table_oid;
+		tupleData.t_data = &tup_item->htup;
 
-		ExecStoreHeapTuple(tuple_buf, slot, false);
+		ExecForceStoreHeapTuple(&tupleData, slot, false);
 
 		return true;
 	}
@@ -88,29 +90,196 @@ KDS_fetch_tuple_slot(TupleTableSlot *slot,
 	{
 		Datum  *tts_values = KERN_DATA_STORE_VALUES(kds, row_index);
 		char   *tts_isnull = KERN_DATA_STORE_DCLASS(kds, row_index);
-		int		i, natts = slot->tts_tupleDescriptor->natts;
-
-		for (i=0; i < natts; i++)
-			Assert(tts_isnull[i] == DATUM_CLASS__NORMAL ||
-				   tts_isnull[i] == DATUM_CLASS__NULL);
+		int		natts = slot->tts_tupleDescriptor->natts;
 
 		ExecClearTuple(slot);
 		memcpy(slot->tts_values, tts_values, sizeof(Datum) * natts);
 		memcpy(slot->tts_isnull, tts_isnull, sizeof(bool) * natts);
-#ifdef NOT_USED
-		/*
-		 * XXX - pointer reference is better than memcpy from performance
-		 * perspectives, however, we need to ensure tts_values/tts_isnull
-		 * shall be restored when pgstrom-data-store is released.
-		 * It will be cause of complicated / invisible bugs.
-		 */
-		slot->tts_values = tts_values;
-		slot->tts_isnull = tts_isnull;
-#endif
 		ExecStoreVirtualTuple(slot);
 		return true;
 	}
 	return false;
+}
+
+Datum
+KDS_fetch_datum_column(kern_data_store *kds,
+					   kern_colmeta *cmeta,
+					   size_t row_index,
+					   bool *p_isnull)
+{
+	char	   *addr;
+	Datum		datum;
+
+	Assert(cmeta >= &kds->colmeta[0] &&
+		   cmeta <  &kds->colmeta[kds->nr_colmeta] &&
+		   row_index < kds->nrooms);
+
+	if (cmeta->nullmap_offset != 0)
+	{
+		bits8  *nullmap = (bits8 *)
+			((char *)kds + __kds_unpack(cmeta->nullmap_offset));
+		if (att_isnull(row_index, nullmap))
+		{
+			*p_isnull = true;
+			return 0;
+		}
+	}
+	*p_isnull = false;
+
+	addr = (char *)kds + __kds_unpack(cmeta->values_offset);
+	if (cmeta->attbyval)
+	{
+		addr += TYPEALIGN(cmeta->attalign,
+						  cmeta->attlen) * row_index;
+		switch (cmeta->attlen)
+		{
+			case sizeof(cl_uchar):
+				datum = UInt8GetDatum(*((cl_uchar *)addr));
+				break;
+			case sizeof(cl_ushort):
+				datum = UInt16GetDatum(*((cl_ushort *)addr));
+				break;
+			case sizeof(cl_uint):
+				datum = UInt32GetDatum(*((cl_uint *)addr));
+				break;
+			case sizeof(cl_ulong):
+				datum = UInt64GetDatum(*((cl_ulong *)addr));
+				break;
+			default:
+				elog(ERROR, "unexpected type definition");
+		}
+	}
+	else if (cmeta->attlen > 0)
+	{
+		addr += TYPEALIGN(cmeta->attalign,
+						  cmeta->attlen) * row_index;
+		datum = PointerGetDatum(addr);
+	}
+	else if (cmeta->attlen == -1)
+	{
+		kern_data_extra *extra = (kern_data_extra *)((char *)kds + kds->extra_hoffset);
+		size_t		off = __kds_unpack(((cl_uint *)addr)[row_index]);
+
+		Assert(off < extra->length);
+		datum = PointerGetDatum((char *)extra + off);
+	}
+	else
+	{
+		elog(ERROR, "unsupported type definition attlen=%d attbyval=%d", cmeta->attlen, cmeta->attbyval);
+	}
+	return datum;
+}
+
+void
+__KDS_store_datum_column(kern_data_store *kds,
+						 kern_colmeta *cmeta,
+						 size_t row_index,
+						 Datum datum, bool isnull)
+{
+
+
+	char	   *addr;
+
+	Assert(kds->format == KDS_FORMAT_COLUMN &&
+		   cmeta >= &kds->colmeta[0] &&
+		   cmeta <  &kds->colmeta[kds->ncols] &&
+		   row_index < kds->nrooms);
+	if (cmeta->nullmap_offset != 0)
+	{
+		uint32 *nullmap = (uint32 *)
+			((char *)kds + __kds_unpack(cmeta->nullmap_offset));
+
+		/*
+		 * Row-level lock prevents concurrent access per row basis.
+		 * So, null-bitmap must be set/cleared by atomic operations,
+		 * because other bits are not locked at this moment.
+		 */
+		if (!isnull)
+			__atomic_fetch_or(nullmap + (row_index >> 5),
+							  (1U << (row_index & 0x1f)),
+							  __ATOMIC_SEQ_CST);
+		else
+		{
+			__atomic_fetch_and(nullmap + (row_index >> 5),
+							   ~(1U << (row_index & 0x1f)),
+							   __ATOMIC_SEQ_CST);
+			return;
+		}
+	}
+	else if (isnull)
+	{
+		elog(ERROR, "NULL value on '%s' column with NOT NULL constraint",
+			 NameStr(cmeta->attname));
+	}
+
+	addr = (char *)kds + __kds_unpack(cmeta->values_offset);
+	if (cmeta->attbyval)
+	{
+		switch (cmeta->attlen)
+		{
+			case sizeof(cl_uchar):
+				((cl_uchar *)addr)[row_index] = DatumGetUInt8(datum);
+				break;
+			case sizeof(cl_ushort):
+				((cl_ushort *)addr)[row_index] = DatumGetUInt16(datum);
+				break;
+			case sizeof(cl_uint):
+				((cl_uint *)addr)[row_index] = DatumGetUInt32(datum);
+				break;
+			case sizeof(cl_ulong):
+				((cl_ulong *)addr)[row_index] = DatumGetUInt64(datum);
+				break;
+			default:
+				elog(ERROR, "unsupported type definition");
+		}
+	}
+	else if (cmeta->attlen > 0)
+	{
+		addr += TYPEALIGN(cmeta->attalign,
+						  cmeta->attlen) * row_index;
+		memcpy(addr, DatumGetPointer(datum), cmeta->attlen);
+	}
+	else if (cmeta->attlen == -1)
+	{
+		kern_data_extra *extra = (kern_data_extra *)((char *)kds + kds->extra_hoffset);
+
+		Assert(kds->extra_hoffset > 0);
+		Assert((char *)datum >= (char *)extra &&
+			   (char *)datum + VARSIZE_ANY(datum) <= (char *)extra + extra->length);
+		((cl_uint *)addr)[row_index] = __kds_packed((char *)datum - (char *)extra);
+	}
+	else
+	{
+		elog(ERROR, "unsupported type definition");
+	}	
+}
+
+/*
+ * NOTE: caller must ensure this KDS has no concurrent updates by lock or
+ * other way.
+ */
+void
+KDS_store_datum_column(kern_data_store *kds,
+					   kern_colmeta *cmeta,
+					   size_t row_index,
+					   Datum datum, bool isnull)
+{
+	/* allocation of extra buffer, and copy the varlena datum */
+	if (cmeta->attlen == -1)
+	{
+		kern_data_extra *extra = (kern_data_extra *)
+			((char *)kds + kds->extra_hoffset);
+		size_t		sz = VARSIZE_ANY(datum);
+		char	   *pos;
+
+		Assert(extra->usage + sz <= extra->length);
+		pos = (char *)extra + extra->usage;
+		memcpy(pos, DatumGetPointer(datum), sz);
+		extra->usage += MAXALIGN(sz);
+
+		datum = PointerGetDatum(pos);
+	}
+	__KDS_store_datum_column(kds, cmeta, row_index, datum, isnull);
 }
 
 bool
@@ -121,44 +290,20 @@ KDS_fetch_tuple_column(TupleTableSlot *slot,
 	TupleDesc	tupdesc = slot->tts_tupleDescriptor;
 	int			j;
 
-	/*
-	 * XXX - Is a mode to fetch system columns (if any) valuable?
-	 * Right now, KDS_fetch_tuple_column() is only used by gstore_fdw.c
-	 * to fetch rows from KDS(column), however, its transaction control
-	 * properties are separately saved, thus, nobody tries to pick up
-	 * system columns via this API.
-	 */
 	Assert(kds->format == KDS_FORMAT_COLUMN);
-	Assert(kds->ncols == tupdesc->natts);
-	if (row_index >= kds->nitems)
-	{
-		ExecClearTuple(slot);
-		return false;
-	}
+	Assert(kds->ncols >= tupdesc->natts);
+	Assert(row_index < kds->nrooms);
 
+	ExecClearTuple(slot);
 	for (j=0; j < tupdesc->natts; j++)
 	{
-		void   *addr = kern_get_datum_column(kds, j, row_index);
-		int		attlen = kds->colmeta[j].attlen;
+		kern_colmeta *cmeta = &kds->colmeta[j];
+		Datum	datum;
+		bool	isnull;
 
-		if (!addr)
-			slot->tts_isnull[j] = true;
-		else
-		{
-			slot->tts_isnull[j] = false;
-			if (!kds->colmeta[j].attbyval)
-				slot->tts_values[j] = PointerGetDatum(addr);
-			else if (attlen == sizeof(cl_char))
-				slot->tts_values[j] = CharGetDatum(*((cl_char *)addr));
-			else if (attlen == sizeof(cl_short))
-				slot->tts_values[j] = Int16GetDatum(*((cl_short *)addr));
-			else if (attlen == sizeof(cl_int))
-				slot->tts_values[j] = Int32GetDatum(*((cl_int *)addr));
-			else if (attlen == sizeof(cl_long))
-				slot->tts_values[j] = Int64GetDatum(*((cl_long *)addr));
-			else
-				elog(ERROR, "unexpected attlen: %d", attlen);
-		}
+		datum = KDS_fetch_datum_column(kds, cmeta, row_index, &isnull);
+		slot->tts_isnull[j] = isnull;
+		slot->tts_values[j] = datum;
 	}
 	ExecStoreVirtualTuple(slot);
 
@@ -197,7 +342,7 @@ KDS_fetch_tuple_block(TupleTableSlot *slot,
 			tuple->t_tableOid = (rel ? RelationGetRelid(rel) : InvalidOid);
 			tuple->t_data = (HeapTupleHeader)((char *)hpage +
 											  ItemIdGetOffset(lpp));
-			ExecStoreHeapTuple(tuple, slot, false);
+			ExecForceStoreHeapTuple(tuple, slot, false);
 			return true;
 		}
 		/* move to the next block */
@@ -328,20 +473,15 @@ PDS_release(pgstrom_data_store *pds)
 	Assert(refcnt >= 0);
 	if (refcnt == 0)
 	{
+
+
+		
 		if (!pds->gcontext)
 		{
-			Assert(pds->kds.format == KDS_FORMAT_ARROW);
+			Assert(pds->kds.format == KDS_FORMAT_ARROW ||
+				   pds->kds.format == KDS_FORMAT_COLUMN);
 			pfree(pds);
 		}
-#if 0
-		else if ((pds->kds.format == KDS_FORMAT_BLOCK) ||
-				 (pds->kds.format == KDS_FORMAT_ARROW && pds->iovec))
-		{
-			rc = gpuMemFreeHost(gcontext, pds);
-			if (rc != CUDA_SUCCESS)
-				werror("failed on gpuMemFreeHost: %s", errorText(rc));
-		}
-#endif
 		else
 		{
 			rc = gpuMemFree(gcontext, (CUdeviceptr) pds);
@@ -405,13 +545,33 @@ __init_kernel_column_metadata(kern_data_store *kds,
 	typ = (Form_pg_type) GETSTRUCT(tup);
 
 	cmeta->attbyval = typ->typbyval;
-	if (!cmeta->attbyval)
-		kds->has_notbyval = true;
 	cmeta->attalign = typealign_get_width(typ->typalign);
 	cmeta->attlen   = typ->typlen;
+	if (cmeta->attlen == 0 || cmeta->attlen < -1)
+		elog(ERROR, "type %s has unexpected length (%d)",
+			 NameStr(typ->typname), typ->typlen);
+	else if (cmeta->attlen == -1)
+		kds->has_varlena = true;
 	cmeta->attnum   = attnum;
 	if (p_attcacheoff && *p_attcacheoff > 0)
-		cmeta->attcacheoff = att_align_nominal(*p_attcacheoff, typ->typalign);
+	{
+		/*
+		 * Special case handling - varlena can use attcacheoff only if offset
+		 * is aligned, thus we can reference the value regardless of the format
+		 * and padding.
+		 */
+		if (typ->typlen == -1)
+		{
+			int		__off = att_align_nominal(*p_attcacheoff, typ->typalign);
+
+			if (*p_attcacheoff == __off)
+				cmeta->attcacheoff = __off;
+			else
+				cmeta->attcacheoff = -1;
+		}
+		else
+			cmeta->attcacheoff = att_align_nominal(*p_attcacheoff, typ->typalign);
+	}
 	else
 		cmeta->attcacheoff = -1;
 	cmeta->atttypid = atttypid;
@@ -496,11 +656,13 @@ __init_kernel_column_metadata(kern_data_store *kds,
 				break;
 		}
 	}
-	if (p_attcacheoff && *p_attcacheoff > 0 && typ->typlen > 0)
-		*p_attcacheoff += typ->typlen;
-	else
-		*p_attcacheoff = -1;
-
+	if (p_attcacheoff)
+	{
+		if (*p_attcacheoff > 0 && typ->typlen > 0)
+			*p_attcacheoff += typ->typlen;
+		else
+			*p_attcacheoff = -1;
+	}
 	ReleaseSysCache(tup);
 }
 
@@ -571,10 +733,90 @@ KDS_calculateHeadSize(TupleDesc tupdesc)
 	for (j=0; j < tupdesc->natts; j++)
 	{
 		Form_pg_attribute attr = tupleDescAttr(tupdesc, j);
-
 		nr_colmeta += count_num_of_subfields(attr->atttypid);
 	}
 	return STROMALIGN(offsetof(kern_data_store, colmeta[nr_colmeta]));
+}
+
+/*
+ * Check compatibility of KDS schema-definition
+ */
+static bool
+__check_kern_colmeta_compatibility(Oid type_oid, int type_mod,
+								   kern_data_store *kds, kern_colmeta *cmeta)
+{
+	HeapTuple		tup;
+	Form_pg_type	typ;
+	bool			retval = false;
+
+	if (cmeta->atttypid != type_oid ||
+		cmeta->atttypmod != type_mod)
+		return false;
+
+	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type_oid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for type %u", type_oid);
+	typ = (Form_pg_type) GETSTRUCT(tup);
+
+	if ((cmeta->attbyval && !typ->typbyval) ||
+        (!cmeta->attbyval && typ->typbyval) ||
+		(cmeta->attalign != typealign_get_width(typ->typalign)) ||
+		(cmeta->attlen != typ->typlen))
+		goto not_compatible;
+
+	if (OidIsValid(typ->typelem))
+	{
+		kern_colmeta   *__cmeta = kds->colmeta + cmeta->idx_subattrs;
+
+		if (cmeta->idx_subattrs >= kds->nr_colmeta ||
+			cmeta->num_subattrs != 1 ||
+			!__check_kern_colmeta_compatibility(typ->typelem, -1,
+												kds, __cmeta))
+			goto not_compatible;
+	}
+	else if (OidIsValid(typ->typrelid))
+	{
+		kern_colmeta   *__cmeta = kds->colmeta + cmeta->idx_subattrs;
+		TupleDesc		rowdesc;
+		int				j;
+
+		rowdesc = lookup_rowtype_tupdesc(type_oid, type_mod);
+		if (rowdesc->natts != cmeta->num_subattrs ||
+			cmeta->idx_subattrs + cmeta->num_subattrs > kds->nr_colmeta)
+			goto not_compatible;
+		for (j=0; j < rowdesc->natts; j++)
+		{
+			Form_pg_attribute __attr = tupleDescAttr(rowdesc, j);
+
+			if (!__check_kern_colmeta_compatibility(__attr->atttypid,
+													__attr->atttypmod,
+													kds, __cmeta+j))
+				goto not_compatible;
+		}
+	}
+	retval = true;
+not_compatible:
+	ReleaseSysCache(tup);
+	return retval;
+}
+
+bool
+KDS_schemaIsCompatible(TupleDesc tupdesc, kern_data_store *kds)
+{
+	int		j;
+	
+	if (kds->ncols != tupdesc->natts)
+		return false;
+	for (j=0; j < tupdesc->natts; j++)
+	{
+		Form_pg_attribute attr = tupleDescAttr(tupdesc, j);
+
+		if (!__check_kern_colmeta_compatibility(attr->atttypid,
+												attr->atttypmod,
+												kds, &kds->colmeta[j]))
+			return false;
+	}
+	return true;
 }
 
 pgstrom_data_store *
@@ -655,14 +897,15 @@ __PDS_create_slot(GpuContext *gcontext,
 	CUresult	rc;
 	size_t		kds_head_sz;
 	size_t		unitsz;
-	size_t		nrooms;
+	size_t		nrooms = UINT_MAX;
 
 	bytesize = STROMALIGN_DOWN(bytesize);
 	kds_head_sz = KDS_calculateHeadSize(tupdesc);
 	if (kds_head_sz > bytesize)
 		elog(ERROR, "Required length for KDS-Slot is too short");
 	unitsz = MAXALIGN((sizeof(Datum) + sizeof(char)) * tupdesc->natts);
-	nrooms = (bytesize - kds_head_sz) / unitsz;
+	if (unitsz > 0)
+		nrooms = (bytesize - kds_head_sz) / unitsz;
 
 	rc = __gpuMemAllocManaged(gcontext,
 							  &m_deviceptr,
@@ -722,6 +965,41 @@ __PDS_create_block(GpuContext *gcontext,
 	pds->filedesc = -1;
 
 	return pds;
+}
+
+/*
+ * debug support
+ */
+void
+KDS_dump_schema(kern_data_store *kds)
+{
+	int		j;
+
+	elog(INFO, "KDS { length=%zu, nitems=%u, usage=%u, nrooms=%u, ncols=%d, format=%d, has_varlena=%s }",
+		 kds->length,
+		 kds->nitems,
+		 kds->usage,
+		 kds->nrooms,
+		 kds->ncols,
+		 kds->format,
+		 kds->has_varlena ? "true" : "false");
+	for (j=0; j < kds->nr_colmeta; j++)
+	{
+		kern_colmeta   *cmeta = &kds->colmeta[j];
+
+		elog(INFO, "cmeta%c%d%c { attbyval=%d, attalign=%d, attlen=%d, attnum=%d, attcacheoff=%d, atttypid=%u, atttypmod=%d, atttypkind=%d }",
+			 j < kds->ncols ? '[' : '(',
+			 j,
+			 j < kds->ncols ? ']' : ')',
+			 cmeta->attbyval,
+			 cmeta->attalign,
+			 cmeta->attlen,
+			 cmeta->attnum,
+			 cmeta->attcacheoff,
+			 cmeta->atttypid,
+			 cmeta->atttypmod,
+			 cmeta->atttypkind);
+	}
 }
 
 /*
@@ -1150,13 +1428,13 @@ PDS_exec_heapscan_row(pgstrom_data_store *pds,
 		curr_usage = (__kds_unpack(kds->usage) +
 					  MAXALIGN(offsetof(kern_tupitem, htup) + tup.t_len));
 		tup_item = (kern_tupitem *)((char *)kds + kds->length - curr_usage);
-		tup_index[ntup] = __kds_packed((uintptr_t)tup_item - (uintptr_t)kds);
+		tup_item->rowid = kds->nitems + ntup;
 		tup_item->t_len = tup.t_len;
-		tup_item->t_self = tup.t_self;
 		memcpy(&tup_item->htup, tup.t_data, tup.t_len);
-		kds->usage = __kds_packed(curr_usage);
+		memcpy(&tup_item->htup.t_ctid, &tup.t_self, sizeof(ItemPointerData));
 
-		ntup++;
+		tup_index[ntup++] = __kds_packed((uintptr_t)tup_item - (uintptr_t)kds);
+		kds->usage = __kds_packed(curr_usage);
 	}
 	UnlockReleaseBuffer(buffer);
 	Assert(ntup <= MaxHeapTuplesPerPage);
@@ -1229,9 +1507,10 @@ KDS_insert_tuple(kern_data_store *kds, TupleTableSlot *slot)
 		return false;
 
 	tup_item = (kern_tupitem *)((char *)kds + kds->length - curr_usage);
+	tup_item->rowid = kds->nitems;
 	tup_item->t_len = tuple->t_len;
-	tup_item->t_self = tuple->t_self;
 	memcpy(&tup_item->htup, tuple->t_data, tuple->t_len);
+	memcpy(&tup_item->htup.t_ctid, &tuple->t_self, sizeof(ItemPointerData));
 	tup_index[kds->nitems++] = __kds_packed((uintptr_t)tup_item -
 											(uintptr_t)kds);
 	kds->usage = __kds_packed(curr_usage);
@@ -1279,12 +1558,12 @@ KDS_insert_hashitem(kern_data_store *kds,
 	khitem = (kern_hashitem *)((char *)kds + kds->length - curr_usage);
 	khitem->hash = hash_value;
 	khitem->next = 0x7f7f7f7f;	/* to be set later */
-	khitem->rowid = kds->nitems++;
+	khitem->t.rowid = kds->nitems;
 	khitem->t.t_len = tuple->t_len;
-	khitem->t.t_self = tuple->t_self;
 	memcpy(&khitem->t.htup, tuple->t_data, tuple->t_len);
+	memcpy(&khitem->t.htup.t_ctid, &tuple->t_self, sizeof(ItemPointerData));
 
-	row_index[khitem->rowid] = __kds_packed((char *)&khitem->t.t_len -
+	row_index[kds->nitems++] = __kds_packed((char *)&khitem->t.t_len -
 											(char *)kds);
 	kds->usage = __kds_packed(curr_usage);
 

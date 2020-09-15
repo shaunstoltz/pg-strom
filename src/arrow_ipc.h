@@ -58,7 +58,7 @@ struct SQLtype__pgsql
 
 struct SQLtype__mysql
 {
-	const char *typname;
+	int			typeid;
 };
 
 union SQLtype
@@ -122,20 +122,19 @@ struct hashItem
 	struct hashItem	*next;
 	uint32		hash;
 	uint32		index;
-	uint32		label_len;
+	uint32		label_sz;
 	char		label[FLEXIBLE_ARRAY_MEMBER];
 };
 
 struct SQLdictionary
 {
 	struct SQLdictionary *next;
-	Oid			enum_typeid;
-	int			dict_id;
-	char		is_delta;
+	int64		dict_id;
 	SQLbuffer	values;
 	SQLbuffer	extra;
+	int			nloaded;	/* # of items loaded from existing file */
 	int			nitems;
-	int			nslots;			/* width of hash slot */
+	int			nslots;		/* width of hash slot */
 	hashItem   *hslots[FLEXIBLE_ARRAY_MEMBER];
 };
 
@@ -167,24 +166,31 @@ extern int		assignArrowTypePgSQL(SQLfield *column,
 									 char typtype,
 									 char typalign,
 									 Oid typrelid,
-									 Oid typelem);
+									 Oid typelem,
+									 const char *tz_name,
+									 ArrowField *arrow_field);
 /*
  * Error messages, and misc definitions for pg2arrow
  */
-#ifndef __PG2ARROW__
-#define Elog(fmt, ...)		elog(ERROR,(fmt),##__VA_ARGS__)
-#else
+#ifdef __PGSTROM_MODULE__
+#define Elog(fmt, ...)			elog(ERROR,(fmt),##__VA_ARGS__)
+#else /* __PGSTROM_MODULE__ */
 #define Elog(fmt, ...)								\
 	do {											\
 		fprintf(stderr,"%s:%d  " fmt "\n",			\
 				__FILE__,__LINE__, ##__VA_ARGS__);	\
 		exit(1);									\
 	} while(0)
-#endif
+#endif /* __PGSTROM_MODULE__ */
 
 /*
  * SQLbuffer related routines
  */
+extern void	   *palloc(Size sz);
+extern void	   *palloc0(Size sz);
+extern char	   *pstrdup(const char *orig);
+extern void	   *repalloc(void *ptr, Size sz);
+
 static inline void
 sql_buffer_init(SQLbuffer *buf)
 {

@@ -28,6 +28,13 @@
 #include <pg_config_manual.h>
 #endif	/* __CUDACC__ */
 
+/* check MAXIMUM_ALIGNOF */
+#if MAXIMUM_ALIGNOF == 8
+#define MAXIMUM_ALIGNOF_SHIFT	3
+#else
+#error Unexpected MAXIMUM_ALIGNOF definition
+#endif
+
 /*
  * Basic type definition - because of historical reason, we use "cl_"
  * prefix for the definition of data types below. It might imply
@@ -61,8 +68,12 @@ typedef double				cl_double;
 typedef cl_ulong			uintptr_t;
 #endif
 
+#define CL_SHORT_NBITS		(sizeof(cl_short) * BITS_PER_BYTE)
+#define CL_INT_NBITS		(sizeof(cl_int) * BITS_PER_BYTE)
+#define CL_LONG_NBITS		(sizeof(cl_long) * BITS_PER_BYTE)
+
 /* PG's utility macros */
-#ifndef PG_STROM_H
+#ifdef __CUDACC__
 #ifdef offsetof
 #undef offsetof
 #endif /* offsetof */
@@ -89,18 +100,12 @@ typedef cl_ulong			uintptr_t;
 #define container_of(TYPE,FIELD,PTR)			\
 	((TYPE *)((char *) (PTR) - offsetof(TYPE, FIELD)))
 
+#ifndef true
 #define true			((cl_bool) 1)
+#endif
+#ifndef false
 #define false			((cl_bool) 0)
-#if MAXIMUM_ALIGNOF == 16
-#define MAXIMUM_ALIGNOF_SHIFT	4
-#elif MAXIMUM_ALIGNOF == 8
-#define MAXIMUM_ALIGNOF_SHIFT	3
-#elif MAXIMUM_ALIGNOF == 4
-#define MAXIMUM_ALIGNOF_SHIFT	2
-#else
-#error Unexpected MAXIMUM_ALIGNOF definition
-#endif	/* MAXIMUM_ALIGNOF */
-
+#endif
 #ifdef __CUDACC__
 #undef FLEXIBLE_ARRAY_MEMBER
 #define FLEXIBLE_ARRAY_MEMBER	1
@@ -238,7 +243,7 @@ typedef struct nameData
 #define LONGALIGN_DOWN(LEN)     TYPEALIGN_DOWN(sizeof(cl_long), (LEN))
 #define MAXALIGN(LEN)			TYPEALIGN(MAXIMUM_ALIGNOF, (LEN))
 #define MAXALIGN_DOWN(LEN)		TYPEALIGN_DOWN(MAXIMUM_ALIGNOF, (LEN))
-#endif		/* PG_STROM_H */
+#endif	/* __CUDACC__ */
 
 /* wider alignment */
 #define STROMALIGN_LEN			16
@@ -391,6 +396,7 @@ typedef struct
 	const char	   *error_funcname;
 	const char	   *error_message;	/* !!only const static cstring!! */
 	struct kern_parambuf *kparams;
+	void		   *stack_bounds;
 	cl_char		   *vlpos;
 	cl_char		   *vlend;
 	cl_char			vlbuf[1];
@@ -414,11 +420,12 @@ typedef struct
 
 #define INIT_KERNEL_CONTEXT(kcxt,__kparams)							\
 	do {															\
-		memset(kcxt, 0, offsetof(kern_context, vlbuf));				\
-		(kcxt)->kparams = (__kparams);								\
-		assert((cl_ulong)(__kparams) == MAXALIGN(__kparams));		\
-		(kcxt)->vlpos = (kcxt)->vlbuf;								\
-		(kcxt)->vlend = (kcxt)->vlbuf + KERN_CONTEXT_VARLENA_BUFSZ; \
+		memset(kcxt, 0, offsetof(kern_context, vlbuf));					\
+		(kcxt)->kparams = (__kparams);									\
+		assert((cl_ulong)(__kparams) == MAXALIGN(__kparams));			\
+		(kcxt)->stack_bounds = (char *)(kcxt) - KERN_CONTEXT_STACK_LIMIT; \
+		(kcxt)->vlpos = (kcxt)->vlbuf;									\
+		(kcxt)->vlend = (kcxt)->vlbuf + KERN_CONTEXT_VARLENA_BUFSZ;		\
 	} while(0)
 
 #define PTR_ON_VLBUF(kcxt,ptr,len)							\
@@ -437,6 +444,9 @@ kern_context_alloc(kern_context *kcxt, size_t len)
 	}
 	return NULL;
 }
+
+#define CHECK_KERNEL_STACK_DEPTH(kcxt)						\
+	(((cl_ulong)((kcxt)->stack_bounds)) > ((cl_ulong)(&(kcxt))))
 
 #ifdef __CUDA_ARCH__
 /*
@@ -472,6 +482,9 @@ __STROM_EREPORT(kern_context *kcxt, cl_int errcode,
 	}
 }
 
+#define STROM_ELOG(kcxt, message)										\
+	__STROM_EREPORT((kcxt),ERRCODE_INTERNAL_ERROR,						\
+					__FILE__,__LINE__,__FUNCTION__,(message))
 #define STROM_EREPORT(kcxt, errcode, message)							\
 	__STROM_EREPORT((kcxt),(errcode),									\
 					__FILE__,__LINE__,__FUNCTION__,(message))
@@ -537,7 +550,7 @@ kern_writeback_error_status(kern_errorbuf *result, kern_context *kcxt)
 #define STROM_CPU_FALLBACK(a,b,c)	STROM_EREPORT((a),(b),(c))
 #endif	/* !__CUDA_ARCH__ && !__CUDACC__ */
 
-#ifndef PG_STROM_H
+#ifdef __CUDACC__
 /* definitions at storage/block.h */
 typedef cl_uint		BlockNumber;
 #define InvalidBlockNumber		((BlockNumber) 0xFFFFFFFF)
@@ -554,6 +567,14 @@ typedef struct {
 	} ip_blkid;
 	cl_ushort		ip_posid;
 } ItemPointerData;
+
+STATIC_FUNCTION(cl_bool)
+ItemPointerEquals(ItemPointerData *ip1, ItemPointerData *ip2)
+{
+	return (ip1->ip_blkid.bi_hi == ip2->ip_blkid.bi_hi &&
+			ip1->ip_blkid.bi_lo == ip2->ip_blkid.bi_lo &&
+			ip1->ip_posid       == ip2->ip_posid);
+}
 
 typedef struct HeapTupleFields
 {
@@ -614,13 +635,65 @@ typedef struct {
 #define HEAP2_XACT_MASK			0xE000	/* visibility-related bits */
 
 /*
+ * Index tuple header structure
+ *
+ * All index tuples start with IndexTupleData.  If the HasNulls bit is set,
+ * this is followed by an IndexAttributeBitMapData.  The index attribute
+ * values follow, beginning at a MAXALIGN boundary.
+ */
+typedef struct IndexTupleData
+{
+	ItemPointerData		t_tid;		/* reference TID to heap tuple */
+
+	/* ---------------
+	 * t_info is laid out in the following fashion:
+	 *
+	 * 15th (high) bit: has nulls
+	 * 14th bit: has var-width attributes
+	 * 13th bit: AM-defined meaning
+	 * 12-0 bit: size of tuple
+	 * ---------------
+	 */
+	unsigned short		t_info;
+
+	char				data[1];	/* data or IndexAttributeBitMapData */
+} IndexTupleData;
+
+typedef struct IndexAttributeBitMapData
+{
+	cl_uchar			bits[(INDEX_MAX_KEYS + 8 - 1) / 8];
+} IndexAttributeBitMapData;
+
+#define INDEX_SIZE_MASK		0x1fff
+#define INDEX_VAR_MASK		0x4000
+#define INDEX_NULL_MASK		0x8000
+
+/*
  * Below is routines to support KDS_FORMAT_BLOCKS - This KDS format is used
  * to load raw PostgreSQL heap blocks to GPU without modification by CPU.
  * All CPU has to pay attention is, not to load rows which should not be
  * visible to the current scan snapshot.
  */
 typedef cl_uint		TransactionId;
+#define InvalidTransactionId		((TransactionId) 0)
+#define FrozenTransactionId			((TransactionId) 2)
+#define InvalidCommandId			(~0U)
+#else
+#include "access/htup_details.h"
+#endif	/* __CUDACC__ */
 
+typedef struct
+{
+	cl_int		vl_len_;
+	cl_int		ndim;			/* always 1 for xidvector */
+	cl_int		dataoffset;		/* always 0 for xidvector */
+	cl_uint		elemtype;		/* XIDOID */
+	cl_int		dim1;			/* number of items */
+	cl_int		lbound1;		/* always 1 for xidvector */
+	TransactionId values[FLEXIBLE_ARRAY_MEMBER];
+} xidvector;
+
+#ifdef __CUDACC__
 /* definitions at storage/itemid.h */
 typedef struct ItemIdData
 {
@@ -656,20 +729,26 @@ typedef cl_ushort		OffsetNumber;
 #define MaxOffsetNumber			((OffsetNumber) (BLCKSZ / sizeof(ItemIdData)))
 #define OffsetNumberMask		(0xffff)	/* valid uint16 bits */
 
-/* definitions at storage/bufpage.h */
-typedef struct
-{
-	cl_uint			xlogid;			/* high bits */
-	cl_uint			xrecoff;		/* low bits */
-} PageXLogRecPtr;
+#define OffsetNumberNext(offsetNumber)			\
+	((OffsetNumber) (1 + (offsetNumber)))
 
+/* definitions at storage/bufpage.h */
 typedef cl_ushort	LocationIndex;
 
 typedef struct PageHeaderData
 {
-	/* XXX LSN is member of *any* block, not only page-organized ones */
+#if 0
+	/*
+	 * NOTE: device code (ab-)uses this field to track parent block/item
+	 * when GiST index is loaded. Without this hack, hard to implement
+	 * depth-first search at GpuJoin.
+	 */
 	PageXLogRecPtr	pd_lsn;			/* LSN: next byte after last byte of xlog
 									 * record for last change to this page */
+#else
+	cl_uint			pd_parent_blkno;
+	cl_uint			pd_parent_item;	
+#endif
 	cl_ushort		pd_checksum;	/* checksum */
 	cl_ushort		pd_flags;		/* flag bits, see below */
 	LocationIndex	pd_lower;		/* offset to start of free space */
@@ -701,65 +780,10 @@ PageGetMaxOffsetNumber(PageHeaderData *page)
 			(pd_lower - SizeOfPageHeaderData) / sizeof(ItemIdData));
 }
 
-#endif	/* PG_STROM_H */
+#endif	/* __CUDACC__ */
 
 /*
  * kern_data_store
- *
- * +---------------------------------------------------------------+
- * | Common header portion of the kern_data_store                  |
- * |         :                                                     |
- * | 'format' determines the layout below                          |
- * |                                                               |
- * | 'nitems' and 'nrooms' mean number of tuples except for BLOCK  |
- * | format. In BLOCK format, these fields mean number of the      |
- * | PostgreSQL blocks. We cannot know exact number of tuples      |
- * | without scanning of the data-store                            |
- * +---------------------------------------------------------------+
- * | Attributes of columns                                         |
- * |                                                               |
- * | kern_colmeta colmeta[0]                                       |
- * | kern_colmeta colmeta[1]       <--+                            |
- * |        :                         :   column definition of     |
- * | kern_colmeta colmeta[ncols-1] <--+-- regular tables           |
- * |        :                                                      |
- * | kern_colmeta colmeta[idx_subattrs]     <--+                   |
- * |        :                                  : field definition  |
- * | kern_colmeta colmeta[idx_subattrs +       : of composite type |
- * |                      num_subattrs - 1] <--+                   |
- * +---------------------------------------------------------------+
- * | <slot format> | <row format> / <hash format> | <block format> |
- * +---------------+------------------------------+----------------+
- * | values/isnull | Offset to the first hash-    | BlockNumber of |
- * | pair of the   | item for each slot (*).      | PostgreSQL;    |
- * | 1st tuple     |                              | used to setup  |
- * | +-------------+ (*) nslots=0 if row-format,  | ctid system    |
- * | | values[0]   | thus, it has no offset to    | column.        |
- * | |    :        | hash items.                  |                |
- * | | values[M-1] |                              | (*) N=nrooms   |
- * | +-------------+  hash_slot[0]                | block_num[0]   |
- * | | isnull[0]   |  hash_slot[1]                | block_num[1]   |
- * | |    :        |      :                       |      :         |
- * | | isnull[M-1] |  hash_slot[nslots-1]         |      :         |
- * +-+-------------+------------------------------+ block_num[N-1] |
- * | values/isnull | Offset to the individual     +----------------+ 
- * | pair of the   | kern_tupitem.                |     ^          |
- * | 2nd tuple     |                              |     |          |
- * | +-------------+ row_index[0]                 | Raw PostgreSQL |
- * | | values[0]   | row_index[1]                 | Block-0        |
- * | |    :        |    :                         |     |          |
- * | | values[M-1] | row_index[nitems-1]          |   BLCKSZ(8KB)  |
- * | +-------------+--------------+---------------+     |          |
- * | | isnull[0]   |    :         |       :       |     v          |
- * | |    :        +--------------+---------------+----------------+
- * | | isnull[M-1] | kern_tupitem | kern_hashitem |                |
- * +-+-------------+--------------+---------------+                |   
- * | values/isnull | kern_tupitem | kern_hashitem | Raw PostgreSQL |
- * | pair of the   +--------------+---------------+ Block-1        |
- * | 3rd tuple     | kern_tupitem | kern_hashitem |                |
- * |      :        |     :        |     :         |     :          |
- * |      :        |     :        |     :         |     :          |
- * +---------------+--------------+---------------+----------------+
  */
 #include "arrow_defs.h"
 
@@ -807,7 +831,7 @@ typedef struct {
 	NameData		attname;
 
 	/*
-	 * (only arrow format)
+	 * (only arrow/column format)
 	 * @attoptions keeps extra information of Apache Arrow type. Unlike
 	 * PostgreSQL types, it can have variation of data accuracy in time
 	 * related data types, or precision in decimal data type.
@@ -819,15 +843,6 @@ typedef struct {
 	cl_uint			values_length;
 	cl_uint			extra_offset;
 	cl_uint			extra_length;
-
-	/*
-	 * (only column format)
-	 * @va_offset is offset of the values array from the kds-head.
-	 * @va_length is length of the values array and extra area which is
-	 * used to dictionary of varlena or nullmap of fixed-length values.
-	 */
-	cl_uint			va_offset;
-	cl_uint			va_length;
 } kern_colmeta;
 
 /*
@@ -835,8 +850,8 @@ typedef struct {
  */
 typedef struct
 {
-	cl_ushort			t_len;	/* length of tuple */
-	ItemPointerData		t_self;	/* SelfItemPointer */
+	cl_uint			t_len;		/* length of tuple */
+	cl_uint			rowid;		/* unique Id of this item */
 	HeapTupleHeaderData	htup;
 } kern_tupitem;
 
@@ -847,8 +862,6 @@ typedef struct
 {
 	cl_uint				hash;	/* 32-bit hash value */
 	cl_uint				next;	/* offset of the next (PACKED) */
-	cl_uint				rowid;	/* unique identifier of this hash entry */
-	cl_uint				__padding__; /* for alignment */
 	kern_tupitem		t;		/* HeapTuple of this entry */
 } kern_hashitem;
 
@@ -870,7 +883,7 @@ typedef struct {
 	cl_uint			nrooms;		/* number of available rows in this store */
 	cl_uint			ncols;		/* number of columns in this store */
 	cl_char			format;		/* one of KDS_FORMAT_* above */
-	cl_char			has_notbyval; /* true, if any of column is !attbyval */
+	cl_char			has_varlena; /* true, if any varlena attribute */
 	cl_char			tdhasoid;	/* copy of TupleDesc.tdhasoid */
 	cl_uint			tdtypeid;	/* copy of TupleDesc.tdtypeid */
 	cl_int			tdtypmod;	/* copy of TupleDesc.tdtypmod */
@@ -878,10 +891,30 @@ typedef struct {
 	cl_uint			nslots;		/* width of hash-slot (only HASH format) */
 	cl_uint			nrows_per_block; /* average number of rows per
 									  * PostgreSQL block (only BLOCK format) */
+#ifndef __CUDACC__
+	/*
+	 * Offset to the extra buffer (only COLUMN format, with varlena)
+	 * at the host-side, shall not be refered at the device-side.
+	 */
+	cl_ulong		extra_hoffset;
+#else
+	cl_ulong		__no_such_field__;
+#endif
 	cl_uint			nr_colmeta;	/* number of colmeta[] array elements;
 								 * maybe, >= ncols, if any composite types */
 	kern_colmeta	colmeta[FLEXIBLE_ARRAY_MEMBER]; /* metadata of columns */
 } kern_data_store;
+
+/*
+ * kern_data_extra - extra buffer of KDS_FORMAT_COLUMN
+ */
+typedef struct
+{
+	char		signature[8];	/* signature on the base file */
+	cl_ulong	length;
+	cl_ulong	usage;
+	char		data[FLEXIBLE_ARRAY_MEMBER];
+} kern_data_extra;
 
 /* attribute number of system columns */
 #ifndef SYSATTR_H
@@ -970,7 +1003,7 @@ KERN_DATA_STORE_HASHSLOT(kern_data_store *kds)
 {
 	Assert(kds->format == KDS_FORMAT_HASH);
 	return (cl_uint *)(KERN_DATA_STORE_BODY(kds) +
-					   STROMALIGN(sizeof(cl_uint) * kds->nitems));
+					   STROMALIGN(sizeof(cl_uint) * kds->nrooms));
 }
 
 /* access function for row- and hash-format */
@@ -1001,7 +1034,7 @@ KDS_ROW_REF_HTUP(kern_data_store *kds,
 							   + __kds_unpack(tup_offset)
 							   - offsetof(kern_tupitem, htup));
 	if (p_self)
-		*p_self = tupitem->t_self;
+		*p_self = tupitem->htup.t_ctid;
 	if (p_len)
 		*p_len = tupitem->t_len;
 	return &tupitem->htup;
@@ -1176,12 +1209,11 @@ kern_fetch_varlena_datum_arrow(kern_colmeta *cmeta,
  */
 typedef struct kern_parambuf
 {
-	hostptr_t	hostptr;	/* address of the parambuf on host-side */
-
 	/*
 	 * Fields of system information on execution
 	 */
 	cl_long		xactStartTimestamp;	/* timestamp when transaction start */
+	cl_uint		xactIdVector;		/* offset to xidvector */
 
 	/* variable length parameters / constants */
 	cl_uint		length;		/* total length of parambuf */
@@ -1205,38 +1237,6 @@ pointer_on_kparams(void *ptr, kern_parambuf *kparams)
 	return kparams && ((char *)ptr >= (char *)kparams &&
 					   (char *)ptr <  (char *)kparams + kparams->length);
 }
-
-/*
- * GstoreIpcHandle
- *
- * Format definition when Gstore_fdw exports IPChandle of the GPU memory.
- */
-
-/* Gstore_fdw's internal data format */
-#define GSTORE_FDW_FORMAT__PGSTROM		50		/* KDS_FORMAT_COLUMN */
-//#define GSTORE_FDW_FORMAT__ARROW		51		/* Apache Arrow compatible */
-
-/* column 'compression' option */
-#define GSTORE_COMPRESSION__NONE		0
-#define GSTORE_COMPRESSION__PGLZ		1
-
-typedef struct
-{
-	cl_uint		__vl_len;		/* 4B varlena header */
-	cl_short	device_id;		/* GPU device where pinning on */
-	cl_char		format;			/* one of GSTORE_FDW_FORMAT__* */
-	cl_char		__padding__;	/* reserved */
-	cl_long		rawsize;		/* length in bytes */
-	union {
-#ifdef CU_IPC_HANDLE_SIZE
-		CUipcMemHandle		d;	/* CUDA driver API */
-#endif
-#ifdef CUDA_IPC_HANDLE_SIZE
-		cudaIpcMemHandle_t	r;	/* CUDA runtime API */
-#endif
-		char				data[64];
-	} ipc_mhandle;
-} GstoreIpcHandle;
 
 /*
  * PostgreSQL varlena related definitions
@@ -1493,6 +1493,7 @@ typedef struct
 #define DATUM_CLASS__VARLENA	2	/* datum is pg_varlena_t reference */
 #define DATUM_CLASS__ARRAY		3	/* datum is pg_array_t reference */
 #define DATUM_CLASS__COMPOSITE	4	/* datum is pg_composite_t reference */
+#define DATUM_CLASS__GEOMETRY	5	/* datum is pg_geometry_t reference */
 
 /*
  * device functions in cuda_common.fatbin
@@ -1518,52 +1519,51 @@ pg_hash_any(const cl_uchar *k, cl_int keylen);
  * EXTRACT_HEAP_READ_XXXX()
  *  -> load raw values to dclass[]/values[], and update extras[]
  */
-#define EXTRACT_HEAP_TUPLE_BEGIN(ADDR, kds, htup)						\
+#define EXTRACT_HEAP_TUPLE_BEGIN(ADDR,kds,htup)							\
 	do {																\
-		const HeapTupleHeaderData * __restrict__ __htup = (htup);		\
-		const kern_colmeta * __restrict__ __kds_colmeta = (kds)->colmeta; \
-		kern_colmeta	__cmeta;										\
+		kern_colmeta   *__cmeta;										\
 		cl_uint			__colidx = 0;									\
 		cl_uint			__ncols;										\
-		cl_bool			__heap_hasnull;									\
+		cl_uchar	   *__nullmap = NULL;								\
 		char		   *__pos;											\
 																		\
-		if (!__htup)													\
+		if (!(htup))													\
 			__ncols = 0;	/* to be considered as NULL */				\
 		else															\
 		{																\
-			__heap_hasnull = ((__htup->t_infomask & HEAP_HASNULL) != 0); \
+			if (((htup)->t_infomask & HEAP_HASNULL) != 0)				\
+				__nullmap = (htup)->t_bits;								\
 			__ncols = Min((kds)->ncols,									\
-						  __htup->t_infomask2 & HEAP_NATTS_MASK);		\
-			__cmeta = __kds_colmeta[__colidx];							\
-			__pos = (char *)(__htup) + __htup->t_hoff;					\
+						  (htup)->t_infomask2 & HEAP_NATTS_MASK);		\
+			__pos = (char *)(htup) + (htup)->t_hoff;					\
 			assert(__pos == (char *)MAXALIGN(__pos));					\
 		}																\
 		if (__colidx < __ncols &&										\
-			(!__heap_hasnull || !att_isnull(__colidx, __htup->t_bits)))	\
+			(!__nullmap || !att_isnull(__colidx, __nullmap)))			\
 		{																\
+			__cmeta = &((kds)->colmeta[__colidx]);						\
 			(ADDR) = __pos;												\
-			__pos += (__cmeta.attlen > 0 ?								\
-					  __cmeta.attlen :									\
+			__pos += (__cmeta->attlen > 0 ?								\
+					  __cmeta->attlen :									\
 					  VARSIZE_ANY(__pos));								\
 		}																\
 		else															\
 			(ADDR) = NULL
 
-#define EXTRACT_HEAP_TUPLE_NEXT(ADDR)									\
+#define EXTRACT_HEAP_TUPLE_NEXT(ADDR,kds)								\
 		__colidx++;														\
 		if (__colidx < __ncols &&										\
-			(!__heap_hasnull || !att_isnull(__colidx, __htup->t_bits)))	\
+			(!__nullmap || !att_isnull(__colidx, __nullmap)))			\
 		{																\
-			__cmeta = __kds_colmeta[__colidx];							\
+			__cmeta = &((kds)->colmeta[__colidx]);						\
 																		\
-			if (__cmeta.attlen > 0)										\
-				__pos = (char *)TYPEALIGN(__cmeta.attalign, __pos);		\
+			if (__cmeta->attlen > 0)									\
+				__pos = (char *)TYPEALIGN(__cmeta->attalign, __pos);	\
 			else if (!VARATT_NOT_PAD_BYTE(__pos))						\
-				__pos = (char *)TYPEALIGN(__cmeta.attalign, __pos);		\
+				__pos = (char *)TYPEALIGN(__cmeta->attalign, __pos);	\
 			(ADDR) = __pos;												\
-			__pos += (__cmeta.attlen > 0 ?								\
-					  __cmeta.attlen :									\
+			__pos += (__cmeta->attlen > 0 ?								\
+					  __cmeta->attlen :									\
 					  VARSIZE_ANY(__pos));								\
 		}																\
 		else															\
@@ -1627,6 +1627,59 @@ pg_hash_any(const cl_uchar *k, cl_int keylen);
 		}														\
 	} while(0)
 
+/*
+ * Similar macro to extract IndexTuple
+ */
+#define EXTRACT_INDEX_TUPLE_BEGIN(ADDR,KDS,itup)					\
+	do {															\
+		const kern_colmeta *__cmeta = (KDS)->colmeta;				\
+		cl_uint		__ncols = (KDS)->ncols;							\
+		cl_uint		__colidx = 0;									\
+		cl_uchar   *__nullmap = NULL;								\
+		char	   *__pos;											\
+																	\
+		if (!(itup))												\
+			__ncols = 0;											\
+		else if (((itup)->t_info & INDEX_NULL_MASK) == 0)			\
+			__pos = itup->data;										\
+		else														\
+		{															\
+			__nullmap = (cl_uchar *)(itup)->data;					\
+			__pos = (itup)->data + MAXALIGN(BITMAPLEN(__ncols));	\
+		}															\
+		if (__colidx < __ncols &&									\
+			(!__nullmap || !att_isnull(__colidx, __nullmap)))		\
+		{															\
+			(ADDR) = __pos;											\
+			__pos += (__cmeta->attlen > 0 ?							\
+					  __cmeta->attlen :								\
+					  VARSIZE_ANY(__pos));							\
+		}															\
+		else														\
+			(ADDR) = NULL
+
+#define EXTRACT_INDEX_TUPLE_NEXT(ADDR,KDS)							\
+		__colidx++;													\
+		if (__colidx < __ncols &&									\
+			(!__nullmap || !att_isnull(__colidx, __nullmap)))		\
+		{															\
+			__cmeta = &(KDS)->colmeta[__colidx];					\
+																	\
+			if (__cmeta->attlen > 0)								\
+				__pos = (char *)TYPEALIGN(__cmeta->attalign, __pos); \
+			else if (!VARATT_NOT_PAD_BYTE(__pos))					 \
+				__pos = (char *)TYPEALIGN(__cmeta->attalign, __pos); \
+			(ADDR) = __pos;											\
+			__pos += (__cmeta->attlen > 0 ?							\
+					  __cmeta->attlen :								\
+					  VARSIZE_ANY(__pos));							\
+		}															\
+		else														\
+			(ADDR) = NULL
+		
+#define EXTRACT_INDEX_TUPLE_END()									\
+	} while(0)
+
 #ifdef __CUDACC__
 /*
  * device functions to decompress a toast datum
@@ -1646,17 +1699,17 @@ DEVICE_FUNCTION(void *)
 kern_get_datum_tuple(kern_colmeta *colmeta,
 					 HeapTupleHeaderData *htup,
 					 cl_uint colidx);
-DEVICE_FUNCTION(void *)
-kern_get_datum_row(kern_data_store *kds,
-				   cl_uint colidx, cl_uint rowidx);
-DEVICE_FUNCTION(void *)
-kern_get_datum_slot(kern_data_store *kds,
-					cl_uint colidx, cl_uint rowidx);
-//see below
-//DEVICE_FUNCTION(void *)
-//kern_get_datum_column(kern_data_store *kds,
-//					  cl_uint colidx, cl_uint rowidx);
 
+struct GstoreFdwSysattr;	/* not to include cuda_gstore.h here */
+DEVICE_FUNCTION(void *)
+kern_get_datum_column(kern_data_store *kds,
+					  kern_data_extra *extra,
+					  cl_uint colidx, cl_uint rowidx);
+DEVICE_FUNCTION(cl_bool)
+kern_check_visibility_column(kern_context *kcxt,
+							 kern_data_store *kds,
+							 cl_uint rowidx,
+							 struct GstoreFdwSysattr *p_sysattr);
 /*
  * device functions to form/deform HeapTuple
  */
@@ -1678,12 +1731,26 @@ __form_kern_heaptuple(kern_context *kcxt,
 					  void	   *buffer,			/* out */
 					  cl_int	ncols,			/* in */
 					  kern_colmeta *colmeta,	/* in */
-					  HeapTupleHeaderData *htup_orig, /* in: if heap-tuple */
-					  cl_int	comp_typmod,	/* in: if composite type */
-					  cl_uint	comp_typeid,	/* in: if composite type */
-					  cl_uint	htuple_oid,		/* in */
+					  cl_uint	comp_typeid,	/* in */
+					  cl_int	comp_typmod,	/* in */
+					  ItemPointerData *tup_self,/* in */
 					  cl_char  *tup_dclass,		/* in */
 					  Datum	   *tup_values);	/* in */
+/*
+ * support function for KDS_FORMAT_SLOT
+ */
+DEVICE_FUNCTION(cl_uint)
+kds_slot_compute_extra(kern_context *kcxt,
+					   kern_data_store *kds,
+					   cl_char *tup_dclass,
+					   Datum   *tup_values);
+DEVICE_FUNCTION(void)
+kds_slot_store_values(kern_context *kcxt,
+					  kern_data_store *kds_dst,
+					  cl_uint  dst_index,
+					  char    *dst_extra,
+					  cl_char *tup_dclass,
+					  Datum   *tup_values);
 /*
  * Reduction Operations
  */
@@ -1692,60 +1759,6 @@ pgstromStairlikeSum(cl_uint my_value, cl_uint *total_sum);
 DEVICE_FUNCTION(cl_uint)
 pgstromStairlikeBinaryCount(int predicate, cl_uint *total_count);
 #endif	/* __CUDACC__ */
-
-/*
- * Some host code uses kern_get_datum_column() to implement fallback code
- * on KDS_FORMAT_COLUMN, however, this data-store format shall be deprecated
- * in the near future. So, we keep this inline function for a while.
- */
-STATIC_INLINE(void *)
-kern_get_datum_column(kern_data_store *kds,
-					  cl_uint colidx, cl_uint rowidx)
-{
-	kern_colmeta *cmeta;
-	size_t		offset;
-	size_t		length;
-	char	   *values;
-	char	   *nullmap;
-
-	Assert(colidx < kds->ncols);
-	cmeta = &kds->colmeta[colidx];
-	/* special case handling if 'tableoid' system column */
-	if (cmeta->attnum == TableOidAttributeNumber)
-		return &kds->table_oid;
-	offset = __kds_unpack(cmeta->va_offset);
-	if (offset == 0)
-		return NULL;
-	values = (char *)kds + offset;
-	length = __kds_unpack(cmeta->va_length);
-	if (cmeta->attlen < 0)
-	{
-		Assert(!cmeta->attbyval);
-		offset = ((cl_uint *)values)[rowidx];
-		if (offset == 0)
-			return NULL;
-		Assert(offset < length);
-		values += __kds_unpack(offset);
-	}
-	else
-	{
-		cl_int	unitsz = TYPEALIGN(cmeta->attalign,
-								   cmeta->attlen);
-		size_t	array_sz = MAXALIGN(unitsz * kds->nitems);
-
-		Assert(length >= array_sz);
-		if (length > array_sz)
-		{
-			length -= array_sz;
-			Assert(MAXALIGN(BITMAPLEN(kds->nitems)) == length);
-			nullmap = values + array_sz;
-			if (att_isnull(rowidx, nullmap))
-				return NULL;
-		}
-		values += unitsz * rowidx;
-	}
-	return (void *)values;
-}
 
 /* base type definitions and templates */
 #include "cuda_basetype.h"

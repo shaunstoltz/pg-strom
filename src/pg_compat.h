@@ -106,7 +106,8 @@
  * flags from the PathNameOpenFile.
  */
 #if PG_VERSION_NUM < 110000
-#define PathNameOpenFile(a,b)	PathNameOpenFile((FileName)(a),(b),0600)
+#define PathNameOpenFilePerm(a,b,c)	PathNameOpenFile((FileName)(a),(b),(c))
+#define PathNameOpenFile(a,b)		PathNameOpenFile((FileName)(a),(b),0600)
 #endif
 
 /*
@@ -239,8 +240,8 @@ typedef ParallelHeapScanDescData		ParallelTableScanDescData;
 
 #define MakeSingleTupleTableSlot(tdesc,tts_ops)			\
 	MakeSingleTupleTableSlot((tdesc))
-#define ExecStoreHeapTuple(tup,slot,shouldFree)			\
-	ExecStoreTuple((tup),(slot),InvalidBuffer,(shouldFree))
+#define ExecForceStoreHeapTuple(tuple,slot,shouldFree)	\
+	ExecStoreTuple((tuple),(slot),InvalidBuffer,(shouldFree))
 static inline HeapTuple
 ExecFetchSlotHeapTuple(TupleTableSlot *slot,
 					   bool materialize, bool *shouldFree)
@@ -251,12 +252,35 @@ ExecFetchSlotHeapTuple(TupleTableSlot *slot,
 #endif	/* < PG12 */
 
 /*
+ * PG12 (commit: 1ef6bd2954c4ec63ff8a2c9c4ebc38251d7ef5c5) don't
+ * require return slots for nodes without projection.
+ * Instead of the ps_ResultTupleSlot->tts_tupleDescriptor,
+ * ps_ResultTupleDesc is now reliable source to determine the tuple
+ * definition. For the compatibility to PG11 or older, we use the
+ * access macro below.
+ */
+#if PG_VERSION_NUM < 120000
+#define planStateResultTupleDesc(ps)			\
+	((ps)->ps_ResultTupleSlot->tts_tupleDescriptor)
+#else
+#define planStateResultTupleDesc(ps)	((ps)->ps_ResultTupleDesc)
+#endif
+
+/*
  * PG12 added 'pathkey' argument of create_append_path().
  * It shall be ignored on the older versions.
  */
 #if PG_VERSION_NUM < 120000
 #define create_append_path(a,b,c,d,e,f,g,h,i,j)	\
 	create_append_path((a),(b),(c),(d),(f),(g),(h),(i),(j))
+#endif
+
+/*
+ * PG11 added 'flags' argument for BackgroundWorkerInitializeConnection
+ */
+#if PG_VERSION_NUM < 110000
+#define BackgroundWorkerInitializeConnection(dbname,username,flags)	\
+	BackgroundWorkerInitializeConnection((dbname),(username))
 #endif
 
 #endif	/* PG_COMPAT_H */

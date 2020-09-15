@@ -29,8 +29,12 @@
 #define __ntoh32(x)			(x)
 #define __ntoh64(x)			(x)
 #else	/* WORDS_BIGENDIAN */
-#ifdef __PG2ARROW__
-/* build for client program in little endian */
+#ifdef __PGSTROM_MODULE__
+/* build for server module don't need endian translation */
+#define __ntoh16(x)			(x)
+#define __ntoh32(x)			(x)
+#define __ntoh64(x)			(x)
+#else  /* __PGSTROM_MODULE__ */
 #if PG_VERSION_NUM < 110000
 #define __ntoh16(x)			ntohs(x)
 #define __ntoh32(x)			BSWAP32(x)
@@ -40,13 +44,8 @@
 #define __ntoh32(x)			pg_ntoh32(x)
 #define __ntoh64(x)			pg_ntoh64(x)
 #endif	/* PG_VERSION */
-#else	/* __PG2ARROW__ */
-/* build for server module in little endian */
-#define __ntoh16(x)			(x)
-#define __ntoh32(x)			(x)
-#define __ntoh64(x)			(x)
-#endif	/* __PG2ARROW__ */
-#endif	/* WORDS_BIGENDIAN */
+#endif  /* __PGSTROM_MODULE__ */
+#endif  /* WORDS_BIGENDIAN */
 
 /* ----------------------------------------------------------------
  *
@@ -280,7 +279,7 @@ typedef struct NumericVar
 	NumericDigit *digits;	/* base-NBASE digits */
 } NumericVar;
 
-#ifndef __PG2ARROW__
+#ifdef  __PGSTROM_MODULE__
 #define NUMERIC_SHORT_SIGN_MASK			0x2000
 #define NUMERIC_SHORT_DSCALE_MASK		0x1F80
 #define NUMERIC_SHORT_DSCALE_SHIFT		7
@@ -330,7 +329,7 @@ init_var_from_num(NumericVar *nv, const char *addr, int sz)
 		nv->digits = (NumericDigit *)n_long->n_data;
 	}
 }
-#endif	/* !__PG2ARROW__ */
+#endif	/* __PGSTROM_MODULE__ */
 
 static size_t
 put_decimal_value(SQLfield *column,
@@ -346,7 +345,9 @@ put_decimal_value(SQLfield *column,
 		int				scale = column->arrow_type.Decimal.scale;
 		int128			value = 0;
 		int				d, dig;
-#ifdef __PG2ARROW__
+#ifdef __PGSTROM_MODULE__
+		init_var_from_num(&nv, addr, sz);
+#else
 		struct {
 			uint16		ndigits;	/* number of digits */
 			uint16		weight;		/* weight of first digit */
@@ -359,9 +360,7 @@ put_decimal_value(SQLfield *column,
 		nv.sign		= (int16)__ntoh16(rawdata->sign);
 		nv.dscale	= (int16)__ntoh16(rawdata->dscale);
 		nv.digits	= rawdata->digits;
-#else	/* __PG2ARROW__ */
-		init_var_from_num(&nv, addr, sz);
-#endif	/* __PG2ARROW__ */
+#endif	/* __PGSTROM_MODULE__ */
 		if ((nv.sign & NUMERIC_SIGN_MASK) == NUMERIC_NAN)
 			Elog("Decimal128 cannot map NaN in PostgreSQL Numeric");
 
@@ -582,6 +581,7 @@ __put_timestamp_value_generic(SQLfield *column,
 	{
 		assert(pgsql_sz == sizeof(Timestamp));
 		value = __ntoh64(*((const Timestamp *)addr));
+
 		/* convert PostgreSQL epoch to UNIX epoch */
 		value += (POSTGRES_EPOCH_JDATE -
 				  UNIX_EPOCH_JDATE) * USECS_PER_DAY;
@@ -803,46 +803,7 @@ put_array_value(SQLfield *column,
 	}
 	else
 	{
-#ifdef __PG2ARROW__
-		struct {
-			int32		ndim;
-			int32		hasnull;
-			int32		element_type;
-			struct {
-				int32	sz;
-				int32	lb;
-			} dim[FLEXIBLE_ARRAY_MEMBER];
-		}  *rawdata = (void *) addr;
-		int32		ndim = __ntoh32(rawdata->ndim);
-		//int32		hasnull = __ntoh32(rawdata->hasnull);
-		Oid			element_typeid = __ntoh32(rawdata->element_type);
-		size_t		i, nitems = 1;
-		int			item_sz;
-		char	   *pos;
-
-		if (element_typeid != element->sql_type.pgsql.typeid)
-			Elog("PostgreSQL array type mismatch");
-		if (ndim < 1)
-			Elog("Invalid dimension size of PostgreSQL Array (ndim=%d)", ndim);
-		for (i=0; i < ndim; i++)
-			nitems *= __ntoh32(rawdata->dim[i].sz);
-
-		pos = (char *)&rawdata->dim[ndim];
-		for (i=0; i < nitems; i++)
-		{
-			if (pos + sizeof(int32) > addr + sz)
-				Elog("out of range - binary array has corruption");
-			item_sz = __ntoh32(*((int32 *)pos));
-			pos += sizeof(int32);
-			if (item_sz < 0)
-				sql_field_put_value(element, NULL, 0);
-			else
-			{
-				sql_field_put_value(element, pos, item_sz);
-				pos += item_sz;
-			}
-		}
-#else	/* __PG2ARROW__ */
+#ifdef __PGSTROM_MODULE__
 		/*
 		 * NOTE: varlena of ArrayType may have short-header (1b, not 4b).
 		 * We assume (addr - VARHDRSZ) is a head of ArrayType for performance
@@ -889,7 +850,46 @@ put_array_value(SQLfield *column,
 				Elog("Bug? PostgreSQL Array has unsupported element type");
 			}
 		}
-#endif	/* !__PG2ARROW__ */
+#else  /* __PGSTROM_MODULE__ */
+		struct {
+			int32		ndim;
+			int32		hasnull;
+			int32		element_type;
+			struct {
+				int32	sz;
+				int32	lb;
+			} dim[FLEXIBLE_ARRAY_MEMBER];
+		}  *rawdata = (void *) addr;
+		int32		ndim = __ntoh32(rawdata->ndim);
+		//int32		hasnull = __ntoh32(rawdata->hasnull);
+		Oid			element_typeid = __ntoh32(rawdata->element_type);
+		size_t		i, nitems = 1;
+		int			item_sz;
+		char	   *pos;
+
+		if (element_typeid != element->sql_type.pgsql.typeid)
+			Elog("PostgreSQL array type mismatch");
+		if (ndim < 1)
+			Elog("Invalid dimension size of PostgreSQL Array (ndim=%d)", ndim);
+		for (i=0; i < ndim; i++)
+			nitems *= __ntoh32(rawdata->dim[i].sz);
+
+		pos = (char *)&rawdata->dim[ndim];
+		for (i=0; i < nitems; i++)
+		{
+			if (pos + sizeof(int32) > addr + sz)
+				Elog("out of range - binary array has corruption");
+			item_sz = __ntoh32(*((int32 *)pos));
+			pos += sizeof(int32);
+			if (item_sz < 0)
+				sql_field_put_value(element, NULL, 0);
+			else
+			{
+				sql_field_put_value(element, pos, item_sz);
+				pos += item_sz;
+			}
+		}
+#endif /* __PGSTROM_MODULE__ */
 		sql_buffer_setbit(&column->nullmap, row_index);
 		sql_buffer_append(&column->values, &element->nitems, sizeof(int32));
 	}
@@ -919,7 +919,55 @@ put_composite_value(SQLfield *column,
 	}
 	else
 	{
-#ifdef __PG2ARROW__
+#ifdef __PGSTROM_MODULE__
+		HeapTupleHeader htup = (HeapTupleHeader)(addr - VARHDRSZ);
+		bits8	   *nullmap = NULL;
+		int			j, nvalids;
+		char	   *base = (char *)htup + htup->t_hoff;
+		size_t		off = 0;
+
+		if ((htup->t_infomask & HEAP_HASNULL) != 0)
+			nullmap = htup->t_bits;
+		nvalids = HeapTupleHeaderGetNatts(htup);
+
+		for (j=0; j < column->nfields; j++)
+		{
+			SQLfield   *field = &column->subfields[j];
+			int			vl_len;
+			char	   *vl_dat;
+
+			if (j >= nvalids || (nullmap && att_isnull(j, nullmap)))
+			{
+				usage += sql_field_put_value(field, NULL, 0);
+			}
+			else if (field->sql_type.pgsql.typbyval)
+			{
+				Assert(field->sql_type.pgsql.typlen > 0 &&
+					   field->sql_type.pgsql.typlen <= sizeof(Datum));
+
+				off = TYPEALIGN(field->sql_type.pgsql.typalign, off);
+				usage += sql_field_put_value(field, base + off,
+											 field->sql_type.pgsql.typlen);
+				off += field->sql_type.pgsql.typlen;
+			}
+			else if (field->sql_type.pgsql.typlen == -1)
+			{
+				if (!VARATT_NOT_PAD_BYTE(base + off))
+					off = TYPEALIGN(field->sql_type.pgsql.typalign, off);
+				vl_dat = VARDATA_ANY(base + off);
+				vl_len = VARSIZE_ANY_EXHDR(base + off);
+				usage += sql_field_put_value(field, vl_dat, vl_len);
+				off += VARSIZE_ANY(base + off);
+			}
+			else
+			{
+				Elog("Bug? sub-field '%s' of column '%s' has unsupported type",
+					 field->field_name,
+					 column->field_name);
+			}
+			assert(column->nitems == field->nitems);
+		}
+#else  /* __PGSTROM_MODULE__ */
 		const char *pos = addr;
 		int			j, nvalids;
 
@@ -959,52 +1007,7 @@ put_composite_value(SQLfield *column,
 			}
 			assert(column->nitems == sub_field->nitems);
 		}
-#else	/* __PG2ARROW__ */
-		HeapTupleHeader htup = (HeapTupleHeader)(addr - VARHDRSZ);
-		bits8	   *nullmap = NULL;
-		int			j, nvalids;
-		char	   *base = (char *)htup + htup->t_hoff;
-		size_t		off = 0;
-
-		if ((htup->t_infomask & HEAP_HASNULL) != 0)
-			nullmap = htup->t_bits;
-		nvalids = HeapTupleHeaderGetNatts(htup);
-
-		for (j=0; j < column->nfields; j++)
-		{
-			SQLfield   *field = &column->subfields[j];
-
-			if (j >= nvalids || (nullmap && att_isnull(j, nullmap)))
-			{
-				usage += sql_field_put_value(field, NULL, 0);
-			}
-			else if (field->sql_type.pgsql.typbyval)
-			{
-				Assert(field->sql_type.pgsql.typlen > 0 &&
-					   field->sql_type.pgsql.typlen <= sizeof(Datum));
-				usage += sql_field_put_value(field, base + off,
-											 field->sql_type.pgsql.typlen);
-				off = TYPEALIGN(field->sql_type.pgsql.typalign,
-								off + field->sql_type.pgsql.typlen);
-			}
-			else if (field->sql_type.pgsql.typlen == -1)
-			{
-				int		vl_len = VARSIZE_ANY_EXHDR(base + off);
-				char   *vl_dat = VARDATA_ANY(base + off);
-
-				usage += sql_field_put_value(field, vl_dat, vl_len);
-				off = TYPEALIGN(field->sql_type.pgsql.typalign,
-								off + VARSIZE_ANY(base + off));
-			}
-			else
-			{
-				Elog("Bug? sub-field '%s' of column '%s' has unsupported type",
-					 field->field_name,
-					 column->field_name);
-			}
-			assert(column->nitems == field->nitems);
-		}
-#endif	/* !__PG2ARROW__ */
+#endif /* __PGSTROM_MODULE__ */
 		sql_buffer_setbit(&column->nullmap, row_index);
 	}
 	if (column->nullcount > 0)
@@ -1036,15 +1039,14 @@ put_dictionary_value(SQLfield *column,
 			 hitem = hitem->next)
 		{
 			if (hitem->hash == hash &&
-				hitem->label_len == sz &&
+				hitem->label_sz == sz &&
 				memcmp(hitem->label, addr, sz) == 0)
 				break;
 		}
 		if (!hitem)
 			Elog("Enum label was not found in pg_enum result");
-
 		sql_buffer_setbit(&column->nullmap, row_index);
-        sql_buffer_append(&column->values,  &hitem->index, sizeof(int32));
+		sql_buffer_append(&column->values,  &hitem->index, sizeof(int32));
 	}
 	return __buffer_usage_inline_type(column);
 }
@@ -1056,7 +1058,8 @@ put_dictionary_value(SQLfield *column,
  * ----------------------------------------------------------------
  */
 static int
-assignArrowTypeInt(SQLfield *column, bool is_signed)
+assignArrowTypeInt(SQLfield *column, bool is_signed,
+				   ArrowField *arrow_field)
 {
 	initArrowNode(&column->arrow_type, Int);
 	column->arrow_type.Int.is_signed = is_signed;
@@ -1087,11 +1090,21 @@ assignArrowTypeInt(SQLfield *column, bool is_signed)
 				 column->sql_type.pgsql.typlen);
 			break;
 	}
+
+	if (arrow_field)
+	{
+		int32_t		bitWidth = column->arrow_type.Int.bitWidth;
+
+		if (arrow_field->type.node.tag != ArrowNodeTag__Int ||
+			arrow_field->type.Int.bitWidth != bitWidth ||
+			arrow_field->type.Int.is_signed != is_signed)
+			Elog("attribute '%s' is not compatible", column->field_name);
+	}
 	return 2;		/* null map + values */
 }
 
 static int
-assignArrowTypeFloatingPoint(SQLfield *column)
+assignArrowTypeFloatingPoint(SQLfield *column, ArrowField *arrow_field)
 {
 	initArrowNode(&column->arrow_type, FloatingPoint);
 	switch (column->sql_type.pgsql.typlen)
@@ -1119,39 +1132,58 @@ assignArrowTypeFloatingPoint(SQLfield *column)
 				 column->sql_type.pgsql.typlen);
 			break;
 	}
+
+	if (arrow_field)
+	{
+		ArrowPrecision precision = column->arrow_type.FloatingPoint.precision;
+
+		if (arrow_field->type.node.tag != ArrowNodeTag__FloatingPoint ||
+			arrow_field->type.FloatingPoint.precision != precision)
+			Elog("attribute '%s' is not compatible", column->field_name);
+	}
 	return 2;		/* nullmap + values */
 }
 
 static int
-assignArrowTypeBinary(SQLfield *column)
+assignArrowTypeBinary(SQLfield *column, ArrowField *arrow_field)
 {
+	if (arrow_field &&
+		arrow_field->type.node.tag != ArrowNodeTag__Binary)
+		Elog("attribute '%s' is not compatible", column->field_name);
 	initArrowNode(&column->arrow_type, Binary);
 	column->arrow_typename	= "Binary";
 	column->put_value		= put_variable_value;
-
 	return 3;		/* nullmap + index + extra */
 }
 
 static int
-assignArrowTypeUtf8(SQLfield *column)
+assignArrowTypeUtf8(SQLfield *column, ArrowField *arrow_field)
 {
+	if (arrow_field &&
+		arrow_field->type.node.tag != ArrowNodeTag__Utf8)
+		Elog("attribute '%s' is not compatible", column->field_name);
 	initArrowNode(&column->arrow_type, Utf8);
 	column->arrow_typename	= "Utf8";
 	column->put_value		= put_variable_value;
-
 	return 3;		/* nullmap + index + extra */
 }
 
 static int
-assignArrowTypeBpchar(SQLfield *column)
+assignArrowTypeBpchar(SQLfield *column, ArrowField *arrow_field)
 {
+	int32_t		byteWidth;
+
 	if (column->sql_type.pgsql.typmod <= VARHDRSZ)
 		Elog("unexpected Bpchar definition (typmod=%d)",
 			 column->sql_type.pgsql.typmod);
+	byteWidth = column->sql_type.pgsql.typmod - VARHDRSZ;
+	if (arrow_field &&
+		(arrow_field->type.node.tag != ArrowNodeTag__FixedSizeBinary ||
+		 arrow_field->type.FixedSizeBinary.byteWidth != byteWidth))
+		Elog("attribute '%s' is not compatible", column->field_name);
 
 	initArrowNode(&column->arrow_type, FixedSizeBinary);
-	column->arrow_type.FixedSizeBinary.byteWidth
-		= column->sql_type.pgsql.typmod - VARHDRSZ;
+	column->arrow_type.FixedSizeBinary.byteWidth = byteWidth;
 	column->arrow_typename	= "FixedSizeBinary";
 	column->put_value		= put_bpchar_value;
 
@@ -1159,8 +1191,12 @@ assignArrowTypeBpchar(SQLfield *column)
 }
 
 static int
-assignArrowTypeBool(SQLfield *column)
+assignArrowTypeBool(SQLfield *column, ArrowField *arrow_field)
 {
+	if (arrow_field &&
+		arrow_field->type.node.tag != ArrowNodeTag__Bool)
+		Elog("attribute %s is not compatible", column->field_name);
+
 	initArrowNode(&column->arrow_type, Bool);
 	column->arrow_typename	= "Bool";
 	column->put_value		= put_bool_value;
@@ -1169,7 +1205,7 @@ assignArrowTypeBool(SQLfield *column)
 }
 
 static int
-assignArrowTypeDecimal(SQLfield *column)
+assignArrowTypeDecimal(SQLfield *column, ArrowField *arrow_field)
 {
 #ifdef PG_INT128_TYPE
 	int		typmod			= column->sql_type.pgsql.typmod;
@@ -1181,6 +1217,13 @@ assignArrowTypeDecimal(SQLfield *column)
 		typmod -= VARHDRSZ;
 		precision = (typmod >> 16) & 0xffff;
 		scale = (typmod & 0xffff);
+	}
+	if (arrow_field)
+	{
+		if (arrow_field->type.node.tag != ArrowNodeTag__Decimal)
+			Elog("attribute %s is not compatible", column->field_name);
+		precision = arrow_field->type.Decimal.precision;
+		scale = arrow_field->type.Decimal.scale;
 	}
 	initArrowNode(&column->arrow_type, Decimal);
 	column->arrow_type.Decimal.precision = precision;
@@ -1194,10 +1237,18 @@ assignArrowTypeDecimal(SQLfield *column)
 }
 
 static int
-assignArrowTypeDate(SQLfield *column)
+assignArrowTypeDate(SQLfield *column, ArrowField *arrow_field)
 {
+	ArrowDateUnit	unit = ArrowDateUnit__Day;
+
+	if (arrow_field)
+	{
+		if (arrow_field->type.node.tag != ArrowNodeTag__Date)
+			Elog("attribute %s is not compatible", column->field_name);
+		unit = arrow_field->type.Date.unit;
+	}
 	initArrowNode(&column->arrow_type, Date);
-	column->arrow_type.Date.unit = ArrowDateUnit__Day;
+	column->arrow_type.Date.unit = unit;
 	column->arrow_typename	= "Date";
 	column->put_value		= put_date_value;
 
@@ -1205,10 +1256,18 @@ assignArrowTypeDate(SQLfield *column)
 }
 
 static int
-assignArrowTypeTime(SQLfield *column)
+assignArrowTypeTime(SQLfield *column, ArrowField *arrow_field)
 {
+	ArrowTimeUnit	unit = ArrowTimeUnit__MicroSecond;
+
+	if (arrow_field)
+	{
+		if (arrow_field->type.node.tag != ArrowNodeTag__Time)
+			Elog("attribute %s is not compatible", column->field_name);
+		unit = arrow_field->type.Time.unit;
+	}
 	initArrowNode(&column->arrow_type, Time);
-	column->arrow_type.Time.unit = ArrowTimeUnit__MicroSecond;
+	column->arrow_type.Time.unit = unit;
 	column->arrow_type.Time.bitWidth = 64;
 	column->arrow_typename	= "Time";
 	column->put_value		= put_time_value;
@@ -1217,10 +1276,24 @@ assignArrowTypeTime(SQLfield *column)
 }
 
 static int
-assignArrowTypeTimestamp(SQLfield *column)
+assignArrowTypeTimestamp(SQLfield *column, const char *tz_name,
+						 ArrowField *arrow_field)
 {
+	ArrowTimeUnit	unit = ArrowTimeUnit__MicroSecond;
+
+	if (arrow_field)
+	{
+		if (arrow_field->type.node.tag != ArrowNodeTag__Timestamp)
+			Elog("attribute %s is not compatible", column->field_name);
+		unit = arrow_field->type.Timestamp.unit;
+	}
 	initArrowNode(&column->arrow_type, Timestamp);
-	column->arrow_type.Timestamp.unit = ArrowTimeUnit__MicroSecond;
+	column->arrow_type.Timestamp.unit = unit;
+	if (tz_name)
+	{
+		column->arrow_type.Timestamp.timezone = pstrdup(tz_name);
+		column->arrow_type.Timestamp._timezone_len = strlen(tz_name);
+	}
 	column->arrow_typename	= "Timestamp";
 	column->put_value		= put_timestamp_value;
 
@@ -1228,10 +1301,18 @@ assignArrowTypeTimestamp(SQLfield *column)
 }
 
 static int
-assignArrowTypeInterval(SQLfield *column)
+assignArrowTypeInterval(SQLfield *column, ArrowField *arrow_field)
 {
+	ArrowIntervalUnit	unit = ArrowIntervalUnit__Day_Time;
+
+	if (arrow_field)
+	{
+		if (arrow_field->type.node.tag != ArrowNodeTag__Interval)
+			Elog("attribute %s is not compatible", column->field_name);
+		unit = arrow_field->type.Interval.unit;
+	}
 	initArrowNode(&column->arrow_type, Interval);
-	column->arrow_type.Interval.unit = ArrowIntervalUnit__Day_Time;
+	column->arrow_type.Interval.unit = unit;
 	column->arrow_typename	= "Interval";
 	column->put_value       = put_interval_value;
 
@@ -1239,8 +1320,12 @@ assignArrowTypeInterval(SQLfield *column)
 }
 
 static int
-assignArrowTypeList(SQLfield *column)
+assignArrowTypeList(SQLfield *column, ArrowField *arrow_field)
 {
+	if (arrow_field &&
+		arrow_field->type.node.tag != ArrowNodeTag__List)
+		Elog("attribute %s is not compatible", column->field_name);
+
 	initArrowNode(&column->arrow_type, List);
 	column->arrow_typename	= "List";
 	column->put_value		= put_array_value;
@@ -1249,8 +1334,12 @@ assignArrowTypeList(SQLfield *column)
 }
 
 static int
-assignArrowTypeStruct(SQLfield *column)
+assignArrowTypeStruct(SQLfield *column, ArrowField *arrow_field)
 {
+	if (arrow_field &&
+		arrow_field->type.node.tag != ArrowNodeTag__Struct)
+		Elog("attribute %s is not compatible", column->field_name);
+
 	initArrowNode(&column->arrow_type, Struct);
 	column->arrow_typename	= "Struct";
 	column->put_value		= put_composite_value;
@@ -1259,8 +1348,23 @@ assignArrowTypeStruct(SQLfield *column)
 }
 
 static int
-assignArrowTypeDictionary(SQLfield *column)
+assignArrowTypeDictionary(SQLfield *column, ArrowField *arrow_field)
 {
+	if (arrow_field)
+	{
+		ArrowTypeInt   *indexType;
+
+		if (arrow_field->type.node.tag != ArrowNodeTag__Utf8)
+			Elog("attribute %s is not compatible", column->field_name);
+		if (!arrow_field->dictionary)
+			Elog("attribute has no dictionary");
+		indexType = &arrow_field->dictionary->indexType;
+		if (indexType->node.tag == ArrowNodeTag__Int &&
+			indexType->bitWidth == sizeof(uint32) &&
+			!indexType->is_signed)
+			Elog("IndexType of ArrowDictionaryEncoding must be Int32");
+	}
+
 	initArrowNode(&column->arrow_type, Utf8);
 	column->arrow_typename	= psprintf("Enum; dictionary=%u",
 									   column->sql_type.pgsql.typeid);
@@ -1284,8 +1388,9 @@ assignArrowTypePgSQL(SQLfield *column,
 					 char typtype,
 					 char typalign,
 					 Oid typrelid,
-					 Oid typelemid)
-
+					 Oid typelemid,
+					 const char *tz_name,
+					 ArrowField *arrow_field)
 {
 	SQLtype__pgsql	   *pgtype = &column->sql_type.pgsql;
 	
@@ -1312,66 +1417,69 @@ assignArrowTypePgSQL(SQLfield *column,
 		/* array type */
 		if (typlen != -1)
 			Elog("Bug? array type is not varlena (typlen != -1)");
-		return assignArrowTypeList(column);
+		return assignArrowTypeList(column, arrow_field);
 	}
 	else if (typrelid != 0)
 	{
 		/* composite type */
-		return assignArrowTypeStruct(column);
+		return assignArrowTypeStruct(column, arrow_field);
 	}
 	else if (typtype == 'e')
 	{
 		/* enum type */
-		return assignArrowTypeDictionary(column);
+		return assignArrowTypeDictionary(column, arrow_field);
 	}
 	else if (strcmp(typnamespace, "pg_catalog") == 0)
 	{
 		/* well known built-in data types? */
 		if (strcmp(typname, "bool") == 0)
 		{
-			return assignArrowTypeBool(column);
+			return assignArrowTypeBool(column, arrow_field);
 		}
 		else if (strcmp(typname, "int2") == 0 ||
 				 strcmp(typname, "int4") == 0 ||
 				 strcmp(typname, "int8") == 0)
 		{
-			return assignArrowTypeInt(column, true);
+			return assignArrowTypeInt(column, true, arrow_field);
 		}
 		else if (strcmp(typname, "float2") == 0 ||
 				 strcmp(typname, "float4") == 0 ||
 				 strcmp(typname, "float8") == 0)
 		{
-			return assignArrowTypeFloatingPoint(column);
+			return assignArrowTypeFloatingPoint(column, arrow_field);
 		}
 		else if (strcmp(typname, "date") == 0)
 		{
-			return assignArrowTypeDate(column);
+			return assignArrowTypeDate(column, arrow_field);
 		}
 		else if (strcmp(typname, "time") == 0)
 		{
-			return assignArrowTypeTime(column);
+			return assignArrowTypeTime(column, arrow_field);
 		}
-		else if (strcmp(typname, "timestamp") == 0 ||
-				 strcmp(typname, "timestamptz") == 0)
+		else if (strcmp(typname, "timestamp") == 0)
 		{
-			return assignArrowTypeTimestamp(column);
+			return assignArrowTypeTimestamp(column, NULL, arrow_field);
+		}
+		else if (strcmp(typname, "timestamptz") == 0)
+		{
+			return assignArrowTypeTimestamp(column, tz_name, arrow_field);
 		}
 		else if (strcmp(typname, "interval") == 0)
 		{
-			return assignArrowTypeInterval(column);
+			return assignArrowTypeInterval(column, arrow_field);
 		}
 		else if (strcmp(typname, "text") == 0 ||
 				 strcmp(typname, "varchar") == 0)
 		{
-			return assignArrowTypeUtf8(column);
+			return assignArrowTypeUtf8(column, arrow_field);
 		}
 		else if (strcmp(typname, "bpchar") == 0)
 		{
-			return assignArrowTypeBpchar(column);
+			return assignArrowTypeBpchar(column, arrow_field);
 		}
 		else if (strcmp(typname, "numeric") == 0)
 		{
-			return assignArrowTypeDecimal(column);
+			return assignArrowTypeDecimal(column, arrow_field);
 		}
 	}
 	/* elsewhere, we save the values just bunch of binary data */
@@ -1381,7 +1489,7 @@ assignArrowTypePgSQL(SQLfield *column,
 			typlen == sizeof(short) ||
 			typlen == sizeof(int) ||
 			typlen == sizeof(double))
-			return assignArrowTypeInt(column, false);
+			return assignArrowTypeInt(column, false, arrow_field);
 		/*
 		 * MEMO: Unfortunately, we have no portable way to pack user defined
 		 * fixed-length binary data types, because their 'send' handler often
@@ -1393,7 +1501,7 @@ assignArrowTypePgSQL(SQLfield *column,
 	}
 	else if (typlen == -1)
 	{
-		return assignArrowTypeBinary(column);
+		return assignArrowTypeBinary(column, arrow_field);
 	}
 	Elog("PostgreSQL type: '%s' is not supported", typname);
 }

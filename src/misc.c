@@ -49,24 +49,88 @@ make_flat_ands_explicit(List *andclauses)
 }
 
 /*
- * __find_appinfos_by_relids - almost equivalent to find_appinfos_by_relids
- * that is added at PG11, but ignores relations that are not partition leafs.
+ * find_appinfos_by_relids_nofail
+ *
+ * It is almost equivalent to find_appinfos_by_relids(), but ignores
+ * relations that are not partition leafs, instead of ereport().
+ * In addition, it tries to solve multi-leve parent-child relations.
  */
-AppendRelInfo **
-__find_appinfos_by_relids(PlannerInfo *root, Relids relids, int *nappinfos)
+static AppendRelInfo *
+build_multilevel_appinfos(PlannerInfo *root,
+						  AppendRelInfo **appstack, int nlevels)
 {
+	AppendRelInfo *apinfo = appstack[nlevels-1];
+	AppendRelInfo *apleaf = appstack[0];
+	AppendRelInfo *result;
+	ListCell   *lc;
+	int			i;
+
+	foreach (lc, root->append_rel_list)
+	{
+		AppendRelInfo *aptemp = lfirst(lc);
+
+		if (aptemp->child_relid == apinfo->parent_relid)
+		{
+			appstack[nlevels] = aptemp;
+			return build_multilevel_appinfos(root, appstack, nlevels+1);
+		}
+	}
+	/* shortcut if a simple single-level relationship */
+	if (nlevels == 1)
+		return apinfo;
+
+	result = makeNode(AppendRelInfo);
+	result->parent_relid = apinfo->parent_relid;
+	result->child_relid = apleaf->child_relid;
+	result->parent_reltype = apinfo->parent_reltype;
+	result->child_reltype = apleaf->child_reltype;
+	foreach (lc, apinfo->translated_vars)
+	{
+		Var	   *var = lfirst(lc);
+
+		for (i=nlevels-1; i>=0; i--)
+		{
+			AppendRelInfo *apcurr = appstack[i];
+			Var	   *temp;
+
+			if (var->varattno > list_length(apcurr->translated_vars))
+				elog(ERROR, "attribute %d of relation \"%s\" does not exist",
+					 var->varattno, get_rel_name(apcurr->parent_reloid));
+			temp = list_nth(apcurr->translated_vars, var->varattno - 1);
+			if (!temp)
+				elog(ERROR, "attribute %d of relation \"%s\" does not exist",
+					 var->varattno, get_rel_name(apcurr->parent_reloid));
+			var = temp;
+		}
+		result->translated_vars = lappend(result->translated_vars, var);
+	}
+	result->parent_reloid = apinfo->parent_reloid;
+
+	return result;
+}
+
+AppendRelInfo **
+find_appinfos_by_relids_nofail(PlannerInfo *root,
+							   Relids relids,
+							   int *nappinfos)
+{
+	AppendRelInfo **appstack;
 	AppendRelInfo **appinfos;
 	ListCell   *lc;
 	int			nrooms = bms_num_members(relids);
 	int			nitems = 0;
 
 	appinfos = palloc0(sizeof(AppendRelInfo *) * nrooms);
+	appstack = alloca(sizeof(AppendRelInfo *) * root->simple_rel_array_size);
 	foreach (lc, root->append_rel_list)
 	{
 		AppendRelInfo *apinfo = lfirst(lc);
 
 		if (bms_is_member(apinfo->child_relid, relids))
-			appinfos[nitems++] = apinfo;
+		{
+			appstack[0] = apinfo;
+			appinfos[nitems++] = build_multilevel_appinfos(root, appstack, 1);
+		}
 	}
 	Assert(nitems <= nrooms);
 	*nappinfos = nitems;
@@ -199,6 +263,55 @@ get_type_oid(const char *type_name,
 				 errmsg("type %s is not defined", type_name)));
 
 	return type_oid;
+}
+
+/*
+ * get_type_name
+ */
+char *
+get_type_name(Oid type_oid, bool missing_ok)
+{
+	HeapTuple	tup;
+	char	   *retval;
+
+	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type_oid));
+	if (!HeapTupleIsValid(tup))
+	{
+		if (!missing_ok)
+			elog(ERROR, "cache lookup failed for type %u", type_oid);
+		return NULL;
+	}
+	retval = pstrdup(NameStr(((Form_pg_type) GETSTRUCT(tup))->typname));
+	ReleaseSysCache(tup);
+
+	return retval;
+}
+
+/*
+ * get_proc_library
+ */
+char *
+get_proc_library(HeapTuple protup)
+{
+	Form_pg_proc	proc = (Form_pg_proc)GETSTRUCT(protup);
+
+	if (proc->prolang == ClanguageId)
+	{
+		Datum		datum;
+		bool		isnull;
+
+		datum = SysCacheGetAttr(PROCOID, protup,
+								Anum_pg_proc_probin,
+								&isnull);
+		if (!isnull)
+			return TextDatumGetCString(datum);
+	}
+	else if (proc->prolang != INTERNALlanguageId &&
+			 proc->prolang != SQLlanguageId)
+	{
+		return (void *)(~0UL);
+	}
+	return NULL;
 }
 
 /*
@@ -1090,22 +1203,16 @@ simple_make_range(TypeCacheEntry *typcache, Datum x_val, Datum y_val)
 	x.val = x_val;
 	x.infinite = generate_null(0.5);
 	x.inclusive = generate_null(25.0);
+	x.lower = true;
 
 	memset(&y, 0, sizeof(RangeBound));
 	y.val = y_val;
 	y.infinite = generate_null(0.5);
 	y.inclusive = generate_null(25.0);
+	y.lower = false;
 
-	if (x.infinite || y.infinite || x.val <= y.val)
-	{
-		x.lower = true;
-		range = make_range(typcache, &x, &y, false);
-	}
-	else
-	{
-		y.lower = true;
-		range = make_range(typcache, &y, &x, false);
-	}
+	range = make_range(typcache, &x, &y, false);
+
 	return PointerGetDatum(range);
 }
 
@@ -1126,8 +1233,8 @@ pgstrom_random_int4range(PG_FUNCTION_ARGS)
 	x = lower + __random() % (upper - lower);
 	y = lower + __random() % (upper - lower);
 	return simple_make_range(typcache,
-							 Int32GetDatum(x),
-							 Int32GetDatum(y));
+							 Int32GetDatum(Min(x,y)),
+							 Int32GetDatum(Max(x,y)));
 }
 PG_FUNCTION_INFO_V1(pgstrom_random_int4range);
 
@@ -1150,8 +1257,8 @@ pgstrom_random_int8range(PG_FUNCTION_ARGS)
 	v = (__random() << 31) | __random();
 	y = lower + v % (upper - lower);
 	return simple_make_range(typcache,
-							 Int64GetDatum(x),
-							 Int64GetDatum(y));
+							 Int64GetDatum(Min(x,y)),
+							 Int64GetDatum(Max(x,y)));
 }
 PG_FUNCTION_INFO_V1(pgstrom_random_int8range);
 
@@ -1198,8 +1305,8 @@ pgstrom_random_tsrange(PG_FUNCTION_ARGS)
 	v = (__random() << 31) | __random();
 	y = lower + v % (upper - lower);
 	return simple_make_range(typcache,
-							 TimestampGetDatum(x),
-							 TimestampGetDatum(y));	
+							 TimestampGetDatum(Min(x,y)),
+							 TimestampGetDatum(Max(x,y)));	
 }
 PG_FUNCTION_INFO_V1(pgstrom_random_tsrange);
 
@@ -1246,8 +1353,8 @@ pgstrom_random_tstzrange(PG_FUNCTION_ARGS)
 	v = (__random() << 31) | __random();
 	y = lower + v % (upper - lower);
 	return simple_make_range(typcache,
-							 TimestampTzGetDatum(x),
-							 TimestampTzGetDatum(y));	
+							 TimestampTzGetDatum(Min(x,y)),
+							 TimestampTzGetDatum(Max(x,y)));	
 }
 PG_FUNCTION_INFO_V1(pgstrom_random_tstzrange);
 
@@ -1279,8 +1386,8 @@ pgstrom_random_daterange(PG_FUNCTION_ARGS)
 	x = lower + __random() % (upper - lower);
 	y = lower + __random() % (upper - lower);
 	return simple_make_range(typcache,
-							 DateADTGetDatum(x),
-							 DateADTGetDatum(y));
+							 DateADTGetDatum(Min(x,y)),
+							 DateADTGetDatum(Max(x,y)));
 }
 PG_FUNCTION_INFO_V1(pgstrom_random_daterange);
 
@@ -1295,3 +1402,360 @@ pgstrom_abort_if(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 PG_FUNCTION_INFO_V1(pgstrom_abort_if);
+
+/*
+ * Simple wrapper for read(2) and write(2) to ensure full-buffer read and
+ * write, regardless of i/o-size and signal interrupts.
+ */
+ssize_t
+__readFileSignal(int fdesc, void *buffer, size_t nbytes,
+				 bool interruptible)
+{
+	ssize_t		rv, count = 0;
+
+	do {
+		rv = read(fdesc, (char *)buffer + count, nbytes - count);
+		if (rv < 0)
+		{
+			if (errno == EINTR)
+			{
+				if (interruptible)
+					CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+			return rv;
+		}
+		else if (rv == 0)
+			break;
+		count += rv;
+	} while (count < nbytes);
+
+	return count;
+}
+
+ssize_t
+__readFile(int fdesc, void *buffer, size_t nbytes)
+{
+	return __readFileSignal(fdesc, buffer, nbytes, true);
+}
+
+ssize_t
+__writeFileSignal(int fdesc, const void *buffer, size_t nbytes,
+				  bool interruptible)
+{
+	ssize_t		rv, count = 0;
+
+	do {
+		rv = write(fdesc, (const char *)buffer + count, nbytes - count);
+		if (rv < 0)
+		{
+			if (errno == EINTR)
+			{
+				if (interruptible)
+					CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+			return rv;
+		}
+		else if (rv == 0)
+			break;
+		count += rv;
+	} while (count < nbytes);
+
+	return count;
+}
+
+ssize_t
+__writeFile(int fdesc, const void *buffer, size_t nbytes)
+{
+	return __writeFileSignal(fdesc, buffer, nbytes, true);
+}
+
+
+/*
+ * mmap/munmap wrapper that is automatically unmapped on regarding to
+ * the resource-owner.
+ */
+typedef struct
+{
+	void	   *mmap_addr;
+	size_t		mmap_size;
+	int			mmap_prot;
+	int			mmap_flags;
+	ResourceOwner owner;
+} mmapEntry;
+static HTAB	   *mmap_tracker_htab = NULL;
+
+static void
+cleanup_mmap_chunks(ResourceReleasePhase phase,
+					bool isCommit,
+					bool isTopLevel,
+					void *arg)
+{
+	if (mmap_tracker_htab &&
+		hash_get_num_entries(mmap_tracker_htab) > 0)
+	{
+		HASH_SEQ_STATUS	seq;
+		mmapEntry	   *entry;
+
+		hash_seq_init(&seq, mmap_tracker_htab);
+		while ((entry = hash_seq_search(&seq)) != NULL)
+		{
+			if (entry->owner != CurrentResourceOwner)
+				continue;
+			if (isCommit)
+				elog(WARNING, "mmap (%p-%p; sz=%zu) leaks, and still mapped",
+					 (char *)entry->mmap_addr,
+					 (char *)entry->mmap_addr + entry->mmap_size,
+					 entry->mmap_size);
+			if (munmap(entry->mmap_addr, entry->mmap_size) != 0)
+				elog(WARNING, "failed on munmap(%p, %zu): %m",
+					 entry->mmap_addr, entry->mmap_size);
+			hash_search(mmap_tracker_htab,
+						&entry->mmap_addr,
+						HASH_REMOVE,
+						NULL);
+		}
+	}
+}
+
+void *
+__mmapFile(void *addr, size_t length,
+		   int prot, int flags, int fdesc, off_t offset)
+{
+	void	   *mmap_addr;
+	size_t		mmap_size = TYPEALIGN(PAGE_SIZE, length);
+	mmapEntry  *entry;
+	bool		found;
+
+	if (!mmap_tracker_htab)
+	{
+		HASHCTL		hctl;
+
+		memset(&hctl, 0, sizeof(HASHCTL));
+		hctl.keysize = sizeof(void *);
+		hctl.entrysize = sizeof(mmapEntry);
+		hctl.hcxt = CacheMemoryContext;
+		mmap_tracker_htab = hash_create("mmap_tracker_htab",
+										256,
+										&hctl,
+										HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		RegisterResourceReleaseCallback(cleanup_mmap_chunks, 0);
+	}
+	mmap_addr = mmap(addr, mmap_size, prot, flags, fdesc, offset);
+	if (mmap_addr == MAP_FAILED)
+		return MAP_FAILED;
+	PG_TRY();
+	{
+		entry = hash_search(mmap_tracker_htab,
+							&mmap_addr,
+							HASH_ENTER,
+							&found);
+		if (found)
+			elog(ERROR, "Bug? duplicated mmap entry");
+		Assert(entry->mmap_addr == mmap_addr);
+		entry->mmap_size = mmap_size;
+		entry->mmap_prot = prot;
+		entry->mmap_flags = flags;
+		entry->owner = CurrentResourceOwner;
+	}
+	PG_CATCH();
+	{
+		if (munmap(mmap_addr, mmap_size) != 0)
+			elog(WARNING, "failed on munmap(%p, %zu): %m",
+				 mmap_addr, mmap_size);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	return mmap_addr;
+}
+
+int
+__munmapFile(void *mmap_addr)
+{
+	mmapEntry  *entry;
+	int			rv;
+
+	if (mmap_tracker_htab)
+	{
+		entry = hash_search(mmap_tracker_htab,
+							&mmap_addr, HASH_REMOVE, NULL);
+		if (entry)
+		{
+			rv = munmap(entry->mmap_addr,
+						entry->mmap_size);
+			if (rv != 0)
+			{
+				int		errno_saved = errno;
+
+				elog(WARNING, "failed on munmap(%p, %zu): %m",
+					 entry->mmap_addr,
+					 entry->mmap_size);
+				errno = errno_saved;
+			}
+			return rv;
+		}
+	}
+	/* mmapEntry not found */
+	errno = EINVAL;
+	return -1;
+}
+
+void *
+__mremapFile(void *mmap_addr, size_t new_size)
+{
+	mmapEntry  *entry = NULL;
+	void	   *addr;
+
+	if (mmap_tracker_htab)
+	{
+		entry = hash_search(mmap_tracker_htab,
+							&mmap_addr, HASH_FIND, NULL);
+	}
+	if (!entry)
+	{
+		errno = EINVAL;
+		return MAP_FAILED;
+	}
+	/* nothing to do */
+	if (new_size <= entry->mmap_size)
+		return entry->mmap_addr;
+	addr = mremap(entry->mmap_addr,
+				  entry->mmap_size,
+				  new_size,
+				  MREMAP_MAYMOVE);
+	if (addr == MAP_FAILED)
+		return MAP_FAILED;
+
+	entry->mmap_addr = addr;
+	entry->mmap_size = new_size;
+	return addr;
+}
+
+/*
+ * dummy entry for deprecated functions
+ */
+static void
+__pg_deprecated_function(PG_FUNCTION_ARGS, const char *cfunc_name)
+{
+	FmgrInfo   *flinfo = fcinfo->flinfo;
+
+	if (OidIsValid(flinfo->fn_oid))
+		elog(ERROR, "'%s' on behalf of %s is already deprecated",
+			 cfunc_name, format_procedure(flinfo->fn_oid));
+	elog(ERROR, "'%s' is already deprecated", cfunc_name);
+}
+
+#define PG_DEPRECATED_FUNCTION(cfunc_name)				\
+	Datum	cfunc_name(PG_FUNCTION_ARGS);				\
+	Datum	cfunc_name(PG_FUNCTION_ARGS)				\
+	{													\
+		__pg_deprecated_function(fcinfo, __FUNCTION__);	\
+		PG_RETURN_NULL();								\
+	}													\
+	PG_FUNCTION_INFO_V1(cfunc_name)
+
+/* deadcode/gstore_(fdw|buf).c */
+PG_DEPRECATED_FUNCTION(pgstrom_reggstore_in);
+PG_DEPRECATED_FUNCTION(pgstrom_reggstore_out);
+PG_DEPRECATED_FUNCTION(pgstrom_reggstore_recv);
+PG_DEPRECATED_FUNCTION(pgstrom_reggstore_send);
+
+PG_DEPRECATED_FUNCTION(pgstrom_gstore_fdw_chunk_info);
+PG_DEPRECATED_FUNCTION(pgstrom_gstore_fdw_format);
+PG_DEPRECATED_FUNCTION(pgstrom_gstore_fdw_nitems);
+PG_DEPRECATED_FUNCTION(pgstrom_gstore_fdw_nattrs);
+PG_DEPRECATED_FUNCTION(pgstrom_gstore_fdw_rawsize);
+PG_DEPRECATED_FUNCTION(pgstrom_gstore_export_ipchandle);
+
+/* deadcode/largeobject.c */
+PG_DEPRECATED_FUNCTION(pgstrom_lo_import_gpu);
+PG_DEPRECATED_FUNCTION(pgstrom_lo_export_gpu);
+
+/* deadcode/pl_cuda_v2.c */
+PG_DEPRECATED_FUNCTION(plcuda_function_validator);
+PG_DEPRECATED_FUNCTION(plcuda_function_handler);
+PG_DEPRECATED_FUNCTION(pgsql_table_attr_numbers_by_names);
+PG_DEPRECATED_FUNCTION(pgsql_table_attr_number_by_name);
+PG_DEPRECATED_FUNCTION(pgsql_table_attr_types_by_names);
+PG_DEPRECATED_FUNCTION(pgsql_table_attr_type_by_name);
+PG_DEPRECATED_FUNCTION(pgsql_check_attrs_of_types);
+PG_DEPRECATED_FUNCTION(pgsql_check_attrs_of_type);
+PG_DEPRECATED_FUNCTION(pgsql_check_attr_of_type);
+
+/* deadcode/matrix.c */
+PG_DEPRECATED_FUNCTION(array_matrix_accum);
+PG_DEPRECATED_FUNCTION(array_matrix_accum_varbit);
+PG_DEPRECATED_FUNCTION(varbit_to_int4_array);
+PG_DEPRECATED_FUNCTION(int4_array_to_varbit);
+PG_DEPRECATED_FUNCTION(array_matrix_final_bool);
+PG_DEPRECATED_FUNCTION(array_matrix_final_int2);
+PG_DEPRECATED_FUNCTION(array_matrix_final_int4);
+PG_DEPRECATED_FUNCTION(array_matrix_final_int8);
+PG_DEPRECATED_FUNCTION(array_matrix_final_float4);
+PG_DEPRECATED_FUNCTION(array_matrix_final_float8);
+PG_DEPRECATED_FUNCTION(array_matrix_unnest);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_bool);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_int2);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_int4);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_int8);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_float4);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_float8);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_boolt);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_boolb);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_int2t);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_int2b);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_int4t);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_int4b);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_int8t);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_int8b);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_float4t);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_float4b);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_float8t);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_float8b);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_bool);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_int2);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_int4);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_int8);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_float4);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_float8);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_booll);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_boolr);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_int2l);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_int2r);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_int4l);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_int4r);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_int8l);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_int8r);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_float4l);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_float4r);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_float8l);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_float8r);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_accum);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_final_bool);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_final_int2);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_final_int4);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_final_int8);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_final_float4);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_final_float8);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_accum);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_final_bool);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_final_int2);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_final_int4);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_final_int8);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_final_float4);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_final_float8);
+PG_DEPRECATED_FUNCTION(array_matrix_transpose_bool);
+PG_DEPRECATED_FUNCTION(array_matrix_transpose_int2);
+PG_DEPRECATED_FUNCTION(array_matrix_transpose_int4);
+PG_DEPRECATED_FUNCTION(array_matrix_transpose_int8);
+PG_DEPRECATED_FUNCTION(array_matrix_transpose_float4);
+PG_DEPRECATED_FUNCTION(array_matrix_transpose_float8);
+PG_DEPRECATED_FUNCTION(float4_as_int4);		/* duplicated, see float2.c */
+PG_DEPRECATED_FUNCTION(int4_as_float4);		/* duplicated, see float2.c */
+PG_DEPRECATED_FUNCTION(float8_as_int8);		/* duplicated, see float2.c */
+PG_DEPRECATED_FUNCTION(int8_as_float8);		/* duplicated, see float2.c */
+PG_DEPRECATED_FUNCTION(array_matrix_validation);
+PG_DEPRECATED_FUNCTION(array_matrix_height);
+PG_DEPRECATED_FUNCTION(array_matrix_width);

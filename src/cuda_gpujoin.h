@@ -32,6 +32,7 @@ typedef struct
 	{
 		cl_ulong	chunk_offset;	/* offset to KDS or Hash */
 		cl_ulong	ojmap_offset;	/* offset to outer-join map, if any */
+		cl_ulong	gist_offset;	/* offset to GiST-index pages, if any */
 		cl_bool		is_nestloop;	/* true, if NestLoop. */
 		cl_bool		left_outer;		/* true, if JOIN_LEFT or JOIN_FULL */
 		cl_bool		right_outer;	/* true, if JOIN_RIGHT or JOIN_FULL */
@@ -47,16 +48,20 @@ typedef struct
 	((cl_bool *)((kmrels)->chunks[(depth)-1].right_outer				\
 				 ? ((char *)(kmrels) +									\
 					(size_t)(kmrels)->kmrels_length +					\
-					(size_t)(kmrels)->cuda_dindex *						\
-					(size_t)(kmrels)->ojmaps_length +					\
 					(size_t)(kmrels)->chunks[(depth)-1].ojmap_offset)	\
 				 : NULL))
 
+#define KERN_MULTIRELS_GIST_INDEX(kmrels, depth)						\
+	((kern_data_store *)												\
+	 ((kmrels)->chunks[(depth)-1].gist_offset == 0						\
+	  ? NULL															\
+	  : (char *)(kmrels) + (kmrels)->chunks[(depth)-1].gist_offset))
+
 #define KERN_MULTIRELS_LEFT_OUTER_JOIN(kmrels, depth)	\
-	__ldg(&((kmrels)->chunks[(depth)-1].left_outer))
+	((kmrels)->chunks[(depth)-1].left_outer)
 
 #define KERN_MULTIRELS_RIGHT_OUTER_JOIN(kmrels, depth)	\
-	__ldg(&((kmrels)->chunks[(depth)-1].right_outer))
+	((kmrels)->chunks[(depth)-1].right_outer)
 
 /*
  * kern_gpujoin - control object of GpuJoin
@@ -101,6 +106,11 @@ struct kern_gpujoin
 	cl_uint			num_rels;			/* number of inner relations */
 	cl_uint			grid_sz;			/* grid-size on invocation */
 	cl_uint			block_sz;			/* block-size on invocation */
+	/* debug counters */
+	cl_ulong		debug_counter0;
+	cl_ulong		debug_counter1;
+	cl_ulong		debug_counter2;
+	cl_ulong		debug_counter3;
 	/* suspend/resume related */
 	cl_uint			suspend_offset;		/* offset to the suspend-backup */
 	cl_uint			suspend_size;		/* length of the suspend buffer */
@@ -186,7 +196,11 @@ DEVICE_FUNCTION(cl_bool)
 gpujoin_quals_eval_arrow(kern_context *kcxt,
 						 kern_data_store *kds,
 						 cl_uint row_index);
-
+DEVICE_FUNCTION(cl_bool)
+gpujoin_quals_eval_column(kern_context *kcxt,
+						  kern_data_store *kds,
+						  kern_data_extra *extra,
+						  cl_uint row_index);
 /*
  * gpujoin_join_quals
  *
@@ -201,12 +215,12 @@ gpujoin_quals_eval_arrow(kern_context *kcxt,
 DEVICE_FUNCTION(cl_bool)
 gpujoin_join_quals(kern_context *kcxt,
 				   kern_data_store *kds,
+				   kern_data_extra *extra,
 				   kern_multirels *kmrels,
 				   int depth,
 				   cl_uint *x_buffer,
 				   HeapTupleHeaderData *inner_htup,
 				   cl_bool *joinquals_matched);
-
 /*
  * gpujoin_hash_value
  *
@@ -215,10 +229,36 @@ gpujoin_join_quals(kern_context *kcxt,
 DEVICE_FUNCTION(cl_uint)
 gpujoin_hash_value(kern_context *kcxt,
 				   kern_data_store *kds,
+				   kern_data_extra *extra,
 				   kern_multirels *kmrels,
 				   cl_int depth,
 				   cl_uint *x_buffer,
 				   cl_bool *is_null_keys);
+
+/*
+ * gpujoin_gist_load_keys
+ *
+ * It preloads GiST index keys from the outer relations, then returns
+ * private datum on kcxt->vlbuf
+ */
+DEVICE_FUNCTION(cl_bool)
+gpujoin_gist_load_keys(kern_context *kcxt,
+					   kern_multirels *kmrels,
+					   kern_data_store *kds,
+					   kern_data_extra *extra,
+					   cl_int depth,
+					   cl_uint *x_buffer);
+
+/*
+ * gpujoin_gist_index_quals
+ *
+ * It checks GiST-index key qualifiers
+ */
+DEVICE_FUNCTION(cl_bool)
+gpujoin_gist_index_quals(kern_context *kcxt,
+						 cl_int depth,
+						 kern_data_store *kds_gist,
+						 IndexTupleData *itup);
 
 /*
  * gpujoin_projection
@@ -229,6 +269,7 @@ gpujoin_hash_value(kern_context *kcxt,
 DEVICE_FUNCTION(cl_uint)
 gpujoin_projection(kern_context *kcxt,
 				   kern_data_store *kds_src,
+				   kern_data_extra *kds_extra,
 				   kern_multirels *kmrels,
 				   cl_uint *r_buffer,
 				   kern_data_store *kds_dst,
@@ -243,6 +284,7 @@ gpujoin_main(kern_context *kcxt,
 			 kern_gpujoin *kgjoin,
 			 kern_multirels *kmrels,
 			 kern_data_store *kds_src,
+			 kern_data_extra *kds_extra,
 			 kern_data_store *kds_dst,
 			 kern_parambuf *kparams_gpreagg,		/* only if combined Join */
 			 cl_uint *l_state,
@@ -274,6 +316,7 @@ KERNEL_FUNCTION(void)
 kern_gpujoin_main(kern_gpujoin *kgjoin,
 				  kern_multirels *kmrels,
 				  kern_data_store *kds_src,
+				  kern_data_extra *kds_extra,
 				  kern_data_store *kds_dst,
 				  kern_parambuf *kparams_gpreagg)
 {
@@ -283,11 +326,14 @@ kern_gpujoin_main(kern_gpujoin *kgjoin,
 	DECL_KERNEL_CONTEXT(u);
 
 	assert(kgjoin->num_rels == GPUJOIN_MAX_DEPTH);
+	memset(l_state, 0, sizeof(l_state));
+	memset(matched, 0, sizeof(matched));
 	INIT_KERNEL_CONTEXT(&u.kcxt, kparams);
 	gpujoin_main(&u.kcxt,
 				 kgjoin,
 				 kmrels,
 				 kds_src,
+				 kds_extra,
 				 kds_dst,
 				 kparams_gpreagg,
 				 l_state,
@@ -308,6 +354,8 @@ kern_gpujoin_right_outer(kern_gpujoin *kgjoin,
 	DECL_KERNEL_CONTEXT(u);
 
 	assert(kgjoin->num_rels == GPUJOIN_MAX_DEPTH);
+	memset(l_state, 0, sizeof(l_state));
+	memset(matched, 0, sizeof(matched));
 	INIT_KERNEL_CONTEXT(&u.kcxt, kparams);
 	gpujoin_right_outer(&u.kcxt,
 						kgjoin,

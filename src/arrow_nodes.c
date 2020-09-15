@@ -168,9 +168,19 @@ __dumpArrowTypeTimestamp(SQLbuffer *buf, ArrowNode *node)
 {
 	ArrowTypeTimestamp *t = (ArrowTypeTimestamp *)node;
 
-	sql_buffer_printf(
-		buf, "{Timestamp: unit=%s}",
-		ArrowTimeUnitAsCstring(t->unit));
+	if (t->timezone)
+	{
+		sql_buffer_printf(
+			buf, "{Timestamp: unit=%s, timezone='%*s'}",
+			ArrowTimeUnitAsCstring(t->unit),
+			t->_timezone_len, t->timezone);
+	}
+	else
+	{
+		sql_buffer_printf(
+			buf, "{Timestamp: unit=%s}",
+			ArrowTimeUnitAsCstring(t->unit));
+	}
 }
 
 static void
@@ -274,10 +284,10 @@ __dumpArrowField(SQLbuffer *buf, ArrowNode *node)
 		f->name ? f->name : "",
 		f->nullable ? "true" : "false");
 	__dumpArrowNode(buf, (ArrowNode *)&f->type);
-	if (f->dictionary.indexType.node.tag == ArrowNodeTag__Int)
+	if (f->dictionary)
 	{
 		sql_buffer_printf(buf, ", dictionary=");
-		__dumpArrowNode(buf, (ArrowNode *)&f->dictionary);
+		__dumpArrowNode(buf, (ArrowNode *)f->dictionary);
 	}
 	sql_buffer_printf(buf, ", children=[");
 	for (i=0; i < f->_num_children; i++)
@@ -650,7 +660,13 @@ __copyArrowField(ArrowField *dest, const ArrowField *src)
 	COPY_CSTRING(name);
 	COPY_SCALAR(nullable);
 	__copyArrowType(&dest->type, &src->type);
-	__copyArrowDictionaryEncoding(&dest->dictionary, &src->dictionary);
+	if (!src->dictionary)
+		dest->dictionary = NULL;
+	else
+	{
+		dest->dictionary = palloc0(sizeof(ArrowDictionaryEncoding));
+		__copyArrowDictionaryEncoding(dest->dictionary, src->dictionary);
+	}
 	COPY_VECTOR(children, ArrowField);
 	COPY_VECTOR(custom_metadata, ArrowKeyValue);
 }
@@ -1361,8 +1377,13 @@ readArrowField(ArrowField *field, const char *pos)
 
 	/* dictionary */
 	dict_pos = fetchOffset(&t, 4);
-	if (dict_pos)
-		readArrowDictionaryEncoding(&field->dictionary, dict_pos);
+	if (!dict_pos)
+		field->dictionary = NULL;
+	else
+	{
+		field->dictionary = palloc0(sizeof(ArrowDictionaryEncoding));
+		readArrowDictionaryEncoding(field->dictionary, dict_pos);
+	}
 
 	/* children */
 	vector = fetchVector(&t, 5, &nitems);
@@ -1629,6 +1650,15 @@ readArrowFooter(ArrowFooter *node, const char *pos)
 #define ARROW_FILE_TAIL_SIGNATURE		"ARROW1"
 #define ARROW_FILE_TAIL_SIGNATURE_SZ	(sizeof(ARROW_FILE_TAIL_SIGNATURE) - 1)
 
+#ifdef __PGSTROM_MODULE__
+#include "pg_strom.h"
+#define __mmap(a,b,c,d,e,f)		__mmapFile((a),(b),(c),(d),(e),(f))
+#define __munmap(a,b)			__munmapFile((a))
+#else
+#define __mmap(a,b,c,d,e,f)		mmap((a),(b),(c),(d),(e),(f))
+#define __munmap(a,b)			munmap((a),(b))
+#endif /* __PGSTROM_MODULE__ */
+
 void
 readArrowFileDesc(int fdesc, ArrowFileInfo *af_info)
 {
@@ -1645,7 +1675,7 @@ readArrowFileDesc(int fdesc, ArrowFileInfo *af_info)
 		Elog("failed on fstat: %m");
 	file_sz = af_info->stat_buf.st_size;
 	mmap_sz = TYPEALIGN(sysconf(_SC_PAGESIZE), file_sz);
-	mmap_head = mmap(NULL, mmap_sz, PROT_READ, MAP_SHARED, fdesc, 0);
+	mmap_head = __mmap(NULL, mmap_sz, PROT_READ, MAP_SHARED, fdesc, 0);
 	if (mmap_head == MAP_FAILED)
 		Elog("failed on mmap: %m");
 	mmap_tail = mmap_head + file_sz - ARROW_FILE_TAIL_SIGNATURE_SZ;
@@ -1658,7 +1688,6 @@ readArrowFileDesc(int fdesc, ArrowFileInfo *af_info)
 			   ARROW_FILE_TAIL_SIGNATURE,
 			   ARROW_FILE_TAIL_SIGNATURE_SZ) != 0)
 	{
-		munmap(mmap_head, mmap_sz);
 		Elog("Signature mismatch on Apache Arrow file");
 	}
 
@@ -1726,5 +1755,5 @@ readArrowFileDesc(int fdesc, ArrowFileInfo *af_info)
 			readArrowMessage(m, pos);
 		}
 	}
-	munmap(mmap_head, mmap_sz);
+	__munmap(mmap_head, mmap_sz);
 }
