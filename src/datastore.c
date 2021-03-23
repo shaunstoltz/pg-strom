@@ -430,10 +430,12 @@ __PDS_clone(pgstrom_data_store *pds_old,
 	pds_new = (pgstrom_data_store *) m_deviceptr;
 
 	/* setup */
+	memset(pds_new, 0, offsetof(pgstrom_data_store, kds));
 	pds_new->gcontext = pds_old->gcontext;
 	pg_atomic_init_u32(&pds_new->refcnt, 1);
 	pds_new->nblocks_uncached = 0;
-	pds_new->filedesc = -1;
+	pds_new->filedesc.rawfd = -1;
+	pds_new->iovec = NULL;
 	memcpy(&pds_new->kds,
 		   &pds_old->kds,
 		   KERN_DATA_STORE_HEAD_LENGTH(&pds_old->kds));
@@ -473,20 +475,17 @@ PDS_release(pgstrom_data_store *pds)
 	Assert(refcnt >= 0);
 	if (refcnt == 0)
 	{
-
-
-		
-		if (!pds->gcontext)
-		{
-			Assert(pds->kds.format == KDS_FORMAT_ARROW ||
-				   pds->kds.format == KDS_FORMAT_COLUMN);
-			pfree(pds);
-		}
-		else
+		if (pds->gcontext)
 		{
 			rc = gpuMemFree(gcontext, (CUdeviceptr) pds);
 			if (rc != CUDA_SUCCESS)
 				werror("failed on gpuMemFree: %s", errorText(rc));
+		}
+		else
+		{
+			Assert(pds->kds.format == KDS_FORMAT_ARROW ||
+				   pds->kds.format == KDS_FORMAT_COLUMN);
+			pfree(pds);
 		}
 	}
 }
@@ -841,12 +840,14 @@ __PDS_create_row(GpuContext *gcontext,
 	pds = (pgstrom_data_store *) m_deviceptr;
 
 	/* setup */
+	memset(pds, 0, offsetof(pgstrom_data_store, kds));
 	pds->gcontext = gcontext;
 	pg_atomic_init_u32(&pds->refcnt, 1);
 	init_kernel_data_store(&pds->kds, tupdesc, bytesize,
 						   KDS_FORMAT_ROW, INT_MAX);
 	pds->nblocks_uncached = 0;
-	pds->filedesc = -1;
+	pds->filedesc.rawfd = -1;
+	pds->iovec = NULL;
 
 	return pds;
 }
@@ -876,12 +877,14 @@ __PDS_create_hash(GpuContext *gcontext,
 	pds = (pgstrom_data_store *) m_deviceptr;
 
 	/* setup */
+	memset(pds, 0, offsetof(pgstrom_data_store, kds));
 	pds->gcontext = gcontext;
 	pg_atomic_init_u32(&pds->refcnt, 1);
 	init_kernel_data_store(&pds->kds, tupdesc, bytesize,
 						   KDS_FORMAT_HASH, INT_MAX);
 	pds->nblocks_uncached = 0;
-	pds->filedesc = -1;
+	pds->filedesc.rawfd = -1;
+	pds->iovec = NULL;
 
 	return pds;
 }
@@ -918,13 +921,15 @@ __PDS_create_slot(GpuContext *gcontext,
 	pds = (pgstrom_data_store *) m_deviceptr;
 
 	/* setup */
+	memset(pds, 0, offsetof(pgstrom_data_store, kds));
 	pds->gcontext = gcontext;
 	pg_atomic_init_u32(&pds->refcnt, 1);
 	init_kernel_data_store(&pds->kds, tupdesc,
 						   bytesize - offsetof(pgstrom_data_store, kds),
 						   KDS_FORMAT_SLOT, nrooms);
 	pds->nblocks_uncached = 0;
-	pds->filedesc = -1;
+	pds->filedesc.rawfd = -1;
+	pds->iovec = NULL;
 
 	return pds;
 }
@@ -937,16 +942,20 @@ __PDS_create_block(GpuContext *gcontext,
 {
 	pgstrom_data_store *pds = NULL;
 	cl_uint		nrooms = nvme_sstate->nblocks_per_chunk;
-	size_t		bytesize;
+	size_t		length;
+	size_t		iovec_sz;
 	CUresult	rc;
 
-	bytesize = KDS_calculateHeadSize(tupdesc)
+	length = KDS_calculateHeadSize(tupdesc)
 		+ STROMALIGN(sizeof(BlockNumber) * nrooms)
 		+ BLCKSZ * nrooms;
-	if (offsetof(pgstrom_data_store, kds) + bytesize > pgstrom_chunk_size())
+	iovec_sz = MAXALIGN(offsetof(strom_io_vector, ioc[nrooms]));
+
+	if (offsetof(pgstrom_data_store,
+				 kds) + length + iovec_sz > pgstrom_chunk_size())
 		elog(ERROR,
 			 "Bug? PDS length (%zu) is larger than pg_strom.chunk_size(%zu)",
-			 offsetof(pgstrom_data_store, kds) + bytesize,
+			 offsetof(pgstrom_data_store, kds) + length + iovec_sz,
 			 pgstrom_chunk_size());
 
 	rc = __gpuMemAllocHost(gcontext,
@@ -956,13 +965,16 @@ __PDS_create_block(GpuContext *gcontext,
 	if (rc != CUDA_SUCCESS)
 		werror("failed on gpuMemAllocHost: %s", errorText(rc));
 	/* setup */
+	memset(pds, 0, offsetof(pgstrom_data_store, kds));
 	pds->gcontext = gcontext;
 	pg_atomic_init_u32(&pds->refcnt, 1);
-	init_kernel_data_store(&pds->kds, tupdesc, bytesize,
+	init_kernel_data_store(&pds->kds, tupdesc, length,
 						   KDS_FORMAT_BLOCK, nrooms);
-    pds->kds.nrows_per_block = nvme_sstate->nrows_per_block;
-    pds->nblocks_uncached = 0;
-	pds->filedesc = -1;
+	pds->kds.nrows_per_block = nvme_sstate->nrows_per_block;
+	pds->nblocks_uncached = 0;
+	pds->filedesc.rawfd = -1;
+	pds->iovec = (strom_io_vector *)((char *)&pds->kds + length);
+	pds->iovec->nr_chunks = 0;
 
 	return pds;
 }
@@ -1017,31 +1029,6 @@ typedef struct _MdfdVec
 	BlockNumber		mdfd_segno;		/* segment number, from 0 */
 } MdfdVec;
 
-static int
-nvme_sstate_open_segment(SMgrRelation rd_smgr, int seg_nr)
-{
-	/* see _mdfd_openseg() and _mdfd_segpath() */
-	char	   *temp;
-	char	   *path;
-	int			fdesc;
-
-	temp = relpath(rd_smgr->smgr_rnode, MAIN_FORKNUM);
-	if (seg_nr > 0)
-	{
-		path = psprintf("%s.%u", temp, seg_nr);
-		pfree(temp);
-	}
-	else
-		path = temp;
-
-	fdesc = open(path, O_RDWR | PG_BINARY, 0600);
-	if (fdesc < 0)
-		elog(ERROR, "failed on open('%s'): %m", path);
-	pfree(path);
-
-	return fdesc;
-}
-
 static void
 nvme_sstate_open_files(GpuContext *gcontext,
 					   NVMEScanState *nvme_sstate,
@@ -1049,46 +1036,45 @@ nvme_sstate_open_files(GpuContext *gcontext,
 {
 	SMgrRelation rd_smgr = relation->rd_smgr;
 	MdfdVec	   *vec;
-	int			i, nr_segs;
-	int			fdesc;
+	int			i, nr_open_segs;
 
-	nr_segs = Min(rd_smgr->md_num_open_segs[MAIN_FORKNUM],
-				  nvme_sstate->nr_segs);
-	for (i=0; i < nr_segs; i++)
+	nr_open_segs = rd_smgr->md_num_open_segs[MAIN_FORKNUM];
+	for (i=0; i < nvme_sstate->nr_segs; i++)
 	{
-		vec = &rd_smgr->md_seg_fds[MAIN_FORKNUM][i];
-		if (vec->mdfd_segno != i)
-			elog(ERROR, "Bug? mdfd_segno is not consistent");
-		if (vec->mdfd_vfd < 0)
-			elog(ERROR, "Bug? seg=%d of relation %s is not opened",
-				 i, RelationGetRelationName(relation));
-		fdesc = FileGetRawDesc(vec->mdfd_vfd);
-		if (fdesc < 0)
-			fdesc = nvme_sstate_open_segment(rd_smgr, i);
+		GPUDirectFileDesc *dfile = &nvme_sstate->files[i];
+
+		if (i < nr_open_segs)
+		{
+			vec = &rd_smgr->md_seg_fds[MAIN_FORKNUM][i];
+			if (vec->mdfd_segno != i)
+				elog(ERROR, "Bug? mdfd_segno is not consistent");
+			if (vec->mdfd_vfd < 0)
+				elog(ERROR, "Bug? seg=%d of relation %s is not opened",
+					 i, RelationGetRelationName(relation));
+			gpuDirectFileDescOpen(dfile, vec->mdfd_vfd);
+		}
 		else
 		{
-			fdesc = dup(fdesc);
-			if (fdesc < 0)
-				elog(ERROR, "failed on dup(2): %m");
+			/* see _mdfd_openseg() and _mdfd_segpath() */
+			const char *pathname;
+			char	   *temp;
+
+			temp = relpath(rd_smgr->smgr_rnode, MAIN_FORKNUM);
+			if (i == 0)
+				pathname = temp;
+			else
+			{
+				pathname = psprintf("%s.%u", temp, i);
+				pfree(temp);
+			}
+			gpuDirectFileDescOpenByPath(dfile, pathname);
 		}
 
-		if (!trackRawFileDesc(gcontext, fdesc, __FILE__, __LINE__))
+		if (!trackRawFileDesc(gcontext, dfile, __FILE__, __LINE__))
 		{
-			close(fdesc);
+			gpuDirectFileDescClose(dfile);
 			elog(ERROR, "out of memory");
 		}
-		nvme_sstate->fdesc[i] = fdesc;
-	}
-
-	while (i < nvme_sstate->nr_segs)
-	{
-		fdesc = nvme_sstate_open_segment(rd_smgr, i);
-		if (!trackRawFileDesc(gcontext, fdesc, __FILE__, __LINE__))
-		{
-			close(fdesc);
-			elog(ERROR, "out of memory");
-		}
-		nvme_sstate->fdesc[i] = fdesc;
 	}
 }
 
@@ -1133,11 +1119,17 @@ PDS_init_heapscan_state(GpuTaskState *gts)
 	 * around the relation scan.
 	 */
 	kds_head_sz = KDS_calculateHeadSize(tupdesc);
-	nrooms_max = (pgstrom_chunk_size() - kds_head_sz)
-		/ (sizeof(BlockNumber) + BLCKSZ);
-	while (kds_head_sz +
+	nrooms_max = (pgstrom_chunk_size() -
+				  offsetof(pgstrom_data_store, kds) -
+				  kds_head_sz -
+				  offsetof(strom_io_vector, ioc))
+		/ (sizeof(BlockNumber) + BLCKSZ + sizeof(strom_io_chunk));
+	while (offsetof(pgstrom_data_store,
+					kds) + kds_head_sz +
 		   STROMALIGN(sizeof(BlockNumber) * nrooms_max) +
-		   BLCKSZ * nrooms_max > pgstrom_chunk_size())
+		   BLCKSZ * nrooms_max +
+		   MAXALIGN(offsetof(strom_io_vector,
+							 ioc[nrooms_max])) > pgstrom_chunk_size())
 		nrooms_max--;
 	if (nrooms_max < 1)
 		return;
@@ -1149,7 +1141,7 @@ PDS_init_heapscan_state(GpuTaskState *gts)
 	nr_segs = (nr_blocks + (BlockNumber) RELSEG_SIZE - 1) / RELSEG_SIZE;
 	nvme_sstate = MemoryContextAllocZero(estate->es_query_cxt,
 										 offsetof(NVMEScanState,
-												  fdesc[nr_segs]));
+												  files[nr_segs]));
 	nvme_sstate->nrows_per_block = nrows_per_block;
 	nvme_sstate->nblocks_per_chunk = nblocks_per_chunk;
 	nvme_sstate->curr_segno = InvalidBlockNumber;
@@ -1168,7 +1160,7 @@ PDS_end_heapscan_state(GpuTaskState *gts)
 {
 	GpuContext	   *gcontext = gts->gcontext;
 	NVMEScanState  *nvme_sstate = gts->nvme_sstate;
-	int		i, fdesc;
+	int				i;
 
 	if (nvme_sstate)
 	{
@@ -1181,293 +1173,12 @@ PDS_end_heapscan_state(GpuTaskState *gts)
 		/* close file descriptors, if any */
 		for (i=0; i < nvme_sstate->nr_segs; i++)
 		{
-			fdesc = nvme_sstate->fdesc[i];
-			untrackRawFileDesc(gcontext, fdesc);
-			if (close(fdesc))
-				elog(NOTICE, "failed on close(%d): %m", fdesc);
+			untrackRawFileDesc(gcontext, &nvme_sstate->files[i]);
+			gpuDirectFileDescClose(&nvme_sstate->files[i]);
 		}
 		pfree(nvme_sstate);
 		gts->nvme_sstate = NULL;
 	}
-}
-
-/*
- * PDS_exec_heapscan_block - PDS scan for KDS_FORMAT_BLOCK format
- */
-static bool
-PDS_exec_heapscan_block(pgstrom_data_store *pds,
-						Relation relation,
-						HeapScanDesc hscan,
-						NVMEScanState *nvme_sstate)
-{
-	BlockNumber		blknum = hscan->rs_cblock;
-	BlockNumber	   *block_nums;
-	Snapshot		snapshot = ((TableScanDesc)hscan)->rs_snapshot;
-	BufferAccessStrategy strategy = hscan->rs_strategy;
-	SMgrRelation	smgr = relation->rd_smgr;
-	Buffer			buffer;
-	Page			spage;
-	Page			dpage;
-	cl_uint			nr_loaded;
-	bool			all_visible;
-
-	/* PDS cannot eat any blocks more, obviously */
-	if (pds->kds.nitems >= pds->kds.nrooms)
-		return false;
-
-	/* array of block numbers */
-	block_nums = (BlockNumber *)KERN_DATA_STORE_BODY(&pds->kds);
-
-	/*
-	 * NVMe-Strom can be applied only when filesystem supports the feature,
-	 * and the current source block is all-visible.
-	 * Elsewhere, we will go fallback with synchronized buffer scan.
-	 */
-	if (RelationCanUseNvmeStrom(relation) &&
-		VM_ALL_VISIBLE(relation, blknum,
-					   &nvme_sstate->curr_vmbuffer))
-	{
-		BufferTag	newTag;
-		uint32		newHash;
-		LWLock	   *newPartitionLock = NULL;
-		bool		retval;
-		int			buf_id;
-
-		/* create a tag so we can lookup the buffer */
-		INIT_BUFFERTAG(newTag, smgr->smgr_rnode.node, MAIN_FORKNUM, blknum);
-		/* determine its hash code and partition lock ID */
-		newHash = BufTableHashCode(&newTag);
-		newPartitionLock = BufMappingPartitionLock(newHash);
-
-		/* check whether the block exists on the shared buffer? */
-		LWLockAcquire(newPartitionLock, LW_SHARED);
-		buf_id = BufTableLookup(&newTag, newHash);
-		if (buf_id < 0)
-		{
-			BlockNumber	segno = blknum / RELSEG_SIZE;
-			int			filedesc;
-
-			Assert(segno < nvme_sstate->nr_segs);
-			/*
-			 * We cannot mix up multiple source files in a single PDS chunk.
-			 * If heapscan_block comes across segment boundary, rest of the
-			 * blocks must be read on the next PDS chunk.
-			 */
-			filedesc = nvme_sstate->fdesc[segno];
-			if (pds->filedesc >= 0 && pds->filedesc != filedesc)
-				retval = false;
-			else
-			{
-				if (pds->filedesc < 0)
-					pds->filedesc = filedesc;
-				/* add uncached block for direct load */
-				pds->nblocks_uncached++;
-				pds->kds.nitems++;
-				block_nums[pds->kds.nrooms - pds->nblocks_uncached] = blknum;
-
-				retval = true;
-			}
-			LWLockRelease(newPartitionLock);
-			return retval;
-		}
-		LWLockRelease(newPartitionLock);
-	}
-	/*
-	 * Load the source buffer with synchronous read
-	 */
-	buffer = ReadBufferExtended(relation, MAIN_FORKNUM, blknum,
-								RBM_NORMAL, strategy);
-#if 1
-	/* Just like heapgetpage(), however, jobs we focus on is OLAP
-	 * workload, so it's uncertain whether we should vacuum the page
-	 * here.
-	 */
-	heap_page_prune_opt(relation, buffer);
-#endif
-	/* we will check tuple's visibility under the shared lock */
-	LockBuffer(buffer, BUFFER_LOCK_SHARE);
-	nr_loaded = pds->kds.nitems - pds->nblocks_uncached;
-	spage = (Page) BufferGetPage(buffer);
-	dpage = (Page) KERN_DATA_STORE_BLOCK_PGPAGE(&pds->kds, nr_loaded);
-	memcpy(dpage, spage, BLCKSZ);
-	block_nums[nr_loaded] = blknum;
-
-	/*
-	 * Logic is almost same as heapgetpage() doing. We have to invalidate
-	 * invisible tuples prior to GPU kernel execution, if not all-visible.
-	 */
-	all_visible = PageIsAllVisible(dpage) && !snapshot->takenDuringRecovery;
-	if (!all_visible)
-	{
-		int				lines = PageGetMaxOffsetNumber(dpage);
-		OffsetNumber	lineoff;
-		ItemId			lpp;
-
-		for (lineoff = FirstOffsetNumber, lpp = PageGetItemId(dpage, lineoff);
-			 lineoff <= lines;
-			 lineoff++, lpp++)
-		{
-			HeapTupleData	tup;
-			bool			valid;
-
-			if (!ItemIdIsNormal(lpp))
-				continue;
-
-			tup.t_tableOid = RelationGetRelid(relation);
-			tup.t_data = (HeapTupleHeader) PageGetItem((Page) dpage, lpp);
-			tup.t_len = ItemIdGetLength(lpp);
-			ItemPointerSet(&tup.t_self, blknum, lineoff);
-
-			valid = HeapTupleSatisfiesVisibility(&tup, snapshot, buffer);
-			CheckForSerializableConflictOut(valid, relation, &tup,
-											buffer, snapshot);
-			if (!valid)
-				ItemIdSetUnused(lpp);
-		}
-	}
-	UnlockReleaseBuffer(buffer);
-	/* dpage became all-visible also */
-	PageSetAllVisible(dpage);
-	pds->kds.nitems++;
-
-	return true;
-}
-
-/*
- * PDS_exec_heapscan_row - PDS scan for KDS_FORMAT_ROW format
- */
-static bool
-PDS_exec_heapscan_row(pgstrom_data_store *pds,
-					  Relation relation,
-					  HeapScanDesc hscan)
-{
-	BlockNumber		blknum = hscan->rs_cblock;
-	Snapshot		snapshot = ((TableScanDesc)hscan)->rs_snapshot;
-	BufferAccessStrategy strategy = hscan->rs_strategy;
-	kern_data_store	*kds = &pds->kds;
-	Buffer			buffer;
-	Page			page;
-	int				lines;
-	int				ntup;
-	OffsetNumber	lineoff;
-	ItemId			lpp;
-	uint		   *tup_index;
-	kern_tupitem   *tup_item;
-	bool			all_visible;
-	Size			max_consume;
-
-	/* Load the target buffer */
-	buffer = ReadBufferExtended(relation, MAIN_FORKNUM, blknum,
-								RBM_NORMAL, strategy);
-#if 1
-	/* Just like heapgetpage(), however, jobs we focus on is OLAP
-	 * workload, so it's uncertain whether we should vacuum the page
-	 * here.
-	 */
-	heap_page_prune_opt(relation, buffer);
-#endif
-	/* we will check tuple's visibility under the shared lock */
-	LockBuffer(buffer, BUFFER_LOCK_SHARE);
-	page = (Page) BufferGetPage(buffer);
-	lines = PageGetMaxOffsetNumber(page);
-	ntup = 0;
-
-	/*
-	 * Check whether we have enough rooms to store expected number of
-	 * tuples on the remaining space. If it is hopeless to load all
-	 * the items in a block, we inform the caller this block shall be
-	 * loaded on the next data store.
-	 */
-	max_consume = KERN_DATA_STORE_HEAD_LENGTH(kds) +
-		STROMALIGN(sizeof(cl_uint) * (kds->nitems + lines)) +
-		offsetof(kern_tupitem, htup) * lines + BLCKSZ +
-		__kds_unpack(kds->usage);
-	if (max_consume > kds->length)
-	{
-		UnlockReleaseBuffer(buffer);
-		return false;
-	}
-
-	/*
-	 * Logic is almost same as heapgetpage() doing.
-	 */
-	all_visible = PageIsAllVisible(page) && !snapshot->takenDuringRecovery;
-
-	/* TODO: make SerializationNeededForRead() an external function
-	 * on the core side. It kills necessity of setting up HeapTupleData
-	 * when all_visible and non-serialized transaction.
-	 */
-	tup_index = KERN_DATA_STORE_ROWINDEX(kds) + kds->nitems;
-	for (lineoff = FirstOffsetNumber, lpp = PageGetItemId(page, lineoff);
-		 lineoff <= lines;
-		 lineoff++, lpp++)
-	{
-		HeapTupleData	tup;
-		size_t			curr_usage;
-		bool			valid;
-
-		if (!ItemIdIsNormal(lpp))
-			continue;
-
-		tup.t_tableOid = RelationGetRelid(relation);
-		tup.t_data = (HeapTupleHeader) PageGetItem((Page) page, lpp);
-		tup.t_len = ItemIdGetLength(lpp);
-		ItemPointerSet(&tup.t_self, blknum, lineoff);
-
-		if (all_visible)
-			valid = true;
-		else
-			valid = HeapTupleSatisfiesVisibility(&tup, snapshot, buffer);
-
-		CheckForSerializableConflictOut(valid, relation,
-										&tup, buffer, snapshot);
-		if (!valid)
-			continue;
-
-		/* put tuple */
-		curr_usage = (__kds_unpack(kds->usage) +
-					  MAXALIGN(offsetof(kern_tupitem, htup) + tup.t_len));
-		tup_item = (kern_tupitem *)((char *)kds + kds->length - curr_usage);
-		tup_item->rowid = kds->nitems + ntup;
-		tup_item->t_len = tup.t_len;
-		memcpy(&tup_item->htup, tup.t_data, tup.t_len);
-		memcpy(&tup_item->htup.t_ctid, &tup.t_self, sizeof(ItemPointerData));
-
-		tup_index[ntup++] = __kds_packed((uintptr_t)tup_item - (uintptr_t)kds);
-		kds->usage = __kds_packed(curr_usage);
-	}
-	UnlockReleaseBuffer(buffer);
-	Assert(ntup <= MaxHeapTuplesPerPage);
-	Assert(kds->nitems + ntup <= kds->nrooms);
-	kds->nitems += ntup;
-
-	return true;
-}
-
-/*
- * PDS_exec_heapscan - PDS scan entrypoint
- */
-bool
-PDS_exec_heapscan(GpuTaskState *gts, pgstrom_data_store *pds)
-{
-	Relation		relation = gts->css.ss.ss_currentRelation;
-	HeapScanDesc	hscan = (HeapScanDesc)gts->css.ss.ss_currentScanDesc;
-	bool			retval;
-
-	CHECK_FOR_INTERRUPTS();
-
-	if (pds->kds.format == KDS_FORMAT_ROW)
-		retval = PDS_exec_heapscan_row(pds, relation, hscan);
-	else if (pds->kds.format == KDS_FORMAT_BLOCK)
-	{
-		Assert(gts->nvme_sstate);
-		retval = PDS_exec_heapscan_block(pds, relation, hscan,
-										 gts->nvme_sstate);
-	}
-	else
-		elog(ERROR, "Bug? unexpected PDS format: %d", pds->kds.format);
-
-	return retval;
 }
 
 /*
@@ -1578,7 +1289,7 @@ KDS_insert_hashitem(kern_data_store *kds,
 void
 PDS_fillup_blocks(pgstrom_data_store *pds)
 {
-	cl_int			filedesc = pds->filedesc;
+	cl_int			filedesc = pds->filedesc.rawfd;
 	cl_int			i, nr_loaded;
 	ssize_t			nbytes;
 	char		   *dest_addr;
@@ -1658,7 +1369,7 @@ __PDS_fillup_arrow(pgstrom_data_store *pds_dst,
 	pds_dst->gcontext = gcontext;
 	pg_atomic_init_u32(&pds_dst->refcnt, 1);
 	pds_dst->nblocks_uncached = 0;
-	pds_dst->filedesc = -1;
+	pds_dst->filedesc.rawfd = -1;
 	pds_dst->iovec = NULL;
 	memcpy(&pds_dst->kds, kds_head, head_sz);
 
@@ -1735,7 +1446,7 @@ PDS_fillup_arrow(pgstrom_data_store *pds_src)
 	__PDS_fillup_arrow(pds_dst,
 					   pds_dst->gcontext,
 					   &pds_src->kds,
-					   pds_src->filedesc,
+					   pds_src->filedesc.rawfd,
 					   pds_src->iovec);
 	return pds_dst;
 }
@@ -1763,7 +1474,7 @@ PDS_writeback_arrow(pgstrom_data_store *pds_src,
 	memset(pds_dst, 0, offsetof(pgstrom_data_store, kds));
 	pds_dst->gcontext = pds_src->gcontext;
 	pg_atomic_init_u32(&pds_dst->refcnt, 1);
-	pds_dst->filedesc = -1;
+	pds_dst->filedesc.rawfd = -1;
 	rc = cuMemcpyDtoH(&pds_dst->kds,
 					  m_kds_src,
 					  pds_src->kds.length);

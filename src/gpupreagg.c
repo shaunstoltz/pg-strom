@@ -967,6 +967,7 @@ cost_gpupreagg(PlannerInfo *root,
 		Cost	outer_startup = input_path->startup_cost;
 		Cost	outer_total   = input_path->total_cost;
 		List   *outer_tlist   = input_path->pathtarget->exprs;
+		Cost	discount = 0.0;
 
 		/*
 		 * Discount cost for DMA-receive if GpuPreAgg can pull-up
@@ -976,16 +977,16 @@ cost_gpupreagg(PlannerInfo *root,
 			pgstrom_path_is_gpujoin(input_path) &&
 			pgstrom_device_expression(root, outer_rel, (Expr *)outer_tlist))
 		{
-			outer_total -= cost_for_dma_receive(input_path->parent, -1.0);
-			outer_total -= cpu_tuple_cost * input_path->rows;
+			discount = (cost_for_dma_receive(input_path->parent, -1.0) +
+						cpu_tuple_cost * input_path->rows);
 		}
 		else if (pathtree_has_gpupath(input_path))
 			outer_total += pgstrom_gpu_setup_cost / 2;
 		else
 			outer_total += pgstrom_gpu_setup_cost;
 
-		gpa_info->outer_startup_cost = outer_startup;
-		gpa_info->outer_total_cost   = outer_total;
+		gpa_info->outer_startup_cost = Max(outer_startup - discount, 0.0);
+		gpa_info->outer_total_cost   = Max(outer_total - discount, 0.0);
 
 		startup_cost = outer_total;
 		run_cost = 0.0;
@@ -1010,6 +1011,8 @@ cost_gpupreagg(PlannerInfo *root,
 									&startup_cost,
 									&run_cost);
 		run_cost -= cpu_tuple_cost * ntuples;
+		if (run_cost < 0.0)
+			run_cost = 0.0;
 		gpa_info->outer_startup_cost = startup_cost;
 		gpa_info->outer_total_cost	= startup_cost + run_cost;
 
@@ -1753,14 +1756,9 @@ gpupreagg_add_grouping_paths(PlannerInfo *root,
 	if (!pgstrom_enabled || !enable_gpupreagg)
 		return;
 
+	/* CREATE EXTENSION pg_strom; was not executed */
 	if (get_namespace_oid("pgstrom", true) == InvalidOid)
-	{
-		ereport(WARNING,
-				(errcode(ERRCODE_UNDEFINED_SCHEMA),
-				 errmsg("schema \"pgstrom\" was not found"),
-				 errhint("Run: CREATE EXTENSION pg_strom")));
 		return;
-	}
 
 	/* traditional GpuPreAgg + Agg path consideration */
 	input_path = input_rel->cheapest_total_path;
@@ -1810,8 +1808,8 @@ replace_expression_by_outerref(Node *node, PathTarget *target_input)
 			{
 				Var	   *varnode = (Var *) node;
 
-				newnode->varnoold  = varnode->varno;
-				newnode->varoattno = varnode->varattno;
+				newnode->varnosyn  = varnode->varno;
+				newnode->varattnosyn = varnode->varattno;
 			}
 			return (Node *) newnode;
 		}
@@ -2840,8 +2838,8 @@ __make_tlist_device_projection(Node *node, void *__con)
 							  varnode->vartypmod,
 							  varnode->varcollid,
 							  varnode->varlevelsup);
-			newnode->varnoold  = varnode->varno;
-			newnode->varoattno = varnode->varattno;
+			newnode->varnosyn  = varnode->varno;
+			newnode->varattnosyn = varnode->varattno;
 			return (Node *) newnode;
 		}
 	}
@@ -2871,8 +2869,8 @@ __make_tlist_device_projection(Node *node, void *__con)
 				{
 					Var	   *varnode = (Var *) node;
 
-					newnode->varnoold = varnode->varno;
-					newnode->varoattno = varnode->varattno;
+					newnode->varnosyn = varnode->varno;
+					newnode->varattnosyn = varnode->varattno;
 				}
 				return (Node *)newnode;
 			}
@@ -3117,6 +3115,7 @@ gpupreagg_codegen_projection_row(StringInfo kern,
 	List		   *type_oid_list = NIL;
 	ListCell	   *lc;
 	int				i, k, nattrs;
+	int				outer_refno_max = -1;
 
 	initStringInfo(&decl);
 	initStringInfo(&tbody);
@@ -3158,10 +3157,7 @@ gpupreagg_codegen_projection_row(StringInfo kern,
 				elog(ERROR, "Bug? system column or whole-row is referenced");
 		}
 
-		appendStringInfoString(
-			&tbody,
-			"  /* extract the given htup and load variables */\n"
-			"  EXTRACT_HEAP_TUPLE_BEGIN(addr,kds_src,htup);\n");
+		resetStringInfo(&temp);
 		for (i=1; i <= nattrs; i++)
 		{
 			bool	referenced = false;
@@ -3214,12 +3210,20 @@ gpupreagg_codegen_projection_row(StringInfo kern,
 						continue;
 
 					/* row */
+					if (!referenced)
+					{
+						appendStringInfo(
+							&temp,
+							"  case %d:\n", i - 1);
+						outer_refno_max = i;
+					}
+
 					appendStringInfo(
 						&temp,
-						"  pg_datum_ref(kcxt, temp.%s_v, addr);\n"
-						"  pg_datum_store(kcxt, temp.%s_v,\n"
-						"                 dst_dclass[%d],\n"
-						"                 dst_values[%d]);\n",
+						"    pg_datum_ref(kcxt, temp.%s_v, addr);\n"
+						"    pg_datum_store(kcxt, temp.%s_v,\n"
+						"                   dst_dclass[%d],\n"
+						"                   dst_values[%d]);\n",
 						dtype->type_name,
 						dtype->type_name,
 						tle->resno - 1,
@@ -3276,9 +3280,16 @@ gpupreagg_codegen_projection_row(StringInfo kern,
 						"  pg_%s_t KVAR_%u;\n",
 						dtype->type_name, i);
 					/* row */
+					if (!referenced)
+					{
+						appendStringInfo(
+							&temp,
+							"  case %d:\n", i - 1);
+						outer_refno_max = i;
+					}
 					appendStringInfo(
 						&temp,
-						"  pg_datum_ref(kcxt, KVAR_%u, addr);\n", i);
+						"    pg_datum_ref(kcxt, KVAR_%u, addr);\n", i);
 					/* slot */
 					appendStringInfo(
 						&sbody,
@@ -3310,20 +3321,33 @@ gpupreagg_codegen_projection_row(StringInfo kern,
 					appendStringInfo(
 						&cbody,
 						"  pg_datum_ref(kcxt, KVAR_%u, addr);\n", i);
+					referenced = true;
 				}
 				context->varlena_bufsz += MAXALIGN(dtype->extra_sz);
 				type_oid_list = list_append_unique_oid(type_oid_list,
 													   dtype->type_oid);
-				appendStringInfoString(&tbody, temp.data);
-                resetStringInfo(&temp);
+				if (referenced)
+					appendStringInfoString(
+						&temp,
+						"    break;\n");
 			}
-			appendStringInfoString(
-				&temp,
-				"  EXTRACT_HEAP_TUPLE_NEXT(addr,kds_src);\n");
 		}
-		appendStringInfoString(
-			&tbody,
-			"  EXTRACT_HEAP_TUPLE_END();\n");
+
+		if (temp.len > 0)
+		{
+			appendStringInfo(
+				&tbody,
+				"  EXTRACT_HEAP_TUPLE_BEGIN(kds_src,htup,%d);\n"
+				"  switch (__colidx)\n"
+				"  {\n"
+				"%s"
+				"  default:\n"
+				"    break;\n"
+				"  }\n"
+				"  EXTRACT_HEAP_TUPLE_END();\n",
+				outer_refno_max,
+				temp.data);
+		}
 	}
 
 	/*
@@ -4145,8 +4169,8 @@ ExecInitGpuPreAgg(CustomScanState *node, EState *estate, int eflags)
 
 	Assert(scan_rel ? outerPlan(node) == NULL : outerPlan(cscan) != NULL);
 	/* activate a GpuContext for CUDA kernel execution */
-	gpas->gts.gcontext = AllocGpuContext(gpa_info->optimal_gpu,
-										 false, false, false);
+	gpas->gts.gcontext = AllocGpuContext(gpa_info->optimal_gpu, false, false);
+
 	/* setup common GpuTaskState fields */
 	pgstromInitGpuTaskState(&gpas->gts,
 							gpas->gts.gcontext,
@@ -4542,7 +4566,6 @@ createGpuPreAggSharedState(GpuPreAggState *gpas,
 	GpuPreAggRuntimeStat *gpa_rtstat;
 	size_t		ss_length = MAXALIGN(sizeof(GpuPreAggSharedState));
 
-	Assert(!IsParallelWorker());
 	if (dsm_addr)
 		gpa_sstate = dsm_addr;
 	else
@@ -4684,7 +4707,7 @@ gpupreagg_create_task(GpuPreAggState *gpas,
 				: gpas->gts.nvme_sstate;
 
 			Assert(nvme_sstate != NULL);
-			Assert(pds_src->filedesc >= 0 || pds_src->nblocks_uncached == 0);
+			Assert(pds_src->filedesc.rawfd >= 0 || pds_src->nblocks_uncached == 0);
 			with_nvme_strom = (pds_src->nblocks_uncached > 0);
 			nrows_per_block = nvme_sstate->nrows_per_block;
 			/*
@@ -5376,12 +5399,12 @@ resume_kernel:
 	if (rc != CUDA_SUCCESS)
 		werror("failed on cuLaunchKernel: %s", errorText(rc));
 
-	rc = cuEventRecord(CU_EVENT0_PER_THREAD, CU_STREAM_PER_THREAD);
+	rc = cuEventRecord(CU_EVENT_PER_THREAD, CU_STREAM_PER_THREAD);
 	if (rc != CUDA_SUCCESS)
 		werror("failed on cuEventRecord: %s", errorText(rc));
 
 	/* Point of synchronization */
-	rc = cuEventSynchronize(CU_EVENT0_PER_THREAD);
+	rc = cuEventSynchronize(CU_EVENT_PER_THREAD);
 	if (rc != CUDA_SUCCESS)
 		werror("failed on cuEventSynchronize: %s", errorText(rc));
 
@@ -5613,6 +5636,11 @@ gpupreagg_process_combined_task(GpuPreAggTask *gpreagg, CUmodule cuda_module)
 		else
 			werror("failed on gpuMemAllocIOMap: %s", errorText(rc));
 	}
+	else if (pds_src->kds.format == KDS_FORMAT_COLUMN)
+	{
+		m_kds_src = pds_src->m_kds_base;
+		m_kds_extra = pds_src->m_kds_extra;
+	}
 	else
 	{
 		m_kds_src = (CUdeviceptr)&pds_src->kds;
@@ -5653,7 +5681,7 @@ gpupreagg_process_combined_task(GpuPreAggTask *gpreagg, CUmodule cuda_module)
 			if (rc != CUDA_SUCCESS)
 				werror("failed on cuMemcpyHtoDAsync: %s", errorText(rc));
 		}
-		else
+		else if (pds_src->kds.format != KDS_FORMAT_COLUMN)
 		{
 			rc = cuMemPrefetchAsync(m_kds_src,
 									pds_src->kds.length,
@@ -5753,12 +5781,12 @@ resume_kernel:
 	if (rc != CUDA_SUCCESS)
 		werror("failed on cuLaunchKernel: %s", errorText(rc));
 
-	rc = cuEventRecord(CU_EVENT0_PER_THREAD, CU_STREAM_PER_THREAD);
+	rc = cuEventRecord(CU_EVENT_PER_THREAD, CU_STREAM_PER_THREAD);
 	if (rc != CUDA_SUCCESS)
 		werror("failed on cuEventRecord: %s", errorText(rc));
 
 	/* Point of synchronization */
-	rc = cuEventSynchronize(CU_EVENT0_PER_THREAD);
+	rc = cuEventSynchronize(CU_EVENT_PER_THREAD);
 	if (rc != CUDA_SUCCESS)
 		werror("failed on cuEventSynchronize: %s", errorText(rc));
 

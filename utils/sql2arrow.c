@@ -29,6 +29,7 @@ static char	   *sqldb_database = NULL;
 static char	   *dump_arrow_filename = NULL;
 static int		shows_progress = 0;
 static userConfigOption *sqldb_session_configs = NULL;
+static nestLoopOption *sqldb_nestloop_options = NULL;
 
 /*
  * loadArrowDictionaryBatches
@@ -40,7 +41,7 @@ __loadArrowDictionaryBatchOne(const char *message_head,
 	SQLdictionary  *dict;
 	ArrowBuffer	   *v_buffer = &dbatch->data.buffers[1];
 	ArrowBuffer	   *e_buffer = &dbatch->data.buffers[2];
-	uint32		   *values = (uint32 *)(message_head + v_buffer->offset);
+	uint32_t		   *values = (uint32_t *)(message_head + v_buffer->offset);
 	char		   *extra = (char *)(message_head + e_buffer->offset);
 	int				i;
 
@@ -55,9 +56,9 @@ __loadArrowDictionaryBatchOne(const char *message_head,
 	for (i=0; i < dict->nloaded; i++)
 	{
 		hashItem   *hitem;
-		uint32		len = values[i+1] - values[i];
+		uint32_t		len = values[i+1] - values[i];
 		char	   *pos = extra + values[i];
-		uint32		hindex;
+		uint32_t		hindex;
 
 		hitem = palloc(offsetof(hashItem, label[len+1]));
 		hitem->hash = hash_any((unsigned char *)pos, len);
@@ -207,7 +208,7 @@ static void
 setup_append_file(SQLtable *table, ArrowFileInfo *af_info)
 {
 	arrowFileUndoLog *undo;
-	uint32			nitems;
+	uint32_t		nitems;
 	ssize_t			nbytes;
 	ssize_t			length;
 	loff_t			offset;
@@ -231,17 +232,15 @@ setup_append_file(SQLtable *table, ArrowFileInfo *af_info)
 		   sizeof(ArrowBlock) * nitems);
 
 	/* move to the file offset in front of the Footer portion */
-	nbytes = sizeof(int32) + 6;		/* strlen("ARROW1") */
-	offset = lseek(table->fdesc, -nbytes, SEEK_END);
-	if (offset < 0)
-		Elog("failed on lseek(%d, %zu, SEEK_END): %m",
-			 table->fdesc, sizeof(int32) + 6);
-	if (read(table->fdesc, buffer, nbytes) != nbytes)
-		Elog("failed on read(2): %m");
-	offset -= *((int32 *)buffer);
+	nbytes = sizeof(int32_t) + 6;		/* strlen("ARROW1") */
+	offset = af_info->stat_buf.st_size - nbytes;
+	if (pread(table->fdesc, buffer, nbytes, offset) != nbytes)
+		Elog("failed on pread(2): %m");
+	offset -= *((int32_t *)buffer);
 	if (lseek(table->fdesc, offset, SEEK_SET) < 0)
 		Elog("failed on lseek(%d, %zu, SEEK_SET): %m",
 			 table->fdesc, offset);
+	table->f_pos = offset;
 	length = af_info->stat_buf.st_size - offset;
 
 	/* makes Undo log to recover process termination */
@@ -283,7 +282,6 @@ static void
 setup_output_file(SQLtable *table, const char *output_filename)
 {
 	int		fdesc;
-	ssize_t	nbytes;
 
 	if (output_filename)
 	{
@@ -308,9 +306,7 @@ setup_output_file(SQLtable *table, const char *output_filename)
 				"        so a temporary file '%s' was built instead.\n", temp);
 	}
 	/* write out header stuff */
-	nbytes = write(table->fdesc, "ARROW1\0\0", 8);
-	if (nbytes != 8)
-		Elog("failed on write(2): %m");
+	arrowFileWrite(table, "ARROW1\0\0", 8);
 	writeArrowSchema(table);
 }
 
@@ -366,6 +362,106 @@ dumpArrowFile(const char *filename)
 	return 0;
 }
 
+static char *
+read_sql_command_from_file(const char *filename)
+{
+	struct stat stat_buf;
+	int			fdesc;
+	loff_t		off;
+	ssize_t		nbytes;
+	char	   *buffer;
+
+	fdesc = open(filename, O_RDONLY);
+	if (fdesc < 0)
+		Elog("failed on open('%s'): %m", filename);
+	if (fstat(fdesc, &stat_buf) != 0)
+		Elog("failed on fstat('%s'): %m", filename);
+	buffer = malloc(stat_buf.st_size + 1);
+	if (!buffer)
+		Elog("out of memory");
+
+	off = 0;
+	while (off < stat_buf.st_size)
+	{
+		nbytes = read(fdesc, buffer + off, stat_buf.st_size - off);
+		if (nbytes < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			Elog("failed on read('%s'): %m", filename);
+		}
+		else if (nbytes == 0)
+		{
+			Elog("unexpected EOF at '%s'", filename);
+		}
+		off += nbytes;
+	}
+	buffer[stat_buf.st_size] = '\0';
+	close(fdesc);
+
+	return buffer;
+}
+
+static nestLoopOption *
+parseNestLoopOption(const char *command, bool outer_join)
+{
+	nestLoopOption *nlopt = palloc0(offsetof(nestLoopOption, pnames[10]));
+	const char *pos;
+	const char *end;
+	const char *sub_command;
+	char	   *dest;
+
+	if (strncmp(command, "file://", 7) == 0)
+		command = read_sql_command_from_file(command + 7);
+
+	sub_command = dest = palloc0(strlen(command) + 100);
+
+	for (pos = command; *pos != '\0'; pos++)
+	{
+		if (*pos == '\\')
+		{
+			pos++;
+			*dest++ = *pos;
+			if (*pos == '\0')
+				Elog("syntax error in: %s", command);
+		}
+		else if (*pos != '$')
+		{
+			*dest++ = *pos;
+		}
+		else
+		{
+			char	   *pname, *c;
+			size_t		sz;
+
+			pos++;
+			if (*pos != '(')
+				Elog("syntax error in: %s", command);
+			end = strchr(pos, ')');
+			if (!end)
+				Elog("syntax error in: %s", command);
+			pname = strndup(pos+1, end - (pos + 1));
+			for (c = pname; *c != '\0'; c++)
+			{
+				if (!isalnum(*c) && *c != '_')
+					Elog("--nestloop: field reference name should be '[0-9a-zA-Z_]+'");
+			}
+			sz = offsetof(nestLoopOption, pnames[nlopt->n_params + 1]);
+			nlopt = repalloc(nlopt, sz);
+			nlopt->pnames[nlopt->n_params++] = pname;
+
+			dest += sprintf(dest, "$%d", nlopt->n_params);
+			pos = end;
+		}
+	}
+	*dest = '\0';
+
+	nlopt->sub_command = sub_command;
+	nlopt->outer_join = outer_join;
+
+	return nlopt;
+}
+
 static void
 usage(void)
 {
@@ -378,8 +474,12 @@ usage(void)
 		  "General options:\n"
 		  "  -d, --dbname=DBNAME   Database name to connect to\n"
 		  "  -c, --command=COMMAND SQL command to run\n"
-		  "  -t, --table=TABLENAME Table name to be dumped\n"
+		  "  -t, --table=TABLENAME Equivalent to '-c SELECT * FROM TABLENAME'\n"
 		  "      (-c and -t are exclusive, either of them must be given)\n"
+#ifdef __PG2ARROW__
+		  "      --inner-join=SUB_COMMAND\n"
+		  "      --outer-join=SUB_COMMAND\n"
+#endif
 		  "  -o, --output=FILENAME result file in Apache Arrow format\n"
 		  "      --append=FILENAME result Apache Arrow file to be appended\n"
 		  "      (--output and --append are exclusive. If neither of them\n"
@@ -434,6 +534,8 @@ parse_options(int argc, char * const argv[])
 		{"dump",         required_argument, NULL, 1001},
 		{"progress",     no_argument,       NULL, 1002},
 		{"set",          required_argument, NULL, 1003},
+		{"inner-join",   required_argument, NULL, 1004},
+		{"outer-join",   required_argument, NULL, 1005},
 		{"help",         no_argument,       NULL, 9999},
 		{NULL, 0, NULL, 0},
 	};
@@ -443,6 +545,7 @@ parse_options(int argc, char * const argv[])
 	int			password_prompt = 0;
 	const char *pos;
 	userConfigOption *last_user_config = NULL;
+	nestLoopOption *last_nest_loop = NULL;
 
 	while ((c = getopt_long(argc, argv, "d:c:t:o:s:h:P:u:p:",
 							long_options, NULL)) >= 0)
@@ -460,7 +563,10 @@ parse_options(int argc, char * const argv[])
 					Elog("-c option was supplied twice");
 				if (meet_table)
 					Elog("-c and -t options are exclusive");
-				sqldb_command = optarg;
+				if (strncmp(optarg, "file://", 7) == 0)
+					sqldb_command = read_sql_command_from_file(optarg + 7);
+				else
+					sqldb_command = optarg;
 				break;
 
 			case 't':
@@ -583,6 +689,19 @@ parse_options(int argc, char * const argv[])
 				}
 				break;
 
+			case 1004:		/* --inner-join */
+			case 1005:		/* --outer-join */
+				{
+					nestLoopOption *nlopt = parseNestLoopOption(optarg, c == 1005);
+
+					if (last_nest_loop)
+						last_nest_loop->next = nlopt;
+					else
+						sqldb_nestloop_options = nlopt;
+					last_nest_loop = nlopt;
+				}
+				break;
+
 			case 9999:		/* --help */
 			default:
 				usage();
@@ -627,7 +746,7 @@ parse_options(int argc, char * const argv[])
 }
 
 /*
- * Entrypoint of mysql2arrow
+ * Entrypoint of pg2arrow / mysql2arrow
  */
 int main(int argc, char * const argv[])
 {
@@ -636,7 +755,6 @@ int main(int argc, char * const argv[])
 	void		   *sqldb_state;
 	SQLtable	   *table;
 	ArrowKeyValue  *kv;
-	ssize_t			usage;
 	SQLdictionary  *sql_dict_list = NULL;
 	
 	parse_options(argc, argv);
@@ -651,7 +769,8 @@ int main(int argc, char * const argv[])
 									   sqldb_username,
 									   sqldb_password,
 									   sqldb_database,
-									   sqldb_session_configs);
+									   sqldb_session_configs,
+									   sqldb_nestloop_options);
 	/* read the original arrow file, if --append mode */
 	if (append_filename)
 	{
@@ -679,7 +798,7 @@ int main(int argc, char * const argv[])
 	kv->_value_len = strlen(sqldb_command);
 	table->customMetadata = kv;
 	table->numCustomMetadata = 1;
-	
+
 	/* open & setup result file */
 	if (!append_filename)
 		setup_output_file(table, output_filename);
@@ -692,22 +811,24 @@ int main(int argc, char * const argv[])
 	/* write out dictionary batch, if any */
 	writeArrowDictionaryBatches(table);
 	/* main loop to fetch and write result */
-	while ((usage = sqldb_fetch_results(sqldb_state, table)) >= 0)
-	{
-		if (usage > batch_segment_sz)
-		{
-			size_t		nitems = table->nitems;
 
+
+	
+	/* main loop to fetch and write result */
+	while (sqldb_fetch_results(sqldb_state, table))
+	{
+		if (table->usage > batch_segment_sz)
+		{
 			writeArrowRecordBatch(table);
-			shows_record_batch_progress(table, nitems);
+			shows_record_batch_progress(table, table->nitems);
+			sql_table_clear(table);
 		}
 	}
 	if (table->nitems > 0)
 	{
-		size_t		nitems = table->nitems;
-
 		writeArrowRecordBatch(table);
-		shows_record_batch_progress(table, nitems);
+		shows_record_batch_progress(table, table->nitems);
+		sql_table_clear(table);
 	}
 	/* write out footer portion */
 	writeArrowFooter(table);
@@ -735,7 +856,7 @@ int main(int argc, char * const argv[])
  */
 
 /* Get a bit mask of the bits set in non-uint32 aligned addresses */
-#define UINT32_ALIGN_MASK (sizeof(uint32) - 1)
+#define UINT32_ALIGN_MASK (sizeof(uint32_t) - 1)
 
 /* Rotate a uint32 value left by k bits - note multiple evaluation! */
 #define rot(x,k) (((x)<<(k)) | ((x)>>(32-(k))))
@@ -835,13 +956,10 @@ int main(int argc, char * const argv[])
  * by using the final values of both b and c.  b is perhaps a little less
  * well mixed than c, however.
  */
-Datum
+uint64_t
 hash_any(const unsigned char *k, int keylen)
 {
-	register uint32 a,
-				b,
-				c,
-				len;
+	register uint32_t a, b, c, len;
 
 	/* Set up the internal state */
 	len = keylen;
@@ -851,7 +969,7 @@ hash_any(const unsigned char *k, int keylen)
 	if (((uintptr_t) k & UINT32_ALIGN_MASK) == 0)
 	{
 		/* Code path for aligned source data */
-		register const uint32 *ka = (const uint32 *) k;
+		register const uint32_t *ka = (const uint32_t *) k;
 
 		/* handle most of the key */
 		while (len >= 12)
@@ -870,13 +988,13 @@ hash_any(const unsigned char *k, int keylen)
 		switch (len)
 		{
 			case 11:
-				c += ((uint32) k[10] << 8);
+				c += ((uint32_t) k[10] << 8);
 				/* fall through */
 			case 10:
-				c += ((uint32) k[9] << 16);
+				c += ((uint32_t) k[9] << 16);
 				/* fall through */
 			case 9:
-				c += ((uint32) k[8] << 24);
+				c += ((uint32_t) k[8] << 24);
 				/* fall through */
 			case 8:
 				/* the lowest byte of c is reserved for the length */
@@ -884,38 +1002,38 @@ hash_any(const unsigned char *k, int keylen)
 				a += ka[0];
 				break;
 			case 7:
-				b += ((uint32) k[6] << 8);
+				b += ((uint32_t) k[6] << 8);
 				/* fall through */
 			case 6:
-				b += ((uint32) k[5] << 16);
+				b += ((uint32_t) k[5] << 16);
 				/* fall through */
 			case 5:
-				b += ((uint32) k[4] << 24);
+				b += ((uint32_t) k[4] << 24);
 				/* fall through */
 			case 4:
 				a += ka[0];
 				break;
 			case 3:
-				a += ((uint32) k[2] << 8);
+				a += ((uint32_t) k[2] << 8);
 				/* fall through */
 			case 2:
-				a += ((uint32) k[1] << 16);
+				a += ((uint32_t) k[1] << 16);
 				/* fall through */
 			case 1:
-				a += ((uint32) k[0] << 24);
+				a += ((uint32_t) k[0] << 24);
 				/* case 0: nothing left to add */
 		}
 #else							/* !WORDS_BIGENDIAN */
 		switch (len)
 		{
 			case 11:
-				c += ((uint32) k[10] << 24);
+				c += ((uint32_t) k[10] << 24);
 				/* fall through */
 			case 10:
-				c += ((uint32) k[9] << 16);
+				c += ((uint32_t) k[9] << 16);
 				/* fall through */
 			case 9:
-				c += ((uint32) k[8] << 8);
+				c += ((uint32_t) k[8] << 8);
 				/* fall through */
 			case 8:
 				/* the lowest byte of c is reserved for the length */
@@ -923,10 +1041,10 @@ hash_any(const unsigned char *k, int keylen)
 				a += ka[0];
 				break;
 			case 7:
-				b += ((uint32) k[6] << 16);
+				b += ((uint32_t) k[6] << 16);
 				/* fall through */
 			case 6:
-				b += ((uint32) k[5] << 8);
+				b += ((uint32_t) k[5] << 8);
 				/* fall through */
 			case 5:
 				b += k[4];
@@ -935,10 +1053,10 @@ hash_any(const unsigned char *k, int keylen)
 				a += ka[0];
 				break;
 			case 3:
-				a += ((uint32) k[2] << 16);
+				a += ((uint32_t) k[2] << 16);
 				/* fall through */
 			case 2:
-				a += ((uint32) k[1] << 8);
+				a += ((uint32_t) k[1] << 8);
 				/* fall through */
 			case 1:
 				a += k[0];
@@ -954,14 +1072,32 @@ hash_any(const unsigned char *k, int keylen)
 		while (len >= 12)
 		{
 #ifdef WORDS_BIGENDIAN
-			a += (k[3] + ((uint32) k[2] << 8) + ((uint32) k[1] << 16) + ((uint32) k[0] << 24));
-			b += (k[7] + ((uint32) k[6] << 8) + ((uint32) k[5] << 16) + ((uint32) k[4] << 24));
-			c += (k[11] + ((uint32) k[10] << 8) + ((uint32) k[9] << 16) + ((uint32) k[8] << 24));
-#else							/* !WORDS_BIGENDIAN */
-			a += (k[0] + ((uint32) k[1] << 8) + ((uint32) k[2] << 16) + ((uint32) k[3] << 24));
-			b += (k[4] + ((uint32) k[5] << 8) + ((uint32) k[6] << 16) + ((uint32) k[7] << 24));
-			c += (k[8] + ((uint32) k[9] << 8) + ((uint32) k[10] << 16) + ((uint32) k[11] << 24));
-#endif							/* WORDS_BIGENDIAN */
+			a += (k[3] +
+				  ((uint32_t) k[2] << 8) +
+				  ((uint32_t) k[1] << 16) +
+				  ((uint32_t) k[0] << 24));
+			b += (k[7] +
+				  ((uint32_t) k[6] << 8) +
+				  ((uint32_t) k[5] << 16) +
+				  ((uint32_t) k[4] << 24));
+			c += (k[11] +
+				  ((uint32_t) k[10] << 8) +
+				  ((uint32_t) k[9] << 16) +
+				  ((uint32_t) k[8] << 24));
+#else					/* !WORDS_BIGENDIAN */
+			a += (k[0] +
+				  ((uint32_t) k[1] << 8) +
+				  ((uint32_t) k[2] << 16) +
+				  ((uint32_t) k[3] << 24));
+			b += (k[4] +
+				  ((uint32_t) k[5] << 8) +
+				  ((uint32_t) k[6] << 16) +
+				  ((uint32_t) k[7] << 24));
+			c += (k[8] +
+				  ((uint32_t) k[9] << 8) +
+				  ((uint32_t) k[10] << 16) +
+				  ((uint32_t) k[11] << 24));
+#endif					/* WORDS_BIGENDIAN */
 			mix(a, b, c);
 			k += 12;
 			len -= 12;
@@ -972,73 +1108,73 @@ hash_any(const unsigned char *k, int keylen)
 		switch (len)
 		{
 			case 11:
-				c += ((uint32) k[10] << 8);
+				c += ((uint32_t) k[10] << 8);
 				/* fall through */
 			case 10:
-				c += ((uint32) k[9] << 16);
+				c += ((uint32_t) k[9] << 16);
 				/* fall through */
 			case 9:
-				c += ((uint32) k[8] << 24);
+				c += ((uint32_t) k[8] << 24);
 				/* fall through */
 			case 8:
 				/* the lowest byte of c is reserved for the length */
 				b += k[7];
 				/* fall through */
 			case 7:
-				b += ((uint32) k[6] << 8);
+				b += ((uint32_t) k[6] << 8);
 				/* fall through */
 			case 6:
-				b += ((uint32) k[5] << 16);
+				b += ((uint32_t) k[5] << 16);
 				/* fall through */
 			case 5:
-				b += ((uint32) k[4] << 24);
+				b += ((uint32_t) k[4] << 24);
 				/* fall through */
 			case 4:
 				a += k[3];
 				/* fall through */
 			case 3:
-				a += ((uint32) k[2] << 8);
+				a += ((uint32_t) k[2] << 8);
 				/* fall through */
 			case 2:
-				a += ((uint32) k[1] << 16);
+				a += ((uint32_t) k[1] << 16);
 				/* fall through */
 			case 1:
-				a += ((uint32) k[0] << 24);
+				a += ((uint32_t) k[0] << 24);
 				/* case 0: nothing left to add */
 		}
 #else							/* !WORDS_BIGENDIAN */
 		switch (len)
 		{
 			case 11:
-				c += ((uint32) k[10] << 24);
+				c += ((uint32_t) k[10] << 24);
 				/* fall through */
 			case 10:
-				c += ((uint32) k[9] << 16);
+				c += ((uint32_t) k[9] << 16);
 				/* fall through */
 			case 9:
-				c += ((uint32) k[8] << 8);
+				c += ((uint32_t) k[8] << 8);
 				/* fall through */
 			case 8:
 				/* the lowest byte of c is reserved for the length */
-				b += ((uint32) k[7] << 24);
+				b += ((uint32_t) k[7] << 24);
 				/* fall through */
 			case 7:
-				b += ((uint32) k[6] << 16);
+				b += ((uint32_t) k[6] << 16);
 				/* fall through */
 			case 6:
-				b += ((uint32) k[5] << 8);
+				b += ((uint32_t) k[5] << 8);
 				/* fall through */
 			case 5:
 				b += k[4];
 				/* fall through */
 			case 4:
-				a += ((uint32) k[3] << 24);
+				a += ((uint32_t) k[3] << 24);
 				/* fall through */
 			case 3:
-				a += ((uint32) k[2] << 16);
+				a += ((uint32_t) k[2] << 16);
 				/* fall through */
 			case 2:
-				a += ((uint32) k[1] << 8);
+				a += ((uint32_t) k[1] << 8);
 				/* fall through */
 			case 1:
 				a += k[0];

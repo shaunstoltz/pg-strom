@@ -413,6 +413,9 @@ construct_flat_cuda_source(cl_uint extra_flags,
 	if ((extra_flags & DEVKERNEL_NEEDS_GPUSORT) != 0)
 		ofs += snprintf(source + ofs, len - ofs,
 						"#include \"cuda_gpusort.h\"\n");
+	/* User's extra module, if any */
+	ofs += pgstrom_codegen_extra_devtypes(source + ofs, len - ofs,
+										  extra_flags);
 	/* Generated from SQL */
 	ofs += snprintf(source + ofs, len - ofs, "\n%s\n", kern_source);
 
@@ -533,6 +536,24 @@ link_cuda_libraries(char *ptx_image,
 				snprintf(pathname, sizeof(pathname),
 						 PGSHAREDIR "/pg_strom/%s.%s",
 						 catalog[i].libname, lib_suffix);
+				rc = cuLinkAddFile(lstate, CU_JIT_INPUT_FATBINARY,
+								   pathname, 0, NULL, NULL);
+				if (rc != CUDA_SUCCESS)
+					werror("failed on cuLinkAddFile(\"%s\"): %s",
+						   pathname, errorText(rc));
+			}
+		}
+
+		/* user's extra device code if any */
+		for (i=0; i < pgstrom_num_users_extra; i++)
+		{
+			pgstromUsersExtraDescriptor *ex_desc = &pgstrom_users_extra_desc[i];
+
+			if ((extra_flags & ex_desc->extra_flags) == ex_desc->extra_flags)
+			{
+				snprintf(pathname, sizeof(pathname),
+						 PGSHAREDIR "/pg_strom/%s.%s",
+						 ex_desc->extra_name, lib_suffix);
 				rc = cuLinkAddFile(lstate, CU_JIT_INPUT_FATBINARY,
 								   pathname, 0, NULL, NULL);
 				if (rc != CUDA_SUCCESS)
@@ -956,16 +977,54 @@ __pgstrom_create_cuda_program(GpuContext *gcontext,
 	int			dindex = gcontext->cuda_dindex;
 	int			hindex;
 	cl_int		target_cc;
+	cl_int		nvrtc_version;
 	dlist_iter	iter;
 	pg_crc32	crc;
 
 	/* build with debug option? */
 	if (pgstrom_debug_jit_compile_options)
 		extra_flags |= DEVKERNEL_BUILD_DEBUG_INFO;
-	/* target binary to build */
+
+	/* Target binary to build
+	 *
+	 * The target binary version shall be determined by CUDA_VERSION
+	 * when PG-Strom was built for, NVRTC_VERSION when PG-Strom loaded it
+	 * at the runtime, and device's computing-capability version.
+	 */
 	Assert(dindex >= 0 && dindex < numDevAttrs);
 	target_cc = (devAttrs[dindex].COMPUTE_CAPABILITY_MAJOR * 10 +
 				 devAttrs[dindex].COMPUTE_CAPABILITY_MINOR);
+
+	nvrtc_version = pgstrom_nvrtc_version();
+#if CUDA_VERSION >= 10010
+#if CUDA_VERSION >= 11010
+	if (nvrtc_version >= 11010 && target_cc >= 80)
+	{
+		/* CUDA 11.1 added CC8.0 (Ampere) support */
+		target_cc = 80;
+	}
+	else
+#endif
+	if (nvrtc_version >= 10010 && target_cc >= 75)
+	{
+		/* CUDA 10.1 added CC7.5 (Turing) support */
+		target_cc = 75;
+	}
+	else
+#endif
+	{
+		/*
+		 * CUDA 9.0 added CC6.0/6.1 (Pascal) and CC7.0 (Volta) support.
+		 * And, PG-Strom does not support older CUDA Toolkit any more.
+		 */
+		if (target_cc >= 70)
+			target_cc = 70;		/* any Volta */
+		else if (target_cc >= 61)
+			target_cc = 61;		/* Pascal except for GP100 */
+		else
+			target_cc = 60;
+	}
+
 	/* makes a hash value */
 	INIT_LEGACY_CRC32(crc);
 	COMP_LEGACY_CRC32(crc, &target_cc, sizeof(cl_int));
@@ -1860,103 +1919,6 @@ cudaProgramBuilderWakeUp(bool error_if_no_builders)
 	if (error_if_no_builders && count == 0)
 		elog(ERROR, "PG-Strom: no active CUDA C program builder");
 }
-
-#if 0
-/*
- * XXXX - PL/CUDA was re-designed to use CUDA runtime,
- * so we no longer need own wrapper library.
- */
-static void
-build_wrapper_libraries(const char *wrapper_filename,
-						void **p_wrapper_lib,
-						size_t *p_wrapper_libsz)
-{
-	char   *src_fname = NULL;
-	char   *lib_fname = NULL;
-	int		fdesc = -1;
-	int		status;
-	char	buffer[1024];
-	char	spath[128];
-	char	lpath[128];
-	char	cmd[MAXPGPATH];
-	void   *wrapper_lib = NULL;
-	ssize_t	rv, buffer_len;
-	struct stat st_buf;
-
-	PG_TRY();
-	{
-		/* write out source */
-		strcpy(spath, P_tmpdir "/XXXXXX.cu");
-		fdesc = mkstemps(spath, 3);
-		if (fdesc < 0)
-			elog(ERROR, "failed on mkstemps('%s') : %m", src_fname);
-		src_fname = spath;
-
-		buffer_len = snprintf(buffer, sizeof(buffer),
-							  "#include <%s>\n",
-							  wrapper_filename);
-		rv = write(fdesc, buffer, buffer_len);
-		if (rv != buffer_len)
-			elog(ERROR, "failed on write(2) on '%s': %m", src_fname);
-		close(fdesc);
-		fdesc = -1;
-
-		/* Run NVCC */
-		snprintf(lpath, sizeof(lpath),
-				 "%s.sm_%lu.o",
-				 spath, devComputeCapability);
-		lib_fname = lpath;
-		snprintf(cmd, sizeof(cmd),
-				 CUDA_BINARY_PATH "/nvcc "
-				 " --relocatable-device-code=true"
-				 " --gpu-architecture=sm_%lu"
-				 " -DPGSTROM_BUILD_WRAPPER"
-				 " -I " PGSHAREDIR "/extension"
-				 " --device-c %s -o %s",
-				 devComputeCapability,
-				 src_fname,
-				 lib_fname);
-		status = system(cmd);
-		if (status < 0 || WEXITSTATUS(status) != 0)
-			elog(ERROR, "failed on nvcc (%s)", cmd);
-
-		/* Read library */
-		fdesc = open(lib_fname, O_RDONLY);
-		if (fdesc < 0)
-			elog(ERROR, "failed to open \"%s\": %m", lib_fname);
-		if (fstat(fdesc, &st_buf) != 0)
-			elog(ERROR, "failed on fstat(\"%s\") : %m", lib_fname);
-
-		wrapper_lib = malloc(st_buf.st_size);
-		if (!wrapper_lib)
-			elog(ERROR, "out of memory");
-		rv = read(fdesc, wrapper_lib, st_buf.st_size);
-		if (rv != st_buf.st_size)
-			elog(ERROR, "failed on read(\"%s\") : %m", lib_fname);
-		close(fdesc);
-		fdesc = -1;
-	}
-	PG_CATCH();
-	{
-		if (wrapper_lib)
-			free(wrapper_lib);
-		if (fdesc >= 0)
-			close(fdesc);
-		if (src_fname)
-			unlink(src_fname);
-		if (lib_fname)
-			unlink(lib_fname);
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-
-	unlink(src_fname);
-	unlink(lib_fname);
-
-	*p_wrapper_lib = wrapper_lib;
-	*p_wrapper_libsz = st_buf.st_size;
-}
-#endif
 
 static void
 pgstrom_startup_cuda_program(void)

@@ -64,9 +64,6 @@ typedef unsigned short		cl_half;
 #endif	/* __CUDACC__ */
 typedef float				cl_float;
 typedef double				cl_double;
-#ifdef __CUDACC__
-typedef cl_ulong			uintptr_t;
-#endif
 
 #define CL_SHORT_NBITS		(sizeof(cl_short) * BITS_PER_BYTE)
 #define CL_INT_NBITS		(sizeof(cl_int) * BITS_PER_BYTE)
@@ -169,6 +166,15 @@ typedef struct nameData
 /*
  * Limitation of types
  */
+#ifndef SCHAR_MAX
+#define SCHAR_MAX		127
+#endif
+#ifndef SCHAR_MIN
+#define SCHAR_MIN		(-128)
+#endif
+#ifndef UCHAR_MAX
+#define UCHAR_MAX		255
+#endif
 #ifndef SHRT_MAX
 #define SHRT_MAX		32767
 #endif
@@ -234,9 +240,9 @@ typedef struct nameData
  * Alignment macros
  */
 #define TYPEALIGN(ALIGNVAL,LEN)	\
-	(((uintptr_t) (LEN) + ((ALIGNVAL) - 1)) & ~((uintptr_t) ((ALIGNVAL) - 1)))
+	(((cl_ulong) (LEN) + ((ALIGNVAL) - 1)) & ~((cl_ulong) ((ALIGNVAL) - 1)))
 #define TYPEALIGN_DOWN(ALIGNVAL,LEN) \
-	(((uintptr_t) (LEN)) & ~((uintptr_t) ((ALIGNVAL) - 1)))
+	(((cl_ulong) (LEN)) & ~((cl_ulong) ((ALIGNVAL) - 1)))
 #define INTALIGN(LEN)			TYPEALIGN(sizeof(cl_int), (LEN))
 #define INTALIGN_DOWN(LEN)		TYPEALIGN_DOWN(sizeof(cl_int), (LEN))
 #define LONGALIGN(LEN)          TYPEALIGN(sizeof(cl_long), (LEN))
@@ -300,6 +306,7 @@ typedef cl_ulong		hostptr_t;
  * assigned on host/device functions
  */
 #define MAXTHREADS_PER_BLOCK		1024
+#define MAXWARPS_PER_BLOCK			(MAXTHREADS_PER_BLOCK / 32)
 #ifdef __CUDACC__
 #define STATIC_INLINE(RET_TYPE)					\
 	__device__ __host__ __forceinline__			\
@@ -795,7 +802,7 @@ PageGetMaxOffsetNumber(PageHeaderData *page)
 #define TYPE_KIND__PSEUDO		'p'
 #define TYPE_KIND__RANGE		'r'
 
-typedef struct {
+struct kern_colmeta {
 	/* true, if column is held by value. Elsewhere, a reference */
 	cl_char			attbyval;
 	/* alignment; 1,2,4 or 8, not characters in pg_attribute */
@@ -843,27 +850,30 @@ typedef struct {
 	cl_uint			values_length;
 	cl_uint			extra_offset;
 	cl_uint			extra_length;
-} kern_colmeta;
+};
+typedef struct kern_colmeta		kern_colmeta;
 
 /*
  * kern_tupitem - individual items for KDS_FORMAT_ROW
  */
-typedef struct
+struct kern_tupitem
 {
 	cl_uint			t_len;		/* length of tuple */
 	cl_uint			rowid;		/* unique Id of this item */
 	HeapTupleHeaderData	htup;
-} kern_tupitem;
+};
+typedef struct kern_tupitem		kern_tupitem;
 
 /*
  * kern_hashitem - individual items for KDS_FORMAT_HASH
  */
-typedef struct
+struct kern_hashitem
 {
 	cl_uint				hash;	/* 32-bit hash value */
 	cl_uint				next;	/* offset of the next (PACKED) */
 	kern_tupitem		t;		/* HeapTuple of this entry */
-} kern_hashitem;
+};
+typedef struct kern_hashitem	kern_hashitem;
 
 #define KDS_FORMAT_ROW			1
 #define KDS_FORMAT_SLOT			2
@@ -872,7 +882,7 @@ typedef struct
 #define KDS_FORMAT_COLUMN		5	/* columnar based storage format */
 #define KDS_FORMAT_ARROW		6	/* apache arrow format */
 
-typedef struct {
+struct kern_data_store {
 	size_t			length;		/* length of this data-store */
 	/*
 	 * NOTE: {nitems + usage} must be aligned to 64bit because these pair of
@@ -903,18 +913,20 @@ typedef struct {
 	cl_uint			nr_colmeta;	/* number of colmeta[] array elements;
 								 * maybe, >= ncols, if any composite types */
 	kern_colmeta	colmeta[FLEXIBLE_ARRAY_MEMBER]; /* metadata of columns */
-} kern_data_store;
+};
+typedef struct kern_data_store		kern_data_store;
 
 /*
  * kern_data_extra - extra buffer of KDS_FORMAT_COLUMN
  */
-typedef struct
+struct kern_data_extra
 {
 	char		signature[8];	/* signature on the base file */
 	cl_ulong	length;
 	cl_ulong	usage;
 	char		data[FLEXIBLE_ARRAY_MEMBER];
-} kern_data_extra;
+};
+typedef struct kern_data_extra		kern_data_extra;
 
 /* attribute number of system columns */
 #ifndef SYSATTR_H
@@ -1519,57 +1531,47 @@ pg_hash_any(const cl_uchar *k, cl_int keylen);
  * EXTRACT_HEAP_READ_XXXX()
  *  -> load raw values to dclass[]/values[], and update extras[]
  */
-#define EXTRACT_HEAP_TUPLE_BEGIN(ADDR,kds,htup)							\
+#define EXTRACT_HEAP_TUPLE_BEGIN(KDS,HTUP,NATTRS)						\
 	do {																\
 		kern_colmeta   *__cmeta;										\
-		cl_uint			__colidx = 0;									\
-		cl_uint			__ncols;										\
+		cl_int			__colidx;										\
+		cl_int			__ncols;										\
 		cl_uchar	   *__nullmap = NULL;								\
 		char		   *__pos;											\
+		void		   *addr;											\
 																		\
-		if (!(htup))													\
+		if (!(HTUP))													\
 			__ncols = 0;	/* to be considered as NULL */				\
 		else															\
 		{																\
-			if (((htup)->t_infomask & HEAP_HASNULL) != 0)				\
-				__nullmap = (htup)->t_bits;								\
-			__ncols = Min((kds)->ncols,									\
-						  (htup)->t_infomask2 & HEAP_NATTS_MASK);		\
-			__pos = (char *)(htup) + (htup)->t_hoff;					\
+			if (((HTUP)->t_infomask & HEAP_HASNULL) != 0)				\
+				__nullmap = (HTUP)->t_bits;								\
+			__ncols = ((HTUP)->t_infomask2 & HEAP_NATTS_MASK);			\
+			__ncols = Min((KDS)->ncols, __ncols);						\
+			__pos = (char *)(HTUP) + (HTUP)->t_hoff;					\
 			assert(__pos == (char *)MAXALIGN(__pos));					\
 		}																\
-		if (__colidx < __ncols &&										\
-			(!__nullmap || !att_isnull(__colidx, __nullmap)))			\
-		{																\
-			__cmeta = &((kds)->colmeta[__colidx]);						\
-			(ADDR) = __pos;												\
-			__pos += (__cmeta->attlen > 0 ?								\
-					  __cmeta->attlen :									\
-					  VARSIZE_ANY(__pos));								\
-		}																\
-		else															\
-			(ADDR) = NULL
-
-#define EXTRACT_HEAP_TUPLE_NEXT(ADDR,kds)								\
-		__colidx++;														\
-		if (__colidx < __ncols &&										\
-			(!__nullmap || !att_isnull(__colidx, __nullmap)))			\
-		{																\
-			__cmeta = &((kds)->colmeta[__colidx]);						\
 																		\
-			if (__cmeta->attlen > 0)									\
-				__pos = (char *)TYPEALIGN(__cmeta->attalign, __pos);	\
-			else if (!VARATT_NOT_PAD_BYTE(__pos))						\
-				__pos = (char *)TYPEALIGN(__cmeta->attalign, __pos);	\
-			(ADDR) = __pos;												\
-			__pos += (__cmeta->attlen > 0 ?								\
-					  __cmeta->attlen :									\
-					  VARSIZE_ANY(__pos));								\
-		}																\
-		else															\
-			(ADDR) = NULL
+		for (__colidx=0; __colidx < (NATTRS); __colidx++)				\
+		{																\
+			if (__colidx < __ncols &&									\
+				(!__nullmap || !att_isnull(__colidx, __nullmap)))		\
+			{															\
+				__cmeta = &((KDS)->colmeta[__colidx]);					\
+				if (__cmeta->attlen > 0)								\
+					__pos = (char *)TYPEALIGN(__cmeta->attalign, __pos); \
+				else if (!VARATT_NOT_PAD_BYTE(__pos))					\
+					__pos = (char *)TYPEALIGN(__cmeta->attalign, __pos); \
+				addr = __pos;											\
+				__pos += (__cmeta->attlen > 0 ?							\
+						  __cmeta->attlen :								\
+						  VARSIZE_ANY(__pos));							\
+			}															\
+			else														\
+				addr = NULL
 
 #define EXTRACT_HEAP_TUPLE_END()										\
+		}																\
 	} while(0)
 
 #define EXTRACT_HEAP_READ_8BIT(ADDR,ATT_DCLASS,ATT_VALUES)	 \

@@ -34,7 +34,7 @@ double		pgstrom_gpu_operator_cost;
 
 /* misc static variables */
 static HTAB				   *gpu_path_htable = NULL;
-static planner_hook_type	planner_hook_next;
+static planner_hook_type	planner_hook_next = NULL;
 static CustomPathMethods	pgstrom_dummy_path_methods;
 static CustomScanMethods	pgstrom_dummy_plan_methods;
 
@@ -43,9 +43,8 @@ long		PAGE_SIZE;
 long		PAGE_MASK;
 int			PAGE_SHIFT;
 long		PHYS_PAGES;
-
-/* SQL function declarations */
-Datum pgstrom_license_query(PG_FUNCTION_ARGS);
+int			pgstrom_num_users_extra = 0;
+pgstromUsersExtraDescriptor pgstrom_users_extra_desc[8];
 
 /* pg_strom.chunk_size */
 Size
@@ -467,6 +466,9 @@ pgstrom_post_planner_recurse(PlannedStmt *pstmt, Plan **p_plan)
 
 static PlannedStmt *
 pgstrom_post_planner(Query *parse,
+#if PG_VERSION_NUM >= 130000
+					 const char *query_string,
+#endif
 					 int cursorOptions,
 					 ParamListInfo boundParams)
 {
@@ -494,10 +496,12 @@ pgstrom_post_planner(Query *parse,
 									  HASH_FUNCTION |
 									  HASH_COMPARE |
 									  HASH_KEYCOPY);
-		if (planner_hook_next)
-			pstmt = planner_hook_next(parse, cursorOptions, boundParams);
-		else
-			pstmt = standard_planner(parse, cursorOptions, boundParams);
+		pstmt = planner_hook_next(parse,
+#if PG_VERSION_NUM >= 130000
+								  query_string,
+#endif
+								  cursorOptions,
+								  boundParams);
 	}
 	PG_CATCH();
 	{
@@ -517,169 +521,34 @@ pgstrom_post_planner(Query *parse,
 }
 
 /*
- * commercial_license_expired_at
+ * Routines to support user's extra GPU logic
  */
-static TimestampTz	commercial_license_expired_timestamp = MIN_TIMESTAMP - 1;
-
-TimestampTz
-commercial_license_expired_at(void)
+uint32
+pgstrom_register_users_extra(const pgstromUsersExtraDescriptor *__desc)
 {
-	return commercial_license_expired_timestamp;
-}
+	pgstromUsersExtraDescriptor *desc;
+	const char *extra_name;
+	uint32		extra_flags;
 
-/*
- * pgstrom_license_query
- */
-static bool
-commercial_license_query(StringInfo buf)
-{
-	StromCmd__LicenseInfo *cmd;
-	size_t		buffer_sz = 10000;
-	int			fdesc;
-	int			i_year, i_mon, i_day;
-	int			e_year, e_mon, e_day;
-	int			i;
-	struct tm	tm;
-	TimestampTz	tv;
+	if (pgstrom_num_users_extra >= 7)
+		elog(ERROR, "too much PG-Strom users' extra module is registered");
+	if (__desc->magic != PGSTROM_USERS_EXTRA_MAGIC_V1)
+		elog(ERROR, "magic number of pgstromUsersExtraDescriptor mismatch");
+	if (__desc->pg_version / 100 != PG_MAJOR_VERSION)
+		elog(ERROR, "PG-Strom Users Extra is built for %u", __desc->pg_version);
 
-	cmd = alloca(sizeof(StromCmd__LicenseInfo) + buffer_sz);
-	memset(cmd, 0, sizeof(StromCmd__LicenseInfo));
-	cmd->buffer_sz = buffer_sz;
+	extra_name = strdup(__desc->extra_name);
+	if (!extra_name)
+		elog(ERROR, "out of memory");
+	extra_flags = (1U << (pgstrom_num_users_extra + 24));
 
-	fdesc = open(NVME_STROM_IOCTL_PATHNAME, O_RDONLY);
-	if (fdesc < 0)
-	{
-		if (errno == ENOENT)
-			elog(LOG, "PG-Strom: nvme_strom driver is not installed");
-		else
-			elog(LOG, "failed to open \"%s\": %m", NVME_STROM_IOCTL_PATHNAME);
-		return false;
-	}
-	if (ioctl(fdesc, STROM_IOCTL__LICENSE_QUERY, cmd) != 0)
-	{
-		if (errno == EINVAL)
-			elog(LOG, "PG-Strom: no valid commercial license is installed");
-		else if (errno == EKEYEXPIRED)
-			elog(LOG, "PG-Strom: commercial license is expired");
-		else
-			elog(LOG, "PG-Strom: failed on STROM_IOCTL__LICENSE_QUERY: %m");
-		close(fdesc);
-		return false;
-	}
-	/* convert to text */
-	i_year = (cmd->issued_at / 10000);
-	i_mon  = (cmd->issued_at / 100) % 100;
-	i_day  = (cmd->issued_at % 100);
-	e_year = (cmd->expired_at / 10000);
-	e_mon  = (cmd->expired_at / 100) % 100;
-	e_day  = (cmd->expired_at % 100);
-
-	if (i_year < 2000 || i_year > 9999 || i_mon < 1 || i_mon > 12)
-	{
-		elog(LOG, "Strange date in the ISSUED_AT field: %08d",
-			 cmd->issued_at);
-		close(fdesc);
-		return false;
-	}
-	if (e_year < 2000 || e_year > 9999 || e_mon < 1 || e_mon > 12)
-	{
-		elog(LOG, "Strange date in the EXPIRED_AT_AT field: %08d",
-			 cmd->expired_at);
-		close(fdesc);
-		return false;
-	}
-
-	/* update expired timestamp */
-	memset(&tm, 0, sizeof(struct tm));
-	tm.tm_year = e_year;
-	tm.tm_mon  = e_mon;
-	tm.tm_mday = e_day;
-	tv = (TimestampTz) mktime(&tm) -
-		((POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * SECS_PER_DAY);
-	tv = (tv + SECS_PER_DAY - 1) * USECS_PER_SEC;
-	if (!IS_VALID_TIMESTAMP(commercial_license_expired_timestamp) ||
-		tv > commercial_license_expired_timestamp)
-		commercial_license_expired_timestamp = tv;
-
-	/* make a JSON string  */
-	appendStringInfo(buf,
-					 "{ \"version\" : %u",
-					 cmd->version);
-	if (cmd->serial_nr)
-		appendStringInfo(buf,
-						 ", \"serial_nr\" : %s",
-						 quote_identifier(cmd->serial_nr));
-	appendStringInfo(buf,
-					 ", \"issued_at\" : \"%d-%s-%d\""
-					 ", \"expired_at\" : \"%d-%s-%d\"",
-					 i_day, months[i_mon-1], i_year,
-					 e_day, months[e_mon-1], e_year);
-	if (cmd->licensee_org)
-		appendStringInfo(buf,
-						 ", \"licensee_org\" : %s",
-						 quote_identifier(cmd->licensee_org));
-	if (cmd->licensee_name)
-		appendStringInfo(buf,
-						 ", \"licensee_name\" : %s",
-						 quote_identifier(cmd->licensee_name));
-	if (cmd->licensee_mail)
-		appendStringInfo(buf,
-						 ", \"licensee_mail\" : %s",
-						 quote_identifier(cmd->licensee_mail));
-	if (cmd->description)
-		appendStringInfo(buf,
-						 ", \"description\" : %s",
-						 quote_identifier(cmd->description));
-	if (cmd->nr_gpus > 0)
-	{
-		appendStringInfo(buf, ", \"gpus\" : [");
-		for (i=0; i < cmd->nr_gpus; i++)
-		{
-			appendStringInfo(
-				buf,
-				"%s{ \"uuid\" : \"%s\", \"pci_id\" : \"%04x:%02x:%02x.%d\" }",
-				(i == 0 ? " " : " , "),
-				cmd->u.gpus[i].uuid,
-				cmd->u.gpus[i].domain,
-				cmd->u.gpus[i].bus_id,
-				cmd->u.gpus[i].dev_id,
-				cmd->u.gpus[i].func_id);
-		}
-		appendStringInfo(buf, " ]");
-	}
-	appendStringInfo(buf, " }");
-
-	return true;
-}
-
-Datum
-pgstrom_license_query(PG_FUNCTION_ARGS)
-{
-	StringInfoData	buf;
-
-	if (!superuser())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 (errmsg("only superuser can query commercial license"))));
-	initStringInfo(&buf);
-	if (!commercial_license_query(&buf))
-		PG_RETURN_NULL();
-	PG_RETURN_POINTER(DirectFunctionCall1(json_in, PointerGetDatum(buf.data)));
-}
-PG_FUNCTION_INFO_V1(pgstrom_license_query);
-
-/*
- * check_heterodb_license
- */
-static void
-check_heterodb_license(void)
-{
-	StringInfoData	buf;
-
-	initStringInfo(&buf);
-	if (commercial_license_query(&buf))
-		elog(LOG, "HeteroDB License: %s", buf.data);
-	pfree(buf.data);
+	desc = &pgstrom_users_extra_desc[pgstrom_num_users_extra++];
+	memcpy(desc, __desc, sizeof(pgstromUsersExtraDescriptor));
+	desc->extra_flags = extra_flags;
+	desc->extra_name  = extra_name;
+	elog(LOG, "PG-Strom users's extra [%s] registered", extra_name);
+	
+	return extra_flags;
 }
 
 /*
@@ -700,8 +569,10 @@ _PG_init(void)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 		errmsg("PG-Strom must be loaded via shared_preload_libraries")));
 
-	/* link nvrtc library according to the current CUDA version */
+	/* load NVIDIA/HeteroDB related stuff, if any */
 	pgstrom_init_nvrtc();
+	pgstrom_init_cufile();
+	pgstrom_init_extra();
 
 	/* dump version number */
 #ifdef PGSTROM_VERSION
@@ -723,7 +594,7 @@ _PG_init(void)
 	pgstrom_init_gpu_mmgr();
 	pgstrom_init_gpu_context();
 	pgstrom_init_cuda_program();
-	pgstrom_init_nvme_strom();
+	pgstrom_init_gpu_direct();
 	pgstrom_init_codegen();
 
 	/* init custom-scan providers/FDWs */
@@ -734,9 +605,6 @@ _PG_init(void)
 	pgstrom_init_relscan();
 	pgstrom_init_arrow_fdw();
 	pgstrom_init_gstore_fdw();
-
-	/* check commercial license, if any */
-	check_heterodb_license();
 
 	/* dummy custom-scan node */
 	memset(&pgstrom_dummy_path_methods, 0, sizeof(CustomPathMethods));
@@ -750,6 +618,6 @@ _PG_init(void)
 		= pgstrom_dummy_create_scan_state;
 
 	/* planner hook registration */
-	planner_hook_next = planner_hook;
+	planner_hook_next = (planner_hook ? planner_hook : standard_planner);
 	planner_hook = pgstrom_post_planner;
 }

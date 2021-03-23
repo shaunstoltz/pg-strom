@@ -1,7 +1,7 @@
 /*
- * pgsql_client.c - MySQL specific portion for mysql2arrow command
+ * pgsql_client.c - PostgreSQL specific portion for pg2arrow command
  *
- * Copyright 2020 (C) KaiGai Kohei <kaigai@heterodb.com>
+ * Copyright 2020-2021 (C) KaiGai Kohei <kaigai@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the PostgreSQL License. See the LICENSE file.
@@ -30,10 +30,28 @@ static void		pgsql_setup_array_element(PGconn *conn,
 
 typedef struct
 {
+	char			pstmt[32];
+	const char	   *command;
+	bool			prepared;
+	bool			outer_join;
+	PGresult	   *res;
+	uint32_t		nitems;
+	uint32_t		index;
+	int				n_params;
+	int			   *p_depth;
+	int			   *p_resno;
+	const char	  **p_names;
+} PGSTATE_NL;
+
+typedef struct
+{
 	PGconn	   *conn;
 	PGresult   *res;
-	uint32		nitems;
-	uint32		index;
+	uint32_t	nitems;
+	uint32_t	index;
+	/* if --nestloop is given */
+	uint32_t	n_depth;
+	PGSTATE_NL	nestloop[1];
 } PGSTATE;
 
 static inline bool
@@ -121,33 +139,243 @@ pgsql_server_connect(const char *sqldb_hostname,
 }
 
 /*
- * pgsql_next_result
+ * pgsql_exec_nestloop
  */
 static PGresult *
-pgsql_next_result(PGSTATE *pgstate)
+pgsql_exec_nestloop(PGSTATE *pgstate, int depth)
 {
-	const char *query = "FETCH FORWARD 500000 FROM " CURSOR_NAME;
+	PGSTATE_NL *nl = &pgstate->nestloop[depth-1];
+	PGresult   *res;
+	const char **param_values = alloca(sizeof(char *) * nl->n_params);
+	int		   *param_length = alloca(sizeof(int) * nl->n_params);
+	int		   *param_format = alloca(sizeof(int) * nl->n_params);
+	int			i, j, k;
+
+	if (!nl->prepared)
+	{
+		Oid	   *param_types = alloca(sizeof(Oid) * nl->n_params);
+
+		for (i = 0; i < nl->n_params; i++)
+		{
+			const char *pname = nl->p_names[i];
+
+			for (k = 0; k <= depth; k++)
+			{
+				if (k == 0)
+					res = pgstate->res;
+				else
+					res = pgstate->nestloop[k-1].res;
+				assert(res != NULL);
+
+				j = PQfnumber(res, pname);
+				if (j >= 0)
+				{
+					param_types[i] = PQftype(res, j);
+					nl->p_depth[i] = k;
+					nl->p_resno[i] = j;
+					break;
+				}
+			}
+			if (k > depth)
+				Elog("could not find nestloop parameter: $(%s)", pname);
+		}
+		res = PQprepare(pgstate->conn,
+						nl->pstmt,
+						nl->command,
+						nl->n_params,
+						param_types);
+		if (PQresultStatus(res) != PGRES_COMMAND_OK)
+			Elog("failed on PQprepare: %s", PQerrorMessage(pgstate->conn));
+		
+		nl->prepared = true;
+	}
+	memset(param_values, 0, sizeof(char *) * nl->n_params);
+	memset(param_length, 0, sizeof(int)    * nl->n_params);
+	memset(param_format, 0, sizeof(int)    * nl->n_params);
+
+	for (i=0; i < nl->n_params; i++)
+	{
+		k = nl->p_depth[i];
+		j = nl->p_resno[i];
+
+		if (k == 0)
+		{
+			if (pgstate->index >= pgstate->nitems ||
+				PQgetisnull(pgstate->res, pgstate->index, j))
+				continue;
+			param_values[i] = PQgetvalue(pgstate->res,
+										 pgstate->index, j);
+			param_length[i] = PQgetlength(pgstate->res,
+										  pgstate->index, j);
+			param_format[i] = PQfformat(pgstate->res, j);
+		}
+		else
+		{
+			PGSTATE_NL *curr = &pgstate->nestloop[k-1];
+
+			if (curr->index >= curr->nitems ||
+				PQgetisnull(curr->res, curr->index, j))
+				continue;
+			param_values[i] = PQgetvalue(curr->res,
+										 curr->index, j);
+			param_length[i] = PQgetlength(curr->res,
+										  curr->index, j);
+			param_format[i] = PQfformat(curr->res, j);
+		}
+	}
+	/* Ok, exec prepared statement */
+	res = PQexecPrepared(pgstate->conn,
+						 nl->pstmt,
+						 nl->n_params,
+						 param_values,
+						 param_length,
+						 param_format,
+						 1);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		Elog("SQL execution failed: %s", PQresultErrorMessage(res));
+	return res;
+}
+
+/*
+ * __pgsql_rewind_nestloop
+ */
+static inline void
+__pgsql_rewind_nestloop(PGSTATE *pgstate, int depth)
+{
+	int		i;
+
+	for (i=depth; i < pgstate->n_depth; i++)
+	{
+		PGSTATE_NL *nl = &pgstate->nestloop[i];
+
+		if (nl->res)
+			PQclear(nl->res);
+		nl->res = NULL;
+		nl->nitems = 0;
+		nl->index = 0;
+	}
+}
+
+/*
+ * pgsql_move_nestloop_next
+ */
+static int
+pgsql_move_nestloop_next(PGSTATE *pgstate, int depth, uint32_t *rows_index)
+{
+	PGSTATE_NL *nl = &pgstate->nestloop[depth - 1];
+
+	assert(depth > 0 && depth <= pgstate->n_depth);
+	if (!nl->res)
+	{
+		nl->res = pgsql_exec_nestloop(pgstate, depth);
+		nl->nitems = PQntuples(nl->res);
+		nl->index = 0;
+	}
+
+	if (pgstate->n_depth == depth)
+	{
+		if (nl->index < nl->nitems)
+		{
+			if (rows_index)
+				rows_index[depth] = nl->index++;
+			return 1;		/* ok, a valid tuple */
+		}
+		else if (nl->outer_join &&
+				 nl->nitems == 0 &&
+				 nl->index == 0)
+		{
+			if (rows_index)
+				rows_index[depth] = UINT_MAX;
+			nl->index++;
+			return 0;		/* ok, null-tuple by OUTER-JOIN */
+		}
+	}
+	else
+	{
+		while (nl->index < nl->nitems)
+		{
+			if (pgsql_move_nestloop_next(pgstate, depth+1, rows_index) >= 0)
+			{
+				if (rows_index)
+					rows_index[depth] = nl->index;
+				return 1;	/* ok, a valid tuple */
+			}
+			nl->index++;
+			__pgsql_rewind_nestloop(pgstate, depth);
+		}
+		if (nl->outer_join &&
+			nl->nitems == 0 &&
+			nl->index == 0)
+		{
+			if (pgsql_move_nestloop_next(pgstate, depth+1, rows_index) >= 0)
+			{
+				if (rows_index)
+					rows_index[depth] = UINT_MAX;
+				return 0;	/* ok, null-tuple by OUTER-JOIN */
+			}
+			nl->index++;
+		}
+	}
+	/* no more tuples */
+	PQclear(nl->res);
+	nl->res = NULL;
+	return -1;
+}
+
+/*
+ * pgsql_move_next
+ */
+static bool
+pgsql_move_next(PGSTATE *pgstate, uint32_t *rows_index)
+{
 	PGconn	   *conn = pgstate->conn;
 	PGresult   *res;
 
-	if (pgstate->res)
+	for (;;)
 	{
-		PQclear(pgstate->res);
-		pgstate->res = NULL;
+		if (pgstate->index >= pgstate->nitems)
+		{
+			const char *query = "FETCH FORWARD 500000 FROM " CURSOR_NAME;
+
+			if (pgstate->res)
+				PQclear(pgstate->res);
+
+			res = PQexecParams(conn, query,
+							   0, NULL, NULL, NULL, NULL,
+							   1);	/* results in binary mode */
+			if (PQresultStatus(res) != PGRES_TUPLES_OK)
+				Elog("SQL execution failed: %s",
+					 PQresultErrorMessage(res));
+			pgstate->res = res;
+			pgstate->nitems = PQntuples(res);
+			pgstate->index  = 0;
+
+			if (pgstate->nitems == 0)
+			{
+				PQclear(pgstate->res);
+				pgstate->res = NULL;
+				return false;	/* no more tuples */
+			}
+		}
+
+		if (pgstate->n_depth == 0)
+		{
+			if (rows_index)
+				rows_index[0] = pgstate->index++;
+			return true;
+		}
+		else if (pgsql_move_nestloop_next(pgstate, 1, rows_index) >= 0)
+		{
+			if (rows_index)
+				rows_index[0] = pgstate->index;
+			return true;
+		}
+		else
+		{
+			pgstate->index++;
+			__pgsql_rewind_nestloop(pgstate, 0);
+		}
 	}
-	res = PQexecParams(conn, query, 0, NULL, NULL, NULL, NULL,
-					   1);  /* results in binary mode */
-	if (PQresultStatus(res) != PGRES_TUPLES_OK)
-		Elog("SQL execution failed: %s", PQresultErrorMessage(res));
-	pgstate->nitems = PQntuples(res);
-	pgstate->index  = 0;
-	if (pgstate->nitems == 0)
-	{
-		PQclear(res);
-		res = NULL;
-	}
-	pgstate->res = res;
-	return res;
 }
 
 /*
@@ -162,7 +390,7 @@ pgsql_create_dictionary(PGconn *conn, SQLtable *root,
 	PGresult   *res;
 	char		query[4096];
 	int			i, nitems;
-	int64		dict_id = enum_typeid;
+	int64_t		dict_id = enum_typeid;
 
 	if (arrow_field)
 	{
@@ -200,7 +428,7 @@ pgsql_create_dictionary(PGconn *conn, SQLtable *root,
 	{
 		const char *enumlabel = PQgetvalue(res, i, 0);
 		hashItem   *hitem;
-		uint32		hash, hindex;
+		uint32_t	hash, hindex;
 		size_t		sz;
 
 		if (PQgetisnull(res, i, 0) != 0)
@@ -230,9 +458,9 @@ pgsql_create_dictionary(PGconn *conn, SQLtable *root,
 
 			sql_buffer_append(&dict->extra, enumlabel, sz);
 			if (dict->values.usage == 0)
-				sql_buffer_append_zero(&dict->values, sizeof(uint32));
+				sql_buffer_append_zero(&dict->values, sizeof(uint32_t));
 			sql_buffer_append(&dict->values,
-							  &dict->extra.usage, sizeof(uint32));
+							  &dict->extra.usage, sizeof(uint32_t));
 		}
 	}
 	PQclear(res);
@@ -258,6 +486,8 @@ pgsql_setup_attribute(PGconn *conn,
 					  Oid typelemid,    /* valid, if array type */
 					  const char *nspname,
 					  const char *typname,
+					  const char *extname,	/* extension name, if any */
+					  const char *extschema,/* extension schema, if relocatable */
 					  ArrowField *arrow_field,
 					  int *p_numFieldNodes,
 					  int *p_numBuffers)
@@ -276,6 +506,8 @@ pgsql_setup_attribute(PGconn *conn,
 										  typrelid,
 										  typelemid,
 										  server_timezone,
+										  extname,
+										  extschema,
 										  arrow_field);
 	if (typrelid != InvalidOid)
 	{
@@ -301,6 +533,27 @@ pgsql_setup_attribute(PGconn *conn,
 	}
 }
 
+#define WITH_RECURSIVE_PG_BASE_TYPE								\
+	"WITH RECURSIVE pg_base_type AS ("							\
+	"  SELECT 0 depth, oid type_id, oid base_id,"				\
+	"         typname, typnamespace,"							\
+	"         typlen, typbyval, typalign, typtype,"				\
+	"         typrelid, typelem, NULL::int typtypmod"			\
+	"    FROM pg_catalog.pg_type t"								\
+	"   WHERE t.typbasetype = 0"								\
+	"UNION ALL"													\
+	"  SELECT b.depth+1, t.oid type_id, b.base_id,"				\
+	"         b.typname, b.typnamespace,"						\
+	"         b.typlen, b.typbyval, b.typalign, b.typtype,"		\
+	"         b.typrelid, b.typelem,"							\
+	"         CASE WHEN b.typtypmod IS NULL"					\
+	"              THEN t.typtypmod"							\
+	"              ELSE b.typtypmod"							\
+	"         END typtypmod"									\
+	"    FROM pg_catalog.pg_type t, pg_base_type b"				\
+	"   WHERE t.typbasetype = b.type_id"						\
+	")\n"
+
 /*
  * pgsql_setup_composite_type
  */
@@ -319,14 +572,41 @@ pgsql_setup_composite_type(PGconn *conn,
 	int			j, nfields;
 
 	snprintf(query, sizeof(query),
-			 "SELECT attname, attnum, atttypid, atttypmod, attlen,"
-			 "       attbyval, attalign, typtype, typrelid, typelem,"
-			 "       nspname, typname"
+			 WITH_RECURSIVE_PG_BASE_TYPE
+			 "SELECT a.attname,"
+			 "       a.attnum,"
+			 "       b.base_id atttypid,"
+			 "       CASE WHEN b.typtypmod IS NULL"
+			 "            THEN a.atttypmod"
+			 "            ELSE b.typtypmod"
+			 "       END atttypmod,"
+			 "       b.typlen,"
+			 "       b.typbyval,"
+			 "       b.typalign,"
+			 "       b.typtype,"
+			 "       b.typrelid,"
+			 "       b.typelem,"
+			 "       n.nspname,"
+			 "       b.typname,"
+			 "       e.extname,"
+			 "       CASE WHEN e.extrelocatable"
+			 "            THEN e.extnamespace::regnamespace::text"
+			 "            ELSE NULL::text"
+			 "       END extnamespace"
 			 "  FROM pg_catalog.pg_attribute a,"
-			 "       pg_catalog.pg_type t,"
-			 "       pg_catalog.pg_namespace n"
-			 " WHERE t.typnamespace = n.oid"
-			 "   AND a.atttypid = t.oid"
+			 "       pg_catalog.pg_namespace n,"
+			 "       pg_base_type b"
+			 "  LEFT OUTER JOIN"
+			 "      (pg_catalog.pg_depend d JOIN"
+			 "       pg_catalog.pg_extension e ON"
+			 "       d.classid = 'pg_catalog.pg_type'::regclass AND"
+			 "       d.refclassid = 'pg_catalog.pg_extension'::regclass AND"
+			 "       d.refobjid = e.oid AND"
+			 "       d.deptype = 'e')"
+			 "    ON b.base_id = d.objid"
+			 " WHERE b.typnamespace = n.oid"
+			 "   AND b.type_id = a.atttypid"
+			 "   AND a.attnum > 0"
 			 "   AND a.attrelid = %u", comptype_relid);
 	res = PQexec(conn, query);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
@@ -352,6 +632,8 @@ pgsql_setup_composite_type(PGconn *conn,
 		const char *typelem   = PQgetvalue(res, j, 9);
 		const char *nspname   = PQgetvalue(res, j, 10);
 		const char *typname   = PQgetvalue(res, j, 11);
+		const char *extname   = PQgetvalue(res, j, 12);
+		const char *extschema = PQgetvalue(res, j, 13);
 		ArrowField *sub_field = NULL;
 		int			index     = atoi(attnum);
 
@@ -373,6 +655,8 @@ pgsql_setup_composite_type(PGconn *conn,
 							  atooid(typelem),
 							  nspname,
 							  typname,
+							  extname,
+							  extschema,
 							  sub_field,
 							  p_numFieldNodes,
 							  p_numBuffers);
@@ -395,22 +679,48 @@ pgsql_setup_array_element(PGconn *conn,
 	char			query[4096];
 	const char     *nspname;
 	const char	   *typname;
+	const char	   *typemod;
 	const char	   *typlen;
 	const char	   *typbyval;
 	const char	   *typalign;
 	const char	   *typtype;
 	const char	   *typrelid;
 	const char	   *typelem;
+	const char	   *extname;
+	const char	   *extschema;
 	ArrowField	   *elem_field = NULL;
 
 	snprintf(query, sizeof(query),
-			 "SELECT nspname, typname,"
-			 "       typlen, typbyval, typalign, typtype,"
-			 "       typrelid, typelem"
-			 "  FROM pg_catalog.pg_type t,"
-			 "       pg_catalog.pg_namespace n"
-			 " WHERE t.typnamespace = n.oid"
-			 "   AND t.oid = %u", typelemid);
+			 WITH_RECURSIVE_PG_BASE_TYPE
+			 "SELECT n.nspname,"
+			 "       b.typname,"
+			 "       CASE WHEN b.typtypmod IS NULL"
+			 "            THEN -1::int"
+			 "            ELSE b.typtypmod"
+			 "       END typtypmod,"
+			 "       b.typlen,"
+			 "       b.typbyval,"
+			 "       b.typalign,"
+			 "       b.typtype,"
+			 "       b.typrelid,"
+			 "       b.typelem,"
+			 "       e.extname,"
+			 "       CASE WHEN e.extrelocatable"
+			 "            THEN e.extnamespace::regnamespace::text"
+			 "            ELSE NULL::text"
+			 "       END extnamespace"
+			 "  FROM pg_catalog.pg_namespace n,"
+			 "       pg_base_type b"
+			 "  LEFT OUTER JOIN"
+			 "      (pg_catalog.pg_depend d JOIN"
+			 "       pg_catalog.pg_extension e ON"
+			 "       d.classid = 'pg_catalog.pg_type'::regclass AND"
+			 "       d.refclassid = 'pg_catalog.pg_extension'::regclass AND"
+			 "       d.refobjid = e.oid AND"
+			 "       d.deptype = 'e')"
+			 "    ON b.base_id = d.objid"
+			 " WHERE b.typnamespace = n.oid"
+			 "   AND b.type_id = %u", typelemid);
 	res = PQexec(conn, query);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		Elog("failed on pg_type system catalog query: %s",
@@ -419,12 +729,15 @@ pgsql_setup_array_element(PGconn *conn,
 		Elog("unexpected number of result rows: %d", PQntuples(res));
 	nspname  = PQgetvalue(res, 0, 0);
 	typname  = PQgetvalue(res, 0, 1);
-	typlen   = PQgetvalue(res, 0, 2);
-	typbyval = PQgetvalue(res, 0, 3);
-	typalign = PQgetvalue(res, 0, 4);
-	typtype  = PQgetvalue(res, 0, 5);
-	typrelid = PQgetvalue(res, 0, 6);
-	typelem  = PQgetvalue(res, 0, 7);
+	typemod  = PQgetvalue(res, 0, 2);
+	typlen   = PQgetvalue(res, 0, 3);
+	typbyval = PQgetvalue(res, 0, 4);
+	typalign = PQgetvalue(res, 0, 5);
+	typtype  = PQgetvalue(res, 0, 6);
+	typrelid = PQgetvalue(res, 0, 7);
+	typelem  = PQgetvalue(res, 0, 8);
+	extname  = PQgetvalue(res, 0, 9);
+	extschema = PQgetvalue(res, 0, 10);
 
 	if (arrow_field)
 	{
@@ -437,7 +750,7 @@ pgsql_setup_array_element(PGconn *conn,
 						  element,
 						  typname,
 						  typelemid,
-						  -1,
+						  atoi(typemod),
 						  atoi(typlen),
 						  pg_strtobool(typbyval),
 						  pg_strtochar(typalign),
@@ -446,6 +759,8 @@ pgsql_setup_array_element(PGconn *conn,
 						  atooid(typelem),
 						  nspname,
 						  typname,
+						  extname,
+						  extschema,
 						  elem_field,
 						  p_numFieldNode,
 						  p_numBuffers);
@@ -456,27 +771,41 @@ pgsql_setup_array_element(PGconn *conn,
  * pgsql_create_buffer
  */
 static SQLtable *
-pgsql_create_buffer(PGconn *conn, PGresult *res,
+pgsql_create_buffer(PGSTATE *pgstate,
 					ArrowFileInfo *af_info,
 					SQLdictionary *sql_dict_list)
 {
+	PGconn	   *conn = pgstate->conn;
+	PGresult   *res = pgstate->res;
 	SQLtable   *table;
-	int			j, nfields = PQnfields(res);
+	int			i, j;
+	int			depth = 0;
+	int			nfields = PQnfields(res);
 
+	for (i=0; i < pgstate->n_depth; i++)
+	{
+		PGSTATE_NL *nl = &pgstate->nestloop[i];
+		int		count;
+
+		count = PQnfields(nl->res);
+		if (count == 0)
+			Elog("sub-command contains no fields: %s", nl->command);
+		nfields += count;
+	}
 	table = palloc0(offsetof(SQLtable, columns[nfields]));
-    table->nitems = 0;
-    table->nfields = nfields;
+	table->nitems = 0;
+	table->nfields = nfields;
 	table->sql_dict_list = sql_dict_list;
 
 	if (af_info &&
 		af_info->footer.schema._num_fields != nfields)
 		Elog("number of the fields mismatch");
 
-	for (j=0; j < nfields; j++)
+	for (i=0, j=0; i < nfields; i++, j++)
 	{
-		const char *attname = PQfname(res, j);
-		Oid			atttypid = PQftype(res, j);
-		int			atttypmod = PQfmod(res, j);
+		const char *attname;
+		Oid			atttypid;
+		int			atttypmod;
 		PGresult   *__res;
 		char		query[4096];
 		const char *typlen;
@@ -487,36 +816,75 @@ pgsql_create_buffer(PGconn *conn, PGresult *res,
 		const char *typelem;
 		const char *nspname;
 		const char *typname;
+		const char *typemod;
+		const char *extname;
+		const char *extschema;
 		ArrowField *arrow_field = NULL;
 
+		if (j == PQnfields(res))
+		{
+			assert(depth < pgstate->n_depth);
+			res = pgstate->nestloop[depth++].res;
+			j = 0;
+		}
+		attname = PQfname(res, j);
+		atttypid = PQftype(res, j);
+		atttypmod = PQfmod(res, j);
+
 		snprintf(query, sizeof(query),
-				 "SELECT typlen, typbyval, typalign, typtype,"
-				 "       typrelid, typelem, nspname, typname"
-				 "  FROM pg_catalog.pg_type t,"
-				 "       pg_catalog.pg_namespace n"
-				 " WHERE t.typnamespace = n.oid"
-				 "   AND t.oid = %u", atttypid);
+				 WITH_RECURSIVE_PG_BASE_TYPE
+				 "SELECT n.nspname,"
+				 "       b.typname,"
+				 "       b.typtypmod,"
+				 "       b.typlen,"
+				 "       b.typbyval,"
+				 "       b.typalign,"
+				 "       b.typtype,"
+				 "       b.typrelid,"
+				 "       b.typelem,"
+				 "       e.extname,"
+				 "       CASE WHEN e.extrelocatable"
+				 "            THEN e.extnamespace::regnamespace::text"
+				 "            ELSE NULL::text"
+				 "       END extnamespace"
+				 "  FROM pg_catalog.pg_namespace n,"
+				 "       pg_base_type b"
+				 "  LEFT OUTER JOIN"
+				 "      (pg_catalog.pg_depend d JOIN"
+				 "       pg_catalog.pg_extension e ON"
+				 "       d.classid = 'pg_catalog.pg_type'::regclass AND"
+				 "       d.refclassid = 'pg_catalog.pg_extension'::regclass AND"
+				 "       d.refobjid = e.oid AND"
+				 "       d.deptype = 'e')"
+				 "    ON b.base_id = d.objid"
+				 " WHERE b.typnamespace = n.oid"
+				 "   AND b.type_id = %u", atttypid);
 		__res = PQexec(conn, query);
 		if (PQresultStatus(__res) != PGRES_TUPLES_OK)
 			Elog("failed on pg_type system catalog query: %s",
 				 PQresultErrorMessage(res));
 		if (PQntuples(__res) != 1)
 			Elog("unexpected number of result rows: %d", PQntuples(__res));
-		typlen   = PQgetvalue(__res, 0, 0);
-		typbyval = PQgetvalue(__res, 0, 1);
-		typalign = PQgetvalue(__res, 0, 2);
-		typtype  = PQgetvalue(__res, 0, 3);
-		typrelid = PQgetvalue(__res, 0, 4);
-		typelem  = PQgetvalue(__res, 0, 5);
-		nspname  = PQgetvalue(__res, 0, 6);
-		typname  = PQgetvalue(__res, 0, 7);
+		nspname  = PQgetvalue(__res, 0, 0);
+		typname  = PQgetvalue(__res, 0, 1);
+		typemod  = PQgetvalue(__res, 0, 2);
+		if (typemod)
+			atttypmod = atoi(typemod);
+		typlen   = PQgetvalue(__res, 0, 3);
+		typbyval = PQgetvalue(__res, 0, 4);
+		typalign = PQgetvalue(__res, 0, 5);
+		typtype  = PQgetvalue(__res, 0, 6);
+		typrelid = PQgetvalue(__res, 0, 7);
+		typelem  = PQgetvalue(__res, 0, 8);
+		extname  = PQgetvalue(__res, 0, 9);
+		extschema = PQgetvalue(__res, 0, 10);
 
 		if (af_info)
 			arrow_field = &af_info->footer.schema.fields[j];
-		
+
 		pgsql_setup_attribute(conn,
 							  table,
-							  &table->columns[j],
+							  &table->columns[i],
 							  attname,
 							  atttypid,
 							  atttypmod,
@@ -528,6 +896,8 @@ pgsql_create_buffer(PGconn *conn, PGresult *res,
 							  atoi(typelem),
 							  nspname,
 							  typname,
+							  extname,
+							  extschema,
 							  arrow_field,
 							  &table->numFieldNodes,
 							  &table->numBuffers);
@@ -545,13 +915,16 @@ sqldb_server_connect(const char *sqldb_hostname,
                      const char *sqldb_username,
                      const char *sqldb_password,
                      const char *sqldb_database,
-                     userConfigOption *session_config_list)
+                     userConfigOption *session_config_list,
+					 nestLoopOption *sqldb_nestloop_list)
 {
 	PGSTATE	   *pgstate;
 	PGconn	   *conn;
 	PGresult   *res;
 	const char *query;
+	int			i, n_depth = 0;
 	userConfigOption *conf;
+	nestLoopOption *nlopt;
 
 	conn = pgsql_server_connect(sqldb_hostname,
 								sqldb_port_num,
@@ -565,7 +938,7 @@ sqldb_server_connect(const char *sqldb_hostname,
 	{
 		res = PQexec(conn, conf->query);
 		if (PQresultStatus(res) != PGRES_COMMAND_OK)
-			Elog();
+			Elog("failed on change parameter: %s", conf->query);
 		PQclear(res);
 	}
 
@@ -595,9 +968,26 @@ sqldb_server_connect(const char *sqldb_hostname,
 		Elog("out of memory");
 
 	/* setup state object */
-	pgstate = palloc0(sizeof(PGSTATE));
+	for (nlopt = sqldb_nestloop_list; nlopt; nlopt = nlopt->next)
+		n_depth++;
+
+	pgstate = palloc0(offsetof(PGSTATE, nestloop[n_depth]));
 	pgstate->conn = conn;
 	pgstate->res  = NULL;
+	pgstate->n_depth = n_depth;
+	for (nlopt = sqldb_nestloop_list, i=0; nlopt; nlopt = nlopt->next, i++)
+	{
+		PGSTATE_NL *nl = &pgstate->nestloop[i];
+
+		sprintf(nl->pstmt, "pstmt_nl%d", i+1);
+		nl->command = nlopt->sub_command;
+		nl->outer_join = nlopt->outer_join;
+		nl->n_params = nlopt->n_params;
+		nl->p_depth = palloc0(sizeof(int) * nlopt->n_params);
+		nl->p_resno = palloc0(sizeof(int) * nlopt->n_params);
+		nl->p_names = palloc0(sizeof(char *) * nlopt->n_params);
+		memcpy(nl->p_names, nlopt->pnames, sizeof(char *) * nlopt->n_params);
+	}
 	return pgstate;
 }
 
@@ -630,54 +1020,70 @@ sqldb_begin_query(void *sqldb_state,
 		Elog("unable to declare a SQL cursor: %s", PQresultErrorMessage(res));
 	PQclear(res);
 
-	/* fetch the first result */
-	res = pgsql_next_result(pgstate);
-	if (!res)
+	/* move to the first tuple(-set) */
+	if (pgsql_move_next(pgstate, NULL) < 0)
 		return NULL;
-	pgstate->res = res;
-
-	return pgsql_create_buffer(conn, res, af_info, dictionary_list);
+	return pgsql_create_buffer(pgstate, af_info, dictionary_list);
 }
 
-ssize_t
+/*
+ * sqldb_fetch_results
+ */
+bool
 sqldb_fetch_results(void *sqldb_state, SQLtable *table)
 {
 	PGSTATE	   *pgstate = sqldb_state;
-	PGresult   *res = pgstate->res;
-	int			j, index = pgstate->index++;
+	PGresult   *res;
+	uint32_t   *rows_index;
+	uint32_t	index;
+	int			depth = 0;
+	int			i, j, ncols;
 	size_t		usage = 0;
 
-	if (index >= pgstate->nitems)
-	{
-		res = pgsql_next_result(pgstate);
-		if (!res)
-			return -1;		/* end of the scan */
-		index = pgstate->index++;
-	}
+	rows_index = alloca(sizeof(uint32_t) * (pgstate->n_depth + 1));
+	if (!pgsql_move_next(pgstate, rows_index))
+		return false;		/* end of the scan */
 
-	table->nitems++;
-	for (j=0; j < table->nfields; j++)
+	res = pgstate->res;
+	ncols = PQnfields(res);
+	index = rows_index[0];
+	for (i=0, j=0; i < table->nfields; i++, j++)
 	{
-		SQLfield   *column = &table->columns[j];
+		SQLfield   *column = &table->columns[i];
 		const char *addr;
 		size_t		sz;
 
+		/* switch to the next depth, if any */
+		while (j == ncols)
+		{
+			PGSTATE_NL *nl = &pgstate->nestloop[depth++];
+
+			assert(depth <= pgstate->n_depth);
+			res = nl->res;
+			ncols = PQnfields(res);
+			index = rows_index[depth];
+			j = 0;
+		}
 		/* data must be binary format */
-		assert(PQfformat(res, j) == 1);
-		if (PQgetisnull(res, index, j))
+		if (index == UINT_MAX || PQgetisnull(res, index, j))
 		{
 			addr = NULL;
 			sz = 0;
 		}
 		else
 		{
+			assert(PQfformat(res, j) == 1);
 			addr = PQgetvalue(res, index, j);
 			sz = PQgetlength(res, index, j);
 		}
 		usage += sql_field_put_value(column, addr, sz);
-		assert(table->nitems == column->nitems);
 	}
-	return usage;
+	assert(depth == pgstate->n_depth);
+
+	table->usage = usage;
+	table->nitems++;
+
+	return true;
 }
 
 void
@@ -686,9 +1092,17 @@ sqldb_close_connection(void *sqldb_state)
 	PGSTATE	   *pgstate = sqldb_state;
 	PGconn	   *conn = pgstate->conn;
 	PGresult   *res;
+	int			i;
 
 	if (pgstate->res)
 		PQclear(pgstate->res);
+	for (i=0; i < pgstate->n_depth; i++)
+	{
+		PGSTATE_NL *nl = &pgstate->nestloop[i];
+
+		if (nl->res)
+			PQclear(nl->res);
+	}
 	/* close the cursor */
 	res = PQexec(conn, "CLOSE " CURSOR_NAME);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
@@ -697,13 +1111,4 @@ sqldb_close_connection(void *sqldb_state)
 	PQclear(res);
 	/* close the connection */
 	PQfinish(conn);
-}
-
-/*
- * Misc functions
- */
-void *
-MemoryContextAlloc(MemoryContext context, Size sz)
-{
-	return palloc(sz);
 }

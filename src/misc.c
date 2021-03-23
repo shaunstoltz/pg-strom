@@ -315,6 +315,60 @@ get_proc_library(HeapTuple protup)
 }
 
 /*
+ * get_object_extension_oid
+ */
+Oid
+get_object_extension_oid(Oid class_id,
+						 Oid object_id,
+						 int32 objsub_id,
+						 bool missing_ok)
+{
+	Relation	drel;
+	ScanKeyData	skeys[3];
+	SysScanDesc	sscan;
+	HeapTuple	tup;
+	Oid			ext_oid = InvalidOid;
+
+	drel = table_open(DependRelationId, AccessShareLock);
+
+	ScanKeyInit(&skeys[0],
+				Anum_pg_depend_classid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(class_id));
+	ScanKeyInit(&skeys[1],
+				Anum_pg_depend_objid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(object_id));
+	ScanKeyInit(&skeys[2],
+				Anum_pg_depend_objsubid,
+				BTEqualStrategyNumber, F_INT4EQ,
+				Int32GetDatum(objsub_id));
+	sscan = systable_beginscan(drel, DependDependerIndexId, true,
+							   NULL, 3, skeys);
+	while (HeapTupleIsValid(tup = systable_getnext(sscan)))
+	{
+		Form_pg_depend	dep = (Form_pg_depend) GETSTRUCT(tup);
+
+		if (dep->refclassid == ExtensionRelationId &&
+			dep->refobjsubid == 0 &&
+			(dep->deptype == DEPENDENCY_EXTENSION ||
+			 dep->deptype == DEPENDENCY_AUTO_EXTENSION))
+		{
+			ext_oid = dep->refobjid;
+			break;
+		}
+	}
+	systable_endscan(sscan);
+	table_close(drel, AccessShareLock);
+
+	if (!missing_ok && !OidIsValid(ext_oid))
+		elog(ERROR, "couldn't find out references (class:%u, objid:%u, subid:%d) by pg_extension at pg_depend",
+			 class_id, object_id, objsub_id);
+
+	return ext_oid;
+}
+
+/*
  * bms_to_cstring - human readable Bitmapset
  */
 char *
@@ -500,6 +554,22 @@ bool
 pathtree_has_gpupath(Path *node)
 {
 	return __pathtree_has_gpupath(node, NULL);
+}
+
+static bool
+__pathtree_has_parallel_aware(Path *path, void *context)
+{
+	bool	rv = path->parallel_aware;
+
+	if (!rv)
+		rv = pathnode_tree_walker(path, __pathtree_has_parallel_aware, context);
+	return rv;
+}
+
+bool
+pathtree_has_parallel_aware(Path *node)
+{
+	return __pathtree_has_parallel_aware(node, NULL);
 }
 
 /*
@@ -769,16 +839,24 @@ errorText(int errcode)
 	const char *error_name;
 	const char *error_desc;
 
-	if (cuGetErrorName(errcode, &error_name) == CUDA_SUCCESS &&
-		cuGetErrorString(errcode, &error_desc) == CUDA_SUCCESS)
+	if (errcode >= 0 && errcode <= CUDA_ERROR_UNKNOWN)
 	{
-		snprintf(buffer, sizeof(buffer), "%s - %s",
-				 error_name, error_desc);
+		if (cuGetErrorName(errcode, &error_name) == CUDA_SUCCESS &&
+			cuGetErrorString(errcode, &error_desc) == CUDA_SUCCESS)
+		{
+			snprintf(buffer, sizeof(buffer), "%s - %s",
+					 error_name, error_desc);
+			return buffer;
+		}
 	}
-	else
+#ifdef WITH_CUFILE
+	else if (errcode > CUFILEOP_BASE_ERR)
 	{
-		snprintf(buffer, sizeof(buffer), "%d - unknown", errcode);
+		return cufileop_status_error((CUfileOpError)errcode);
 	}
+#endif
+	snprintf(buffer, sizeof(buffer),
+			 "%d - unknown", errcode);
 	return buffer;
 }
 
@@ -1415,19 +1493,17 @@ __readFileSignal(int fdesc, void *buffer, size_t nbytes,
 
 	do {
 		rv = read(fdesc, (char *)buffer + count, nbytes - count);
-		if (rv < 0)
-		{
-			if (errno == EINTR)
-			{
-				if (interruptible)
-					CHECK_FOR_INTERRUPTS();
-				continue;
-			}
-			return rv;
-		}
+		if (rv > 0)
+			count += rv;
 		else if (rv == 0)
 			break;
-		count += rv;
+		else if (errno == EINTR)
+		{
+			if (interruptible)
+				CHECK_FOR_INTERRUPTS();
+		}
+		else
+			return rv;
 	} while (count < nbytes);
 
 	return count;
@@ -1440,6 +1516,26 @@ __readFile(int fdesc, void *buffer, size_t nbytes)
 }
 
 ssize_t
+__preadFile(int fdesc, void *buffer, size_t nbytes, off_t f_pos)
+{
+	ssize_t		rv, count = 0;
+
+	do {
+		rv = pread(fdesc, (char *)buffer + count, nbytes - count, f_pos + count);
+		if (rv > 0)
+			count += rv;
+		else if (rv == 0)
+			break;
+		else if (errno == EINTR)
+			CHECK_FOR_INTERRUPTS();
+		else
+			return rv;
+	} while (count < nbytes);
+
+	return count;
+}
+
+ssize_t
 __writeFileSignal(int fdesc, const void *buffer, size_t nbytes,
 				  bool interruptible)
 {
@@ -1447,19 +1543,17 @@ __writeFileSignal(int fdesc, const void *buffer, size_t nbytes,
 
 	do {
 		rv = write(fdesc, (const char *)buffer + count, nbytes - count);
-		if (rv < 0)
-		{
-			if (errno == EINTR)
-			{
-				if (interruptible)
-					CHECK_FOR_INTERRUPTS();
-				continue;
-			}
-			return rv;
-		}
+		if (rv > 0)
+			count += rv;
 		else if (rv == 0)
 			break;
-		count += rv;
+		else if (errno == EINTR)
+		{
+			if (interruptible)
+				CHECK_FOR_INTERRUPTS();
+		}
+		else
+			return rv;
 	} while (count < nbytes);
 
 	return count;
@@ -1471,6 +1565,25 @@ __writeFile(int fdesc, const void *buffer, size_t nbytes)
 	return __writeFileSignal(fdesc, buffer, nbytes, true);
 }
 
+ssize_t
+__pwriteFile(int fdesc, const void *buffer, size_t nbytes, off_t f_pos)
+{
+	ssize_t		rv, count = 0;
+
+	do {
+		rv = pwrite(fdesc, (const char *)buffer + count, nbytes - count, f_pos + count);
+		if (rv > 0)
+			count += rv;
+		else if (rv == 0)
+			break;
+		else if (errno == EINTR)
+			CHECK_FOR_INTERRUPTS();
+		else
+			return rv;
+	} while (count < nbytes);
+
+	return count;
+}
 
 /*
  * mmap/munmap wrapper that is automatically unmapped on regarding to

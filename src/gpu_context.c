@@ -35,10 +35,7 @@ typedef struct CudaResource
 } CudaResource;
 
 /* variables */
-static shmem_startup_hook_type shmem_startup_next = NULL;
-static pg_atomic_uint32 *global_num_running_tasks;	/* shared */
-int					global_max_async_tasks;		/* GUC */
-int					local_max_async_tasks;		/* GUC */
+int					pgstrom_max_async_tasks;		/* GUC */
 bool				pgstrom_reuse_cuda_context;	/* GUC */
 static CudaResource *cuda_resources_array = NULL;
 static slock_t		activeGpuContextLock;
@@ -54,6 +51,7 @@ static dlist_head	activeGpuContextList;
 #define RESTRACK_CLASS__GPUPROGRAM		3
 #define RESTRACK_CLASS__GPUMEMORY_IPC	4
 #define RESTRACK_CLASS__FILEDESC		5
+#define RESTRACK_CLASS__GPUMODULE		6
 
 typedef struct ResourceTracker
 {
@@ -72,8 +70,12 @@ typedef struct ResourceTracker
 			CUipcMemHandle handle;
 			cl_uint		mapcount;
 		} ipcmem;
+		struct {				/* RESTRACK_CLASS__GPUMODULE */
+			ProgramId	program_id;
+			CUmodule	cuda_module;
+		} module;
 		ProgramId	program_id;	/* RESTRACK_CLASS__GPUPROGRAM */
-		int			filedesc;	/* RESTRACK_CLASS__FILEDESC */
+		GPUDirectFileDesc filedesc;	/* RESTRACK_CLASS__FILEDESC */
 	} u;
 } ResourceTracker;
 
@@ -242,7 +244,7 @@ untrackGpuMem(GpuContext *gcontext, CUdeviceptr devptr)
  * trackRawFileDesc - tracker of raw file descriptors
  */
 bool
-trackRawFileDesc(GpuContext *gcontext, int filedesc,
+trackRawFileDesc(GpuContext *gcontext, GPUDirectFileDesc *filedesc,
 				 const char *filename, int lineno)
 {
 	ResourceTracker *tracker = calloc(1, sizeof(ResourceTracker));
@@ -252,12 +254,12 @@ trackRawFileDesc(GpuContext *gcontext, int filedesc,
 		return false;	/* out of memory */
 
 	crc = resource_tracker_hashval(RESTRACK_CLASS__FILEDESC,
-								   &filedesc, sizeof(int));
+								   &filedesc->rawfd, sizeof(int));
 	tracker->crc = crc;
 	tracker->resclass = RESTRACK_CLASS__FILEDESC;
 	tracker->filename = filename;
 	tracker->lineno = lineno;
-	tracker->u.filedesc = filedesc;
+	memcpy(&tracker->u.filedesc, filedesc, sizeof(GPUDirectFileDesc));
 	SpinLockAcquire(&gcontext->restrack_lock);
 	dlist_push_tail(&gcontext->restrack[crc % RESTRACK_HASHSIZE],
 					&tracker->chain);
@@ -269,14 +271,14 @@ trackRawFileDesc(GpuContext *gcontext, int filedesc,
  * untrackRawFileDesc - untracker of raw file descriptors
  */
 void
-untrackRawFileDesc(GpuContext *gcontext, int filedesc)
+untrackRawFileDesc(GpuContext *gcontext, GPUDirectFileDesc *filedesc)
 {
 	dlist_head *restrack_list;
 	dlist_iter	iter;
 	pg_crc32	crc;
 
 	crc = resource_tracker_hashval(RESTRACK_CLASS__FILEDESC,
-								   &filedesc, sizeof(int));
+								   &filedesc->rawfd, sizeof(int));
 	SpinLockAcquire(&gcontext->restrack_lock);
 	restrack_list = &gcontext->restrack[crc % RESTRACK_HASHSIZE];
 	dlist_foreach(iter, restrack_list)
@@ -286,8 +288,8 @@ untrackRawFileDesc(GpuContext *gcontext, int filedesc)
 
 		if (tracker->crc == crc &&
 			tracker->resclass == RESTRACK_CLASS__FILEDESC &&
-			tracker->u.filedesc == filedesc)
-        {
+			tracker->u.filedesc.rawfd == filedesc->rawfd)
+		{
 			dlist_delete(&tracker->chain);
 			SpinLockRelease(&gcontext->restrack_lock);
 			free(tracker);
@@ -295,7 +297,7 @@ untrackRawFileDesc(GpuContext *gcontext, int filedesc)
 		}
 	}
 	SpinLockRelease(&gcontext->restrack_lock);
-	wnotice("Bug? File Descriptor %d was not tracked", filedesc);
+	wnotice("Bug? File Descriptor %d was not tracked", filedesc->rawfd);
 }
 
 /*
@@ -424,55 +426,59 @@ gpuIpcCloseMemHandle(GpuContext *gcontext, CUdeviceptr m_deviceptr)
 }
 
 /*
- * GpuContextLookupModule
+ * __GpuContextLookupModule
  */
-typedef struct
-{
-	dlist_node	chain;
-	ProgramId	program_id;
-	CUmodule	cuda_module;
-} GpuContextModuleEntry;
-
 CUmodule
-GpuContextLookupModule(GpuContext *gcontext, ProgramId program_id)
+__GpuContextLookupModule(GpuContext *gcontext, ProgramId program_id,
+						 const char *filename, int lineno)
 {
-	GpuContextModuleEntry *entry;
+	ResourceTracker *tracker;
+	dlist_head *restrack_list;
 	dlist_iter	iter;
-	cl_int		index = program_id % CUDA_MODULES_HASHSIZE;
-	CUmodule	cuda_module;
+	pg_crc32	crc;
+	CUmodule	cuda_module = NULL;
 
+	crc = resource_tracker_hashval(RESTRACK_CLASS__GPUMODULE,
+								   &program_id, sizeof(ProgramId));
+	restrack_list = &gcontext->restrack[crc % RESTRACK_HASHSIZE];
 	STROM_TRY();
 	{
-		while (!pthreadMutexLockTimeout(&gcontext->cuda_modules_lock, 500))
+		SpinLockAcquire(&gcontext->restrack_lock);
+		dlist_foreach(iter, restrack_list)
 		{
-			if (pg_atomic_read_u32(&gcontext->terminate_workers) != 0)
-				werror("worker termination is required");
-		}
-
-		dlist_foreach(iter, &gcontext->cuda_modules_slot[index])
-		{
-			entry = dlist_container(GpuContextModuleEntry, chain, iter.cur);
-			if (entry->program_id == program_id)
+			tracker = dlist_container(ResourceTracker, chain, iter.cur);
+			if (tracker->crc == crc &&
+				tracker->resclass == RESTRACK_CLASS__GPUMODULE &&
+				tracker->u.module.program_id == program_id)
 			{
-				cuda_module = entry->cuda_module;
-				goto found;
+				cuda_module = tracker->u.module.cuda_module;
+				break;
 			}
 		}
-		entry = calloc(1, sizeof(GpuContextModuleEntry));
-		if (!entry)
-			werror("out of memory");
-		cuda_module = pgstrom_load_cuda_program(program_id);
 
-		entry->cuda_module = cuda_module;
-		entry->program_id = program_id;
-		dlist_push_head(&gcontext->cuda_modules_slot[index],
-						&entry->chain);
-	found:
-		pthreadMutexUnlock(&gcontext->cuda_modules_lock);
+		if (!cuda_module)
+		{
+			cuda_module = pgstrom_load_cuda_program(program_id);
+			tracker = calloc(1, sizeof(ResourceTracker));
+            if (!tracker)
+			{
+				cuModuleUnload(cuda_module);
+				werror("out of memory");
+			}
+			tracker->crc = crc;
+			tracker->resclass = RESTRACK_CLASS__GPUMODULE;
+			tracker->filename = filename;
+			tracker->lineno = lineno;
+			tracker->u.module.program_id = program_id;
+			tracker->u.module.cuda_module = cuda_module;
+
+			dlist_push_tail(restrack_list, &tracker->chain);
+		}
+		SpinLockRelease(&gcontext->restrack_lock);
 	}
 	STROM_CATCH();
 	{
-		pthreadMutexUnlock(&gcontext->cuda_modules_lock);
+		SpinLockRelease(&gcontext->restrack_lock);
 		STROM_RE_THROW();
 	}
 	STROM_END_TRY();
@@ -563,11 +569,15 @@ ReleaseLocalResources(GpuContext *gcontext, bool normal_exit)
 				case RESTRACK_CLASS__FILEDESC:
 					if (normal_exit)
 						wnotice("File desc %d by (%s:%d) is likely leaked",
-								tracker->u.filedesc,
+								tracker->u.filedesc.rawfd,
 								__basename(tracker->filename),
 								tracker->lineno);
-					if (close(tracker->u.filedesc))
-						wnotice("failed on close(2): %m");
+					gpuDirectFileDescClose(&tracker->u.filedesc);
+					break;
+				case RESTRACK_CLASS__GPUMODULE:
+					rc = cuModuleUnload(tracker->u.module.cuda_module);
+					if (rc != CUDA_SUCCESS)
+						wnotice("failed on cuModuleUnload: %s", errorText(rc));
 					break;
 				default:
 					wnotice("Bug? unknown resource tracker class: %d",
@@ -579,20 +589,6 @@ ReleaseLocalResources(GpuContext *gcontext, bool normal_exit)
 	}
 	/* unmap GPU device memory segment */
 	pgstrom_gpu_mmgr_cleanup_gpucontext(gcontext);
-
-	/* unload CUDA modules */
-	for (i=0; i < CUDA_MODULES_HASHSIZE; i++)
-	{
-		GpuContextModuleEntry *entry;
-		dlist_node	   *dnode;
-
-		while (!dlist_is_empty(&gcontext->cuda_modules_slot[i]))
-		{
-			dnode = dlist_pop_head_node(&gcontext->cuda_modules_slot[i]);
-			entry = dlist_container(GpuContextModuleEntry, chain, dnode);
-			free(entry);
-		}
-	}
 
 	/* destroy the CUDA context */
 	if (gcontext->cuda_context)
@@ -611,6 +607,20 @@ ReleaseLocalResources(GpuContext *gcontext, bool normal_exit)
 			if (rc != CUDA_SUCCESS)
 				elog(WARNING, "failed on cuCtxDestroy: %s", errorText(rc));
 			memset(cuda_resource, 0, sizeof(CudaResource));
+		}
+	}
+
+	/* print debug counter, if any */
+	{
+		uint64	debug_count1 = pg_atomic_read_u64(&gcontext->debug_count1);
+		uint64	debug_count2 = pg_atomic_read_u64(&gcontext->debug_count2);
+		uint64	debug_count3 = pg_atomic_read_u64(&gcontext->debug_count3);
+		uint64	debug_count4 = pg_atomic_read_u64(&gcontext->debug_count4);
+
+		if (debug_count1 || debug_count2 || debug_count3 || debug_count4)
+		{
+			elog(NOTICE, "GpuContext %p { debug1: %lu, debug2: %lu, debug3: %lu, debug4: %lu }",
+				 gcontext, debug_count1, debug_count2, debug_count3, debug_count4);
 		}
 	}
 	free(gcontext);
@@ -662,6 +672,8 @@ GpuContextWorkerReportError(int elevel,
 /*
  * GpuContextWorkerMain
  */
+__thread CUevent		CU_EVENT_PER_THREAD = NULL;
+
 static void *
 GpuContextWorkerMain(void *arg)
 {
@@ -687,6 +699,12 @@ GpuContextWorkerMain(void *arg)
 
 	STROM_TRY();
 	{
+		/* setup CU_EVENT_PER_THREAD variable */
+		rc = cuEventCreate(&CU_EVENT_PER_THREAD,
+						   CU_EVENT_BLOCKING_SYNC);
+		if (rc != CUDA_SUCCESS)
+			werror("failed on cuEventCreate: %s", errorText(rc));
+
 		while (pg_atomic_read_u32(&gcontext->terminate_workers) == 0)
 		{
 			GpuTaskState *gts;
@@ -827,8 +845,9 @@ gpuInit(unsigned int flags)
 	if (!cuda_driver_initialized)
 	{
 		rc = cuInit(0);
-		if (rc == CUDA_SUCCESS)
-			cuda_driver_initialized = true;
+		if (rc != CUDA_SUCCESS)
+			return rc;
+		cuda_driver_initialized = true;
 	}
 	return rc;
 }
@@ -862,26 +881,9 @@ activate_cuda_context(GpuContext *gcontext)
 	if (rc != CUDA_SUCCESS)
 		werror("failed on cuDeviceGet: %s", errorText(rc));
 
-	if (!gcontext->never_use_mps)
-	{
-		rc = cuCtxCreate(&cuda_context,
-						 CU_CTX_SCHED_AUTO,
-						 cuda_device);
-	}
-	else
-	{
-		char   *environ_saved = getenv("CUDA_MPS_PIPE_DIRECTORY");
-
-		if (setenv("CUDA_MPS_PIPE_DIRECTORY", "/dev/null", 1) != 0)
-			werror("failed on setenv: %m");
-		rc = cuCtxCreate(&cuda_context,
-						 CU_CTX_SCHED_AUTO,
-						 cuda_device);
-		if (!environ_saved)
-			unsetenv("CUDA_MPS_PIPE_DIRECTORY");
-		else
-			setenv("CUDA_MPS_PIPE_DIRECTORY", environ_saved, 1);
-	}
+	rc = cuCtxCreate(&cuda_context,
+					 CU_CTX_SCHED_AUTO,
+					 cuda_device);
 	if (rc != CUDA_SUCCESS)
 		werror("failed on cuCtxCreate: %s", errorText(rc));
 	gcontext->cuda_device  = cuda_device;
@@ -901,61 +903,45 @@ activate_cuda_context(GpuContext *gcontext)
 static void
 activate_cuda_workers(GpuContext *gcontext)
 {
-	CUresult	rc;
 	cl_int		i;
 
 	if (gcontext->worker_is_running)
 		return;
-
-	Assert(gcontext->cuda_context != NULL);
-	GPUCONTEXT_PUSH(gcontext);
-	for (i=0; i < gcontext->num_workers; i++)
-	{
-		if (!gcontext->cuda_events0[i])
-		{
-			rc = cuEventCreate(&gcontext->cuda_events0[i],
-							   CU_EVENT_BLOCKING_SYNC);
-			if (rc != CUDA_SUCCESS)
-				elog(ERROR, "failed on cuEventCreate: %s", errorText(rc));
-		}
-
-		if (!gcontext->cuda_events1[i])
-		{
-			rc = cuEventCreate(&gcontext->cuda_events1[i],
-							   CU_EVENT_BLOCKING_SYNC);
-			if (rc != CUDA_SUCCESS)
-				elog(ERROR, "failed on cuEventCreate: %s", errorText(rc));
-		}
-	}
-	GPUCONTEXT_POP(gcontext);
-
 	/* creation of worker threads */
+	Assert(gcontext->cuda_context != NULL);
+
 	for (i=0; i < gcontext->num_workers; i++)
 	{
 		pthread_t	thread;
 
-		if ((errno = pthread_create(&thread, NULL,
-									GpuContextWorkerMain,
-									gcontext)) != 0)
+		errno = pthread_create(&thread, NULL,
+							   GpuContextWorkerMain,
+							   gcontext);
+		if (errno != 0)
 			elog(ERROR, "failed on pthread_create: %m");
-
 		gcontext->worker_threads[i] = thread;
+
+		/*
+		 * NOTE: Even if pthread_create() failed to launch worker threads
+		 * later, SynchronizeGpuContext() may terminate the worker threads
+		 * already launched if worker_is_running.
+		 */
+		gcontext->worker_is_running = true;
 	}
-	gcontext->worker_is_running = true;
 }
 
 /*
  * GetGpuContext - acquire a free GpuContext
  */
 GpuContext *
-AllocGpuContext(int cuda_dindex, bool never_use_mps,
+AllocGpuContext(int cuda_dindex,
 				bool activate_context,
 				bool activate_workers)
 {
 	GpuContext	   *gcontext = NULL;
 	dlist_iter		iter;
 	CUresult		rc;
-	int				i, num_workers = local_max_async_tasks;
+	int				i, num_workers = pgstrom_max_async_tasks;
 
 	/* per-process driver initialization */
 	rc = gpuInit(0);
@@ -971,7 +957,6 @@ AllocGpuContext(int cuda_dindex, bool never_use_mps,
 		gcontext = dlist_container(GpuContext, chain, iter.cur);
 
 		if (gcontext->resowner == CurrentResourceOwner &&
-			(!never_use_mps || gcontext->never_use_mps) &&
 			(cuda_dindex < 0 || gcontext->cuda_dindex == cuda_dindex))
 		{
 			pg_atomic_fetch_add_u32(&gcontext->refcnt, 1);
@@ -983,13 +968,9 @@ AllocGpuContext(int cuda_dindex, bool never_use_mps,
 	/*
 	 * Not found, so allocate a new one
 	 */
-	gcontext = calloc(1, offsetof(GpuContext, worker_threads[num_workers]) +
-					  2 * sizeof(CUevent) * num_workers);
+	gcontext = calloc(1, offsetof(GpuContext, worker_threads[num_workers]));
 	if (!gcontext)
 		elog(ERROR, "out of memory");
-	gcontext->cuda_events0 = (CUevent *)
-		((char *)gcontext + offsetof(GpuContext, worker_threads[num_workers]));
-	gcontext->cuda_events1 = gcontext->cuda_events0 + num_workers;
 
 	/* choose a device to use, if no preference */
 	if (cuda_dindex < 0)
@@ -1002,11 +983,7 @@ AllocGpuContext(int cuda_dindex, bool never_use_mps,
 	/* setup fields */
 	pg_atomic_init_u32(&gcontext->refcnt, 1);
 	gcontext->resowner		= CurrentResourceOwner;
-	gcontext->never_use_mps	= never_use_mps;
 	gcontext->cuda_dindex	= cuda_dindex;
-	pthreadMutexInit(&gcontext->cuda_modules_lock, 0);
-	for (i=0; i < CUDA_MODULES_HASHSIZE; i++)
-		dlist_init(&gcontext->cuda_modules_slot[i]);
 	/* resource management */
 	SpinLockInit(&gcontext->restrack_lock);
 	for (i=0; i < RESTRACK_HASHSIZE; i++)
@@ -1020,10 +997,8 @@ AllocGpuContext(int cuda_dindex, bool never_use_mps,
 	memset(gcontext->error_message, 0, sizeof(gcontext->error_message));
 	/* management of work-queue */
 	gcontext->worker_is_running = false;
-	gcontext->global_num_running_tasks
-		= &global_num_running_tasks[cuda_dindex];
 	pthreadMutexInit(&gcontext->worker_mutex, 1);
-	pthreadCondInit(&gcontext->worker_cond);
+	pthreadCondInit(&gcontext->worker_cond, 1);
 	pg_atomic_init_u32(&gcontext->terminate_workers, 0);
 	dlist_init(&gcontext->pending_tasks);
 	gcontext->num_workers = num_workers;
@@ -1106,7 +1081,6 @@ PutGpuContext(GpuContext *gcontext)
 void
 SynchronizeGpuContext(GpuContext *gcontext)
 {
-	CUresult	rc;
 	int			i;
 
 	if (!gcontext->worker_is_running)
@@ -1115,26 +1089,16 @@ SynchronizeGpuContext(GpuContext *gcontext)
 	/* signal to terminate all workers */
 	pg_atomic_write_u32(&gcontext->terminate_workers, 1);
 	pthreadCondBroadcast(&gcontext->worker_cond);
-	/* interrupt cuEventSynchronize() */
-	GPUCONTEXT_PUSH(gcontext);
-	for (i=0; i < gcontext->num_workers; i++)
-	{
-		if ((rc = cuEventRecord(gcontext->cuda_events0[i],
-								CU_STREAM_PER_THREAD)) != CUDA_SUCCESS)
-			elog(WARNING, "failed on cuEventRecord: %s", errorText(rc));
-		if ((rc = cuEventRecord(gcontext->cuda_events1[i],
-								CU_STREAM_PER_THREAD)) != CUDA_SUCCESS)
-			elog(WARNING, "failed on cuEventRecord: %s", errorText(rc));
-	}
-	GPUCONTEXT_POP(gcontext);
 
 	/* wait for completion of the worker threads */
 	for (i=0; i < gcontext->num_workers; i++)
 	{
 		pthread_t	thread = gcontext->worker_threads[i];
 
-		if ((errno = pthread_join(thread, NULL)) != 0)
+		if (pthread_equal(pthread_self(), thread) == 0 &&
+			(errno = pthread_join(thread, NULL)) != 0)
 			elog(PANIC, "failed on pthread_join: %m");
+		gcontext->worker_threads[i] = pthread_self();
 	}
 	memset(gcontext->worker_threads, 0,
 		   sizeof(pthread_t) * gcontext->num_workers);
@@ -1239,48 +1203,16 @@ gpucontext_shmem_exit_cleanup(int code, Datum arg)
 }
 
 /*
- * pgstrom_startup_gpu_context
- */
-static void
-pgstrom_startup_gpu_context(void)
-{
-	bool	found;
-	int		i;
-
-	if (shmem_startup_next)
-		(*shmem_startup_next)();
-
-	global_num_running_tasks =
-		ShmemInitStruct("Global number of running tasks counter",
-						sizeof(pg_atomic_uint32) * numDevAttrs,
-						&found);
-	if (found)
-		elog(ERROR, "Bug? Global number of running tasks counter exists");
-	for (i=0; i < numDevAttrs; i++)
-		pg_atomic_init_u32(&global_num_running_tasks[i], 0);
-}
-
-/*
  * pgstrom_init_gpu_context
  */
 void
 pgstrom_init_gpu_context(void)
 {
-	DefineCustomIntVariable("pg_strom.global_max_async_tasks",
-			"Soft limit for the number of concurrent GpuTasks in system-wide",
+	DefineCustomIntVariable("pg_strom.max_async_tasks",
+							"Soft limit for CUDA worker threads per backend",
 							NULL,
-							&global_max_async_tasks,
-							160,
-							8,
-							INT_MAX,
-							PGC_SUSET,
-							GUC_NOT_IN_SAMPLE,
-                            NULL, NULL, NULL);
-	DefineCustomIntVariable("pg_strom.local_max_async_tasks",
-			"Soft limit for the number of concurrent GpuTasks per backend",
-							NULL,
-							&local_max_async_tasks,
-							8,
+							&pgstrom_max_async_tasks,
+							5,
 							1,
 							64,
 							PGC_SUSET,
@@ -1295,6 +1227,10 @@ pgstrom_init_gpu_context(void)
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
 
+	/* force to disable MPS to avoid troubles */
+	if (setenv("CUDA_MPS_PIPE_DIRECTORY", "/dev/null", 1) != 0)
+		elog(ERROR, "failed on setenv: %m");
+
 	/* initialization of GpuContext List */
 	cuda_resources_array = calloc(numDevAttrs, sizeof(CudaResource));
 	if (!cuda_resources_array)
@@ -1302,11 +1238,6 @@ pgstrom_init_gpu_context(void)
 
 	SpinLockInit(&activeGpuContextLock);
 	dlist_init(&activeGpuContextList);
-
-	/* shared memory */
-	RequestAddinShmemSpace(MAXALIGN(sizeof(pg_atomic_uint32) * numDevAttrs));
-	shmem_startup_next = shmem_startup_hook;
-    shmem_startup_hook = pgstrom_startup_gpu_context;
 
 	/* register the callback to clean up resources */
 	RegisterResourceReleaseCallback(gpucontext_cleanup_callback, NULL);
