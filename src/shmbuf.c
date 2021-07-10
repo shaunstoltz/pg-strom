@@ -3,17 +3,11 @@
  *
  * Implementation of MemoryContext on dynamic shared-memory segments.
  * ----
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2021 (C) PG-Strom Developers Team
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #include "pg_strom.h"
 #include "nodes/memnodes.h"
@@ -253,11 +247,13 @@ shmBufferAttachSegmentOnDemand(int signum, siginfo_t *siginfo, void *unused)
 		SpinLockRelease(&lmap->mutex);
 
 		/* problem solved */
+#ifdef PGSTROM_DEBUG_BUILD
 		fprintf(stderr, "pid=%u: %s on %p (seg_id=%u,rev=%u) - "
 				"[%s] has been locally mapped on demand.\n",
 				MyProcPid, strsignal(signum), fault_addr,
 				segment_id, revision,
 				namebuf);
+#endif
 		errno = errno_saved;
 		return;
 
@@ -702,6 +698,7 @@ shmemContextAlloc(MemoryContext __context, Size required)
 	if (!chunk)
 		return NULL;
 	Assert(chunk->memcxt == __context);
+	
 	return chunk->data;
 }
 

@@ -3,12 +3,11 @@
  *
  * Macro definitions to keep compatibility of PostgreSQL internal APIs.
  * --
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2021 (C) PG-Strom Developers Team
  *
- * This software is an extension of PostgreSQL; You can use, copy,
- * modify or distribute it under the terms of 'LICENSE' included
- * within this package.
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the PostgreSQL License.
  */
 #ifndef PG_COMPAT_H
 #define PG_COMPAT_H
@@ -43,16 +42,26 @@
  */
 #if PG_VERSION_NUM < 120000
 #define tupleDescHasOid(tdesc)		((tdesc)->tdhasoid)
+#define PgClassTupleGetOid(tuple)	HeapTupleGetOid(tuple)
 #define PgProcTupleGetOid(tuple)	HeapTupleGetOid(tuple)
 #define PgTypeTupleGetOid(tuple)	HeapTupleGetOid(tuple)
+#define PgTriggerTupleGetOid(tuple)	HeapTupleGetOid(tuple)
 #define CreateTemplateTupleDesc(a)	CreateTemplateTupleDesc((a), false)
 #define ExecCleanTypeFromTL(a)		ExecCleanTypeFromTL((a),false)
 #define SystemAttributeDefinition(a)			\
 	SystemAttributeDefinition((a),true)
+/* also, 'oid' attribute numbers */
+#define Anum_pg_class_oid			ObjectIdAttributeNumber
+#define Anum_pg_proc_oid			ObjectIdAttributeNumber
+#define Anum_pg_type_oid			ObjectIdAttributeNumber
+#define Anum_pg_trigger_oid			ObjectIdAttributeNumber
+#define Anum_pg_extension_oid		ObjectIdAttributeNumber
 #else
 #define tupleDescHasOid(tdesc)		(false)
+#define PgClassTupleGetOid(tuple)	(((Form_pg_class)GETSTRUCT(tuple))->oid)
 #define PgProcTupleGetOid(tuple)	(((Form_pg_proc)GETSTRUCT(tuple))->oid)
 #define PgTypeTupleGetOid(tuple)	(((Form_pg_type)GETSTRUCT(tuple))->oid)
+#define PgTriggerTupleGetOid(tuple)	(((Form_pg_trigger)GETSTRUCT(tuple))->oid)
 #endif
 
 /*
@@ -230,6 +239,7 @@ typedef ParallelHeapScanDesc			ParallelTableScanDesc;
 typedef ParallelHeapScanDescData		ParallelTableScanDescData;
 
 #define table_open(a,b)					heap_open(a,b)
+#define table_openrv(a,b)				heap_openrv(a,b)
 #define table_close(a,b)				heap_close(a,b)
 #define table_beginscan(a,b,c,d)		heap_beginscan(a,b,c,d)
 #define table_beginscan_parallel(a,b)	heap_beginscan_parallel(a,b)

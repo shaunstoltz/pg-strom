@@ -1,20 +1,14 @@
 /*
  * gpujoin.c
  *
- * GPU accelerated relations join, based on nested-loop or hash-join
+ * GPU version of relations JOIN, using NestLoop, HashJoin, and GiST-Index
  * algorithm.
  * ----
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2021 (C) PG-Strom Developers Team
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #include "pg_strom.h"
 #include "cuda_gpuscan.h"
@@ -2523,6 +2517,7 @@ try_add_gpujoin_paths(PlannerInfo *root,
 	ParamPathInfo  *param_info;
 	GpuJoinPath	   *gjpath;
 	const Path	   *pathnode;
+	Path		   *outer_curr;
 	inner_path_item *ip_item;
 	List		   *ip_items_list;
 	List		   *restrict_clauses = extra->restrictlist;
@@ -2615,11 +2610,12 @@ try_add_gpujoin_paths(PlannerInfo *root,
 	ip_item->join_nrows = joinrel->rows;
 	ip_items_list = list_make1(ip_item);
 
+	outer_curr = outer_path;
 	for (;;)
 	{
 		gjpath = create_gpujoin_path(root,
 									 joinrel,
-									 outer_path,
+									 outer_curr,
 									 ip_items_list,
 									 param_info,
 									 required_outer,
@@ -2638,7 +2634,7 @@ try_add_gpujoin_paths(PlannerInfo *root,
 
 		/* try to pull-up outer GpuJoin, if any */
 		pathnode = gpu_path_find_cheapest(root,
-										  outer_path->parent,
+										  outer_curr->parent,
 										  try_outer_parallel,
 										  try_inner_parallel);
 		if (pathnode && pgstrom_path_is_gpujoin(pathnode))
@@ -2662,7 +2658,7 @@ try_add_gpujoin_paths(PlannerInfo *root,
 
 				ip_items_list = lcons(ip_temp, ip_items_list);
 			}
-			outer_path = linitial(gjtemp->cpath.custom_paths);
+			outer_curr = linitial(gjtemp->cpath.custom_paths);
 		}
 		else
 		{
@@ -6064,8 +6060,8 @@ GpuJoinExecOuterScanChunk(GpuTaskState *gts)
 	{
 		if (gjs->gts.af_state)
 			pds = ExecScanChunkArrowFdw(gts);
-		else if (gjs->gts.gs_state)
-			pds = ExecScanChunkGstoreFdw(gts);
+		else if (gjs->gts.gc_state)
+			pds = ExecScanChunkGpuCache(gts);
 		else
 			pds = pgstromExecScanChunk(gts);
 	}
@@ -6134,8 +6130,8 @@ gpujoin_next_task(GpuTaskState *gts)
 
 	if (gjs->gts.af_state)
 		pds = ExecScanChunkArrowFdw(gts);
-	else if (gjs->gts.gs_state)
-		pds = ExecScanChunkGstoreFdw(gts);
+	else if (gjs->gts.gc_state)
+		pds = ExecScanChunkGpuCache(gts);
 	else
 		pds = GpuJoinExecOuterScanChunk(gts);
 	if (pds)
@@ -7366,7 +7362,7 @@ gpujoin_process_inner_join(GpuJoinTask *pgjoin, CUmodule cuda_module)
 	}
 	else if (pds_src->kds.format == KDS_FORMAT_COLUMN)
 	{
-		m_kds_src = pds_src->m_kds_base;
+		m_kds_src = pds_src->m_kds_main;
 		m_kds_extra = pds_src->m_kds_extra;
 	}
 	else
@@ -7642,7 +7638,7 @@ gpujoin_process_task(GpuTask *gtask, CUmodule cuda_module)
 {
 	GpuJoinTask	   *pgjoin = (GpuJoinTask *) gtask;
 	pgstrom_data_store *pds_src = pgjoin->pds_src;
-	volatile bool	gstore_mapped = false;
+	volatile bool	gcache_mapped = false;
 	int				retval;
 	CUresult		rc;
 
@@ -7652,10 +7648,10 @@ gpujoin_process_task(GpuTask *gtask, CUmodule cuda_module)
 		{
 			if (pds_src->kds.format == KDS_FORMAT_COLUMN)
 			{
-				rc = gstoreFdwMapDeviceMemory(GpuWorkerCurrentContext, pds_src);
+				rc = gpuCacheMapDeviceMemory(GpuWorkerCurrentContext, pds_src);
 				if (rc != CUDA_SUCCESS)
-					werror("failed on gstoreFdwMapDeviceMemory: %s", errorText(rc));
-				gstore_mapped = true;
+					werror("failed on gpuCacheMapDeviceMemory: %s", errorText(rc));
+				gcache_mapped = true;
 			}
 			retval = gpujoin_process_inner_join(pgjoin, cuda_module);
 		}
@@ -7666,13 +7662,13 @@ gpujoin_process_task(GpuTask *gtask, CUmodule cuda_module)
 	}
 	STROM_CATCH();
 	{
-		if (gstore_mapped)
-			gstoreFdwUnmapDeviceMemory(GpuWorkerCurrentContext, pds_src);
+		if (gcache_mapped)
+			gpuCacheUnmapDeviceMemory(GpuWorkerCurrentContext, pds_src);
 		STROM_RE_THROW();
 	}
 	STROM_END_TRY();
-	if (gstore_mapped)
-		gstoreFdwUnmapDeviceMemory(GpuWorkerCurrentContext, pds_src);
+	if (gcache_mapped)
+		gpuCacheUnmapDeviceMemory(GpuWorkerCurrentContext, pds_src);
 	return retval;
 }
 

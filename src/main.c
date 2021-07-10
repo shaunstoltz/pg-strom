@@ -3,17 +3,11 @@
  *
  * Entrypoint of PG-Strom extension, and misc uncategolized functions.
  * ----
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2021 (C) PG-Strom Developers Team
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #include "pg_strom.h"
 
@@ -45,6 +39,18 @@ int			PAGE_SHIFT;
 long		PHYS_PAGES;
 int			pgstrom_num_users_extra = 0;
 pgstromUsersExtraDescriptor pgstrom_users_extra_desc[8];
+
+/* pg_strom.githash() */
+PG_FUNCTION_INFO_V1(pgstrom_githash);
+Datum
+pgstrom_githash(PG_FUNCTION_ARGS)
+{
+#ifdef PGSTROM_GITHASH
+	PG_RETURN_TEXT_P(cstring_to_text(PGSTROM_GITHASH));
+#else
+	PG_RETURN_NULL();
+#endif	
+}
 
 /* pg_strom.chunk_size */
 Size
@@ -569,9 +575,14 @@ _PG_init(void)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 		errmsg("PG-Strom must be loaded via shared_preload_libraries")));
 
+	/* init misc variables */
+	PAGE_SIZE = sysconf(_SC_PAGESIZE);
+	PAGE_MASK = PAGE_SIZE - 1;
+	PAGE_SHIFT = get_next_log2(PAGE_SIZE);
+	PHYS_PAGES = sysconf(_SC_PHYS_PAGES);
+
 	/* load NVIDIA/HeteroDB related stuff, if any */
 	pgstrom_init_nvrtc();
-	pgstrom_init_cufile();
 	pgstrom_init_extra();
 
 	/* dump version number */
@@ -581,12 +592,6 @@ _PG_init(void)
 #else
 	elog(LOG, "PG-Strom built for PostgreSQL %s", PG_MAJORVERSION);
 #endif
-	/* init misc variables */
-	PAGE_SIZE = sysconf(_SC_PAGESIZE);
-	PAGE_MASK = PAGE_SIZE - 1;
-	PAGE_SHIFT = get_next_log2(PAGE_SIZE);
-	PHYS_PAGES = sysconf(_SC_PHYS_PAGES);
-
 	/* init GPU/CUDA infrastracture */
 	pgstrom_init_common_guc();
 	pgstrom_init_shmbuf();
@@ -594,7 +599,6 @@ _PG_init(void)
 	pgstrom_init_gpu_mmgr();
 	pgstrom_init_gpu_context();
 	pgstrom_init_cuda_program();
-	pgstrom_init_gpu_direct();
 	pgstrom_init_codegen();
 
 	/* init custom-scan providers/FDWs */
@@ -604,7 +608,7 @@ _PG_init(void)
 	pgstrom_init_gpupreagg();
 	pgstrom_init_relscan();
 	pgstrom_init_arrow_fdw();
-	pgstrom_init_gstore_fdw();
+	pgstrom_init_gpu_cache();
 
 	/* dummy custom-scan node */
 	memset(&pgstrom_dummy_path_methods, 0, sizeof(CustomPathMethods));

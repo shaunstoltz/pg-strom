@@ -4,17 +4,11 @@
  * miscellaneous and uncategorized routines but usefull for multiple subsystems
  * of PG-Strom.
  * ----
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2021 (C) PG-Strom Developers Team
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #include "pg_strom.h"
 
@@ -849,12 +843,6 @@ errorText(int errcode)
 			return buffer;
 		}
 	}
-#ifdef WITH_CUFILE
-	else if (errcode > CUFILEOP_BASE_ERR)
-	{
-		return cufileop_status_error((CUfileOpError)errcode);
-	}
-#endif
 	snprintf(buffer, sizeof(buffer),
 			 "%d - unknown", errcode);
 	return buffer;
@@ -1486,8 +1474,7 @@ PG_FUNCTION_INFO_V1(pgstrom_abort_if);
  * write, regardless of i/o-size and signal interrupts.
  */
 ssize_t
-__readFileSignal(int fdesc, void *buffer, size_t nbytes,
-				 bool interruptible)
+__readFile(int fdesc, void *buffer, size_t nbytes)
 {
 	ssize_t		rv, count = 0;
 
@@ -1498,21 +1485,12 @@ __readFileSignal(int fdesc, void *buffer, size_t nbytes,
 		else if (rv == 0)
 			break;
 		else if (errno == EINTR)
-		{
-			if (interruptible)
-				CHECK_FOR_INTERRUPTS();
-		}
+			CHECK_FOR_INTERRUPTS();
 		else
 			return rv;
 	} while (count < nbytes);
 
 	return count;
-}
-
-ssize_t
-__readFile(int fdesc, void *buffer, size_t nbytes)
-{
-	return __readFileSignal(fdesc, buffer, nbytes, true);
 }
 
 ssize_t
@@ -1536,8 +1514,7 @@ __preadFile(int fdesc, void *buffer, size_t nbytes, off_t f_pos)
 }
 
 ssize_t
-__writeFileSignal(int fdesc, const void *buffer, size_t nbytes,
-				  bool interruptible)
+__writeFile(int fdesc, const void *buffer, size_t nbytes)
 {
 	ssize_t		rv, count = 0;
 
@@ -1548,21 +1525,12 @@ __writeFileSignal(int fdesc, const void *buffer, size_t nbytes,
 		else if (rv == 0)
 			break;
 		else if (errno == EINTR)
-		{
-			if (interruptible)
-				CHECK_FOR_INTERRUPTS();
-		}
+			CHECK_FOR_INTERRUPTS();
 		else
 			return rv;
 	} while (count < nbytes);
 
 	return count;
-}
-
-ssize_t
-__writeFile(int fdesc, const void *buffer, size_t nbytes)
-{
-	return __writeFileSignal(fdesc, buffer, nbytes, true);
 }
 
 ssize_t

@@ -3,17 +3,11 @@
  *
  * Collection of CUDA inline functions for device code
  * --
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2021 (C) PG-Strom Developers Team
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #ifndef CUDA_UTILS_H
 #define CUDA_UTILS_H
@@ -435,7 +429,7 @@ pg_sysattr_tableoid_fetch_arrow(kern_context *kcxt,
 /*
  * System attribute reference for GPU memory Store
  */
-#include "cuda_gstore.h"
+#include "cuda_gcache.h"
 
 /*
  * inline functions to form/deform HeapTuple

@@ -3,20 +3,14 @@
  *
  * Core implementation of GPU device code.
  * ----
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2021 (C) PG-Strom Developers Team
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #include "cuda_common.h"
-#include "cuda_gstore.h"
+#include "cuda_gcache.h"
 #include "cuda_postgis.h"
 
 /*
@@ -561,8 +555,9 @@ pgstromStairlikeBinaryCount(int predicate, cl_uint *total_count)
 	cl_int		unit_sz;
 	cl_int		i, j;
 
+	assert(__activemask() == ~0U);
 	w_bitmap = __ballot_sync(__activemask(), predicate);
-	if ((get_local_id() & (warpSize-1)) == 0)
+	if (get_lane_id() == 0)
 		items[warp_id] = __popc(w_bitmap);
 	__syncthreads();
 
@@ -1019,19 +1014,16 @@ kern_get_datum_column(kern_data_store *kds,
 DEVICE_FUNCTION(cl_bool)
 kern_check_visibility_column(kern_context *kcxt,
 							 kern_data_store *kds,
-							 cl_uint rowidx,
-							 GstoreFdwSysattr *p_sysattr)
+							 cl_uint rowidx)
 {
 	kern_parambuf  *kparams = kcxt->kparams;
 	xidvector	   *xvec = (xidvector *)
 		kparam_get_value(kparams, kparams->xactIdVector);
-	GstoreFdwSysattr *sysattr = (GstoreFdwSysattr *)
-		kern_get_datum_column(kds, NULL, kds->ncols-1, rowidx);
+	GpuCacheSysattr *sysattr = (GpuCacheSysattr *)
+		kern_get_datum_column(kds, NULL, kds->nr_colmeta-1, rowidx);
 
 	assert(xvec != NULL);
 	assert(sysattr != NULL);
-	if (p_sysattr != NULL)
-		memcpy(p_sysattr, sysattr, sizeof(GstoreFdwSysattr));
 	if (sysattr->xmin == InvalidTransactionId)
 		return false;
 	if (sysattr->xmin != FrozenTransactionId)
@@ -1912,7 +1904,12 @@ __pg_composite_from_arrow(kern_context *kcxt,
 	{
 		kern_colmeta   *smeta = comp->smeta + j;
 
-		if (smeta->atttypkind == TYPE_KIND__COMPOSITE)
+		if (smeta->atttypkind == TYPE_KIND__NULL)
+		{
+			tup_dclass[j] = DATUM_CLASS__NULL;
+			tup_values[j] = 0;
+		}
+		else if (smeta->atttypkind == TYPE_KIND__COMPOSITE)
 		{
 			pg_composite_t	temp;
 

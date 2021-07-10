@@ -4,17 +4,11 @@
  * Definition of base device types. "BASE" type means ones required by
  * PG-Strom core, or Apache Arrow support.
  * --
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2021 (C) PG-Strom Developers Team
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #ifndef CUDA_BASETYPE_H
 #define CUDA_BASETYPE_H
@@ -876,9 +870,9 @@ PG_SIMPLE_TYPECAST_TEMPLATE(float8,float4,(cl_double))
  */
 __STROMCL_SIMPLE_COMPARE_TEMPLATE(bool,  bool,   bool,   cl_char, ==, eq)
 STROMCL_SIMPLE_COMPARE_TEMPLATE(int1,    int1,   int1,   cl_char)
-STROMCL_SIMPLE_COMPARE_TEMPLATE(int12,   int1,   int1,   cl_short)
-STROMCL_SIMPLE_COMPARE_TEMPLATE(int14,   int1,   int1,   cl_int)
-STROMCL_SIMPLE_COMPARE_TEMPLATE(int18,   int1,   int1,   cl_long)
+STROMCL_SIMPLE_COMPARE_TEMPLATE(int12,   int1,   int2,   cl_short)
+STROMCL_SIMPLE_COMPARE_TEMPLATE(int14,   int1,   int4,   cl_int)
+STROMCL_SIMPLE_COMPARE_TEMPLATE(int18,   int1,   int8,   cl_long)
 STROMCL_SIMPLE_COMPARE_TEMPLATE(int21,   int2,   int1,   cl_short)
 STROMCL_SIMPLE_COMPARE_TEMPLATE(int2,    int2,   int2,   cl_short)
 STROMCL_SIMPLE_COMPARE_TEMPLATE(int24,   int2,   int4,   cl_int)

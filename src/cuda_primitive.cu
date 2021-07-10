@@ -3,17 +3,11 @@
  *
  * Collection of primitive functions for CUDA GPU devices
  * --
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2021 (C) PG-Strom Developers Team
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #include "cuda_common.h"
 #include "cuda_primitive.h"
@@ -233,24 +227,33 @@ __mul_s64_overflow(cl_long a, cl_long b, cl_long *p_result)
 {
 	cl_long		hi, lo;
 
-	asm volatile("mul.lo.s64 %0, %2, %3;\n"
-				 "mul.hi.s64 %1, %2, %3;"
-				 : "=l"(lo), "=l"(hi)
-				 : "l"(a), "l"(b));
-	if (((a ^ b) >> 63) == 0)
+	if (a == 0 || b == 0)
 	{
-		if (hi != 0UL)
-		{
-			printf("gid=%u a=%ld b=%ld hi=%lx lo=%lx\n", get_global_id(), a, b, hi, lo);
-			return true;	/* must be positive */
-		}
+		lo = 0;
 	}
 	else
 	{
-		if (hi != ~0UL)
+		asm volatile("mul.lo.s64 %0, %2, %3;\n"
+					 "mul.hi.s64 %1, %2, %3;"
+					 : "=l"(lo), "=l"(hi)
+					 : "l"(a), "l"(b));
+		if (((a ^ b) >> 63) == 0)
 		{
-			printf("GID=%u a=%ld b=%ld hi=%lx lo=%lx\n", get_global_id(), a, b, hi, lo);
-			return true;	/* must be negative */
+			if (hi != 0UL)
+			{
+				printf("gid=%u a=%ld b=%ld hi=%lx lo=%lx\n",
+					   get_global_id(), a, b, hi, lo);
+				return true;	/* must be positive */
+			}
+		}
+		else
+		{
+			if (hi != ~0UL)
+			{
+				printf("GID=%u a=%ld b=%ld hi=%lx lo=%lx\n",
+					   get_global_id(), a, b, hi, lo);
+				return true;	/* must be negative */
+			}
 		}
 	}
 	*p_result = lo;
@@ -322,7 +325,7 @@ pgfn_int18mul(kern_context *kcxt, pg_int1_t arg1, pg_int8_t arg2)
 }
 
 DEVICE_FUNCTION(pg_int2_t)
-pgfn_int21mul(kern_context *kcxt, pg_int2_t arg1, pg_int2_t arg2)
+pgfn_int21mul(kern_context *kcxt, pg_int2_t arg1, pg_int1_t arg2)
 {
 	pg_int2_t	result;
 
@@ -386,7 +389,7 @@ pgfn_int28mul(kern_context *kcxt, pg_int2_t arg1, pg_int8_t arg2)
 }
 
 DEVICE_FUNCTION(pg_int4_t)
-pgfn_int41mul(kern_context *kcxt, pg_int4_t arg1, pg_int2_t arg2)
+pgfn_int41mul(kern_context *kcxt, pg_int4_t arg1, pg_int1_t arg2)
 {
 	pg_int4_t	result;
 
@@ -435,6 +438,22 @@ pgfn_int4mul(kern_context *kcxt, pg_int4_t arg1, pg_int4_t arg2)
 
 DEVICE_FUNCTION(pg_int8_t)
 pgfn_int48mul(kern_context *kcxt, pg_int4_t arg1, pg_int8_t arg2)
+{
+	pg_int8_t	result;
+
+	result.isnull = arg1.isnull | arg2.isnull;
+	if (!result.isnull && __mul_s64_overflow(arg1.value, arg2.value,
+											 &result.value))
+	{
+		result.isnull = true;
+		STROM_EREPORT(kcxt, ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE,
+					  "bigint out of range");
+	}
+	return result;
+}
+
+DEVICE_FUNCTION(pg_int8_t)
+pgfn_int81mul(kern_context *kcxt, pg_int8_t arg1, pg_int1_t arg2)
 {
 	pg_int8_t	result;
 
@@ -1344,6 +1363,7 @@ pgfn_float8div(kern_context *kcxt, pg_float8_t arg1, pg_float8_t arg2)
 		return result;												\
 	}
 
+BASIC_INT_MODFUNC_TEMPLATE(int1mod, int1)
 BASIC_INT_MODFUNC_TEMPLATE(int2mod, int2)
 BASIC_INT_MODFUNC_TEMPLATE(int4mod, int4)
 BASIC_INT_MODFUNC_TEMPLATE(int8mod, int8)
