@@ -17,12 +17,12 @@ CREATE FUNCTION pgstrom.gpucache_sync_trigger()
 CREATE FUNCTION pgstrom.gpucache_apply_redo(regclass)
   RETURNS bigint
   AS 'MODULE_PATHNAME','pgstrom_gpucache_apply_redo'
-  LANGUAGE C CALLED ON NULL INPUT;
+  LANGUAGE C STRICT;
 
 CREATE FUNCTION pgstrom.gpucache_compaction(regclass)
   RETURNS bigint
   AS 'MODULE_PATHNAME','pgstrom_gpucache_compaction'
-  LANGUAGE C CALLED ON NULL INPUT;
+  LANGUAGE C STRICT;
 
 CREATE TYPE pgstrom.__pgstrom_gpucache_info_t AS (
   database_oid			oid,
@@ -30,6 +30,8 @@ CREATE TYPE pgstrom.__pgstrom_gpucache_info_t AS (
   table_oid				oid,
   table_name            text,
   signature				int8,
+  refcnt				int4,
+  corrupted				bool,
   gpu_main_sz			int8,
   gpu_extra_sz			int8,
   redo_write_ts			timestamptz,
