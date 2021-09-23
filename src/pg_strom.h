@@ -640,9 +640,11 @@ extern CUresult __gpuOptimalBlockSize(int *p_grid_sz,
 /*
  * shmbuf.c
  */
-extern MemoryContext	SharedMemoryContextCreate(const char *name);
-extern void				pgstrom_init_shmbuf(void);
-extern MemoryContext	TopSharedMemoryContext;
+extern void	   *shmbufAlloc(size_t sz);
+extern void	   *shmbufAllocZero(size_t sz);
+extern void		shmbufFree(void *addr);
+extern void		pgstrom_init_shmbuf(void);
+extern MemoryContext TopSharedMemoryContext;
 
 /*
  * gpu_mmgr.c
@@ -820,50 +822,26 @@ extern void pgstrom_init_gpu_context(void);
  */
 #define STROM_TRY() \
 	do { \
-		ErrorContextCallback *saved_context_stack = error_context_stack; \
-		sigjmp_buf *saved_exception_stack = (!GpuWorkerCurrentContext \
-											 ? PG_exception_stack \
-											 : GpuWorkerExceptionStack); \
+		sigjmp_buf *saved_exception_stack = GpuWorkerExceptionStack; \
 		sigjmp_buf	local_sigjmp_buf; \
+		Assert(GpuWorkerCurrentContext != NULL); \
 		if (sigsetjmp(local_sigjmp_buf, 0) == 0) \
 		{ \
-			if (!GpuWorkerCurrentContext)\
-				PG_exception_stack = &local_sigjmp_buf; \
-			else \
-				GpuWorkerExceptionStack = &local_sigjmp_buf;
+			GpuWorkerExceptionStack = &local_sigjmp_buf;
 
 #define STROM_CATCH() \
 		} \
 		else \
 		{ \
-			if (!GpuWorkerCurrentContext) \
-			{ \
-				PG_exception_stack = saved_exception_stack;	\
-				error_context_stack = saved_context_stack;	\
-			} \
-			else \
-				GpuWorkerExceptionStack = saved_exception_stack
+			GpuWorkerExceptionStack = saved_exception_stack
 
-#define STROM_END_TRY()\
+#define STROM_END_TRY() \
 		} \
-		if (!GpuWorkerCurrentContext) \
-		{ \
-			PG_exception_stack = saved_exception_stack; \
-			error_context_stack = saved_context_stack; \
-		} \
-		else \
-		{ \
-			 GpuWorkerExceptionStack = saved_exception_stack; \
-		} \
+		GpuWorkerExceptionStack = saved_exception_stack;	\
 	} while(0)
 
 #define STROM_RE_THROW() \
-	do { \
-		if (!GpuWorkerCurrentContext) \
-			PG_RE_THROW(); \
-		else \
-			siglongjmp(*GpuWorkerExceptionStack, 1); \
-	} while(0)
+	siglongjmp(*GpuWorkerExceptionStack, 1)
 
 #define STROM_REPORT_ERROR(elevel,elabel,fmt,...)						\
 	do {																\
@@ -1255,6 +1233,7 @@ extern void gpujoinUpdateRunTimeStat(GpuTaskState *gts,
 /*
  * gpupreagg.c
  */
+extern int	pgstrom_hll_register_bits;
 extern bool pgstrom_path_is_gpupreagg(const Path *pathnode);
 extern bool pgstrom_plan_is_gpupreagg(const Plan *plan);
 extern bool pgstrom_planstate_is_gpupreagg(const PlanState *ps);
@@ -1440,9 +1419,6 @@ extern bool	gpu_path_remember(PlannerInfo *root,
 							  bool inner_parallel,
 							  const Path *gpu_path);
 
-extern Path *pgstrom_create_dummy_path(PlannerInfo *root,
-									   Path *subpath,
-									   PathTarget *target);
 extern void _PG_init(void);
 extern const char *pgstrom_strerror(cl_int errcode);
 
@@ -1981,32 +1957,5 @@ pthreadCondSignal(pthread_cond_t *cond)
 	  (double)(tv2.tv_usec - tv1.tv_usec)) / 1000.0)
 #define TP_DIFF(tp2,tp1)						\
 	((tp2.tv_sec - tp1.tv_sec) * 1000000000UL +	(tp2.tv_nsec - tp1.tv_nsec))
-
-/*
- * simple wrapper for permission checks
- */
-static inline void
-strom_proc_aclcheck(Oid func_oid, Oid user_id, AclMode mode)
-{
-	aclcheck_error(pg_proc_aclcheck(func_oid, user_id, mode),
-#if PG_VERSION_NUM < 110000
-				   ACL_KIND_PROC,
-#else
-				   OBJECT_FUNCTION,
-#endif
-				   format_procedure(func_oid));
-}
-
-static inline void
-strom_foreign_table_aclcheck(Oid ftable_oid, Oid user_id, AclMode mode)
-{
-	aclcheck_error(pg_class_aclcheck(ftable_oid, user_id, mode),
-#if PG_VERSION_NUM < 110000
-				   ACL_KIND_CLASS,
-#else
-				   OBJECT_FOREIGN_TABLE,
-#endif
-				   get_rel_name(ftable_oid));
-}
 
 #endif	/* PG_STROM_H */

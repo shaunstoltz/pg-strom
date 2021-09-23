@@ -705,14 +705,16 @@ __atoi128(const char *tok, bool *p_isnull)
 	{
 		ival = 10 * ival + (*tok - '0');
 		tok++;
-		if (is_minus && ival != 0)
-		{
-			ival = -ival;
-			is_minus = false;
-		}
 	}
-	if (is_minus || *tok != '\0')
+
+	if (*tok != '\0')
 		*p_isnull = true;
+	if (is_minus)
+	{
+		if (ival == 0)
+			*p_isnull = true;
+		ival = -ival;
+	}
 	return ival;
 }
 
@@ -1159,7 +1161,7 @@ __buildArrowStatsOper(arrowStatsHint *arange,
 		arange->eval_quals = lappend(arange->eval_quals, expr);
 	}
 	else if (strategy == BTGreaterEqualStrategyNumber ||
-		strategy == BTGreaterStrategyNumber)
+			 strategy == BTGreaterStrategyNumber)
 	{
 		/* (VAR >= ARG) --> (Max >= ARG) */
 		/* (VAR > ARG) --> (Max > ARG) */
@@ -1304,8 +1306,21 @@ __fetchArrowStatsDatum(RecordBatchFieldState *fstate,
 			break;
 		case NUMERICOID:
 			{
-				return 0;
+				Int128_t	decimal;
+				int			dscale = fstate->attopts.decimal.scale;
+				char	   *result = palloc0(sizeof(struct NumericData));
+
+				decimal.ival = sval->i128;
+				while (dscale > 0 && decimal.ival % 10 == 0)
+				{
+					decimal.ival /= 10;
+					dscale--;
+				}
+				pg_numeric_to_varlena(result, dscale, decimal);
+
+				datum = PointerGetDatum(result);
 			}
+			break;
 		case DATEOID:
 			shift = POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE;
 			switch (fstate->attopts.date.unit)
