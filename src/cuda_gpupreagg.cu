@@ -1386,12 +1386,11 @@ restart:
 	l_hitems[curr].hash  = hash;
 	l_hitems[curr].next  = next;
 
-	l_dclass += GPUPREAGG_NUM_ACCUM_VALUES * curr;
-	l_values += GPUPREAGG_NUM_ACCUM_VALUES * curr;
 	if (l_extras)
 		l_extras += GPUPREAGG_ACCUM_EXTRA_BUFSZ * curr;
-	gpupreagg_init_local_slot(l_dclass, l_values, l_extras);
-
+	gpupreagg_init_local_slot(l_dclass + GPUPREAGG_NUM_ACCUM_VALUES * curr,
+							  l_values + GPUPREAGG_NUM_ACCUM_VALUES * curr,
+							  l_extras);
 	/*
 	 * __threadfence_block() makes above updates visible to other concurent
 	 * threads within this block.
@@ -1401,8 +1400,8 @@ restart:
 	atomicExch(&l_htable->l_hslots[hindex], curr);
 found:
 	/* Runs global-to-local reduction */
-	gpupreagg_update_atomic(l_dclass,
-							l_values,
+	gpupreagg_update_atomic(l_dclass + GPUPREAGG_NUM_ACCUM_VALUES * curr,
+							l_values + GPUPREAGG_NUM_ACCUM_VALUES * curr,
 							GPUPREAGG_ACCUM_MAP_LOCAL,
 							KERN_DATA_STORE_DCLASS(kds_slot, index),
 							KERN_DATA_STORE_VALUES(kds_slot, index),
@@ -1595,9 +1594,9 @@ gpupreagg_groupby_reduction(kern_context *kcxt,
  * aggcalc operations for hyper-log-log
  */
 DEVICE_FUNCTION(void)
-aggcalc_init_hll_pcount(cl_char *p_accum_dclass,
-                        Datum   *p_accum_datum,
-                        char    *extra_pos)
+aggcalc_init_hll_sketch(cl_char *p_accum_dclass,
+						Datum   *p_accum_datum,
+						char    *extra_pos)
 {
 	cl_uint		sz = VARHDRSZ + (1U << GPUPREAGG_HLL_REGISTER_BITS);
 
@@ -1608,9 +1607,9 @@ aggcalc_init_hll_pcount(cl_char *p_accum_dclass,
 }
 
 DEVICE_FUNCTION(void)
-aggcalc_shuffle_hll_pcount(cl_char *p_accum_dclass,
-                           Datum   *p_accum_datum,
-                           int      lane_id)
+aggcalc_shuffle_hll_sketch(cl_char *p_accum_dclass,
+						   Datum   *p_accum_datum,
+						   int      lane_id)
 {
 	cl_char		my_dclass;
 	cl_char		buddy_dclass;
@@ -1663,10 +1662,10 @@ aggcalc_shuffle_hll_pcount(cl_char *p_accum_dclass,
 }
 
 DEVICE_FUNCTION(void)
-aggcalc_normal_hll_pcount(cl_char *p_accum_dclass,
-                          Datum   *p_accum_datum,
-                          cl_char  newval_dclass,
-                          Datum    newval_datum)	/* = int8 hash */
+aggcalc_normal_hll_sketch(cl_char *p_accum_dclass,
+						  Datum   *p_accum_datum,
+						  cl_char  newval_dclass,
+						  Datum    newval_datum)	/* = int8 hash */
 {
 	cl_uint		nrooms = (1U << GPUPREAGG_HLL_REGISTER_BITS);
 	cl_uint		index;
@@ -1688,10 +1687,10 @@ aggcalc_normal_hll_pcount(cl_char *p_accum_dclass,
 }
 
 DEVICE_FUNCTION(void)
-aggcalc_merge_hll_pcount(cl_char *p_accum_dclass,
+aggcalc_merge_hll_sketch(cl_char *p_accum_dclass,
 						 Datum   *p_accum_datum,
 						 cl_char  newval_dclass,
-						 Datum    newval_datum)		/* =bytea hll-registers */
+						 Datum    newval_datum)		/* =bytea sketch */
 {
 	if (newval_dclass != DATUM_CLASS__NULL)
 	{
@@ -1734,7 +1733,7 @@ aggcalc_merge_hll_pcount(cl_char *p_accum_dclass,
 }
 
 DEVICE_FUNCTION(void)
-aggcalc_update_hll_pcount(cl_char *p_accum_dclass,
+aggcalc_update_hll_sketch(cl_char *p_accum_dclass,
 						  Datum   *p_accum_datum,
 						  cl_char  newval_dclass,
 						  Datum    newval_datum)	/* =int8 hash */
