@@ -1100,56 +1100,7 @@ gpujoin_exec_hashjoin(kern_context *kcxt,
 	return depth+1;
 }
 
-/*
- * GiST index specific structures and labels
- */
-#define F_LEAF				(1 << 0)	/* leaf page */
-#define F_DELETED			(1 << 1)	/* the page has been deleted */
-#define F_TUPLES_DELETED	(1 << 2)	/* some tuples on the page were deleted */
-#define F_FOLLOW_RIGHT		(1 << 3)	/* page to the right has no downlink */
-#define F_HAS_GARBAGE		(1 << 4)	/* some tuples on the page are dead */
-
-#define GIST_PAGE_ID		0xFF81
-
-typedef struct GISTPageOpaqueData
-{
-	struct {
-		cl_uint		xlogid;
-		cl_uint		xrecoff;
-	} nsn;
-	BlockNumber	rightlink;		/* next page if any */
-	cl_ushort		flags;			/* see bit definitions above */
-	cl_ushort		gist_page_id;	/* for identification of GiST indexes */
-} GISTPageOpaqueData;
-
-STATIC_INLINE(GISTPageOpaqueData *)
-GistPageGetOpaque(PageHeaderData *page)
-{
-	return (GISTPageOpaqueData *)((char *)page + page->pd_special);
-}
-
-STATIC_INLINE(cl_bool)
-GistPageIsLeaf(PageHeaderData *page)
-{
-	return (GistPageGetOpaque(page)->flags & F_LEAF) != 0;
-}
-
-STATIC_INLINE(cl_bool)
-GistPageIsDeleted(PageHeaderData *page)
-{
-	return (GistPageGetOpaque(page)->flags & F_DELETED) != 0;
-}
-
-STATIC_INLINE(cl_bool)
-GistFollowRight(PageHeaderData *page)
-{
-	return (GistPageGetOpaque(page)->flags & F_FOLLOW_RIGHT) != 0;
-}
-
-/* root page of a gist index */
-#define GIST_ROOT_BLKNO			0
-
-#include "cuda_postgis.h"
+//#include "cuda_postgis.h"
 
 /*
  * gpujoin_prep_gistindex
@@ -1284,7 +1235,9 @@ restart:
 		itup = (IndexTupleData *) PageGetItem(gist_page, lpp);
 
 		kcxt->vlpos = vlpos_saved;		/* rewind */
-		rv = gpujoin_gist_index_quals(kcxt, depth, kds_gist, itup, gist_keys);
+		rv = gpujoin_gist_index_quals(kcxt, depth,
+									  kds_gist, gist_page,
+									  itup, gist_keys);
 		if (rv)
 			break;
 	}
@@ -1620,8 +1573,11 @@ bailout:
 }
 
 #define PSTACK_DEPTH(d)											\
-	((d) >= 0 && (d) <= kgjoin->num_rels ?						\
-	 (cl_uint *)(pstack_base + pstack->ps_offset[(d)]): NULL)
+	((d) >= 0 && (d) <= kgjoin->num_rels						\
+	 ? (cl_uint *)((char *)pstack + pstack->ps_headsz +			\
+				   get_group_id() * pstack->ps_unitsz +			\
+				   pstack->ps_offset[(d)])						\
+	 : NULL)
 
 /*
  * gpujoin_main
@@ -1637,10 +1593,9 @@ gpujoin_main(kern_context *kcxt,
 			 cl_uint *l_state,
 			 cl_bool *matched)
 {
+	gpujoinPseudoStack *pstack = kgjoin->pstack;
 	cl_int			max_depth = kgjoin->num_rels;
 	cl_int			depth;
-	gpujoinPseudoStack *pstack;
-	char		   *pstack_base;
 	__shared__ cl_int depth_thread0 __attribute__((unused));
 
 	assert(kds_src->format == KDS_FORMAT_ROW ||
@@ -1649,11 +1604,6 @@ gpujoin_main(kern_context *kcxt,
 		   kds_src->format == KDS_FORMAT_COLUMN);
 	assert((kds_dst->format == KDS_FORMAT_ROW  && kparams_gpreagg == NULL) ||
 		   (kds_dst->format == KDS_FORMAT_SLOT && kparams_gpreagg != NULL));
-
-	/* setup private variables */
-	pstack = (gpujoinPseudoStack *)kparam_get_value(kcxt->kparams, 0);
-	pstack_base = ((char *)kgjoin + kgjoin->pstack_offset +
-				   get_group_id() * pstack->ps_unitsz);
 
 	/* init per-depth context */
 	if (get_local_id() == 0)
@@ -1830,19 +1780,14 @@ gpujoin_right_outer(kern_context *kcxt,
 					cl_uint *l_state,
 					cl_bool *matched)
 {
+	gpujoinPseudoStack *pstack = kgjoin->pstack;
 	cl_int			max_depth = kgjoin->num_rels;
 	cl_int			depth;
-	gpujoinPseudoStack *pstack;
-	char		   *pstack_base;
 	__shared__ cl_int depth_thread0 __attribute__((unused));
 
 	assert(KERN_MULTIRELS_RIGHT_OUTER_JOIN(kmrels, outer_depth));
 	assert((kds_dst->format == KDS_FORMAT_ROW  && kparams_gpreagg == NULL) ||
 		   (kds_dst->format == KDS_FORMAT_SLOT && kparams_gpreagg != NULL));
-	/* setup private variables */
-	pstack = (gpujoinPseudoStack *)kparam_get_value(kcxt->kparams, 0);
-	pstack_base = ((char *)kgjoin + kgjoin->pstack_offset +
-				   get_group_id() * pstack->ps_unitsz);
 
 	/* setup per-depth context */
 	memset(l_state, 0, sizeof(l_state));

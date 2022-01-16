@@ -196,7 +196,6 @@ static size_t			arrow_metadata_cache_size;
 static int				arrow_record_batch_size_kb;		/* GUC */
 
 /* ---------- static functions ---------- */
-static bool		arrowTypeIsEqual(ArrowField *a, ArrowField *b, int depth);
 static Oid		arrowTypeToPGTypeOid(ArrowField *field, int *typmod);
 static const char *arrowTypeToPGTypeName(ArrowField *field);
 static size_t	arrowFieldLength(ArrowField *field, int64 nitems);
@@ -339,7 +338,7 @@ ArrowGetForeignRelSize(PlannerInfo *root,
 	ListCell	   *lc;
 	int				parallel_nworkers;
 	bool			writable;
-	int				optimal_gpu = INT_MAX;
+	Bitmapset	   *optimal_gpus = (void *)(~0UL);
 	int				j, k;
 
 	/* columns to be fetched */
@@ -360,6 +359,7 @@ ArrowGetForeignRelSize(PlannerInfo *root,
 		File		fdesc;
 		List	   *rb_cached;
 		ListCell   *cell;
+		Bitmapset  *__gpus;
 		size_t		len = 0;
 
 		fdesc = PathNameOpenFile(fname, O_RDONLY | PG_BINARY);
@@ -370,11 +370,13 @@ ArrowGetForeignRelSize(PlannerInfo *root,
 			elog(ERROR, "failed to open file '%s' on behalf of '%s'",
 				 fname, get_rel_name(foreigntableid));
 		}
-		k = GetOptimalGpuForFile(fdesc);
-		if (optimal_gpu == INT_MAX)
-			optimal_gpu = k;
-		else if (optimal_gpu != k)
-			optimal_gpu = -1;
+		/* lookup optimal GPUs */
+		__gpus = extraSysfsLookupOptimalGpus(fdesc);
+		if (optimal_gpus == (void *)(~0UL))
+			optimal_gpus = __gpus;
+		else
+			optimal_gpus = bms_intersect(optimal_gpus, __gpus);
+		/* lookup or build metadata cache */
 		rb_cached = arrowLookupOrBuildMetadataCache(fdesc, NULL);
 		foreach (cell, rb_cached)
 		{
@@ -407,13 +409,12 @@ ArrowGetForeignRelSize(PlannerInfo *root,
 	}
 	bms_free(referenced);
 
-	if (optimal_gpu < 0 || optimal_gpu >= numDevAttrs)
-		optimal_gpu = -1;
-	else if (filesSizeTotal < pgstrom_gpudirect_threshold())
-		optimal_gpu = -1;
+	if (optimal_gpus == (void *)(~0UL) ||
+		filesSizeTotal < pgstrom_gpudirect_threshold())
+		optimal_gpus = NULL;
 
 	baserel->rel_parallel_workers = parallel_nworkers;
-	baserel->fdw_private = makeInteger(optimal_gpu);
+	baserel->fdw_private = list_make1(optimal_gpus);
 	baserel->pages = npages;
 	baserel->tuples = ntuples;
 	baserel->rows = ntuples *
@@ -425,20 +426,20 @@ ArrowGetForeignRelSize(PlannerInfo *root,
 }
 
 /*
- * GetOptimalGpuForArrowFdw
+ * GetOptimalGpusForArrowFdw
  *
- * optimal GPU index is saved at baserel->fdw_private
+ * optimal GPUs bitmap is saved at baserel->fdw_private
  */
-cl_int
-GetOptimalGpuForArrowFdw(PlannerInfo *root, RelOptInfo *baserel)
+Bitmapset *
+GetOptimalGpusForArrowFdw(PlannerInfo *root, RelOptInfo *baserel)
 {
-	if (!baserel->fdw_private)
+	if (baserel->fdw_private == NIL)
 	{
 		RangeTblEntry *rte = root->simple_rte_array[baserel->relid];
 
 		ArrowGetForeignRelSize(root, baserel, rte->relid);
 	}
-	return intVal(baserel->fdw_private);
+	return linitial(baserel->fdw_private);
 }
 
 static void
@@ -1677,6 +1678,14 @@ makeRecordBatchState(ArrowSchema *schema,
 	RecordBatchState *result;
 	int			j, ncols = schema->_num_fields;
 
+	/*
+	 * Right now, we have no support for compressed RecordBatches
+	 */
+	if (rbatch->compression)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("arrow_fdw: compressed record-batches are not supported")));
+	
 	result = palloc0(offsetof(RecordBatchState, columns[ncols]));
 	result->ncols = ncols;
 	result->rb_offset = block->offset + block->metaDataLength;
@@ -2128,7 +2137,7 @@ __arrowFdwLoadRecordBatch(RecordBatchState *rb_state,
 						  Bitmapset *referenced,
 						  GpuContext *gcontext,
 						  MemoryContext mcontext,
-						  int optimal_gpu)
+						  const Bitmapset *optimal_gpus)
 {
 	TupleDesc			tupdesc = RelationGetDescr(relation);
 	pgstrom_data_store *pds;
@@ -2155,7 +2164,7 @@ __arrowFdwLoadRecordBatch(RecordBatchState *rb_state,
 	 * PDS on host-pinned memory, with strom_io_vector.
 	 */
 	if (gcontext &&
-		gcontext->cuda_dindex == optimal_gpu &&
+		bms_is_member(gcontext->cuda_dindex, optimal_gpus) &&
 		iovec->nr_chunks > 0 &&
 		kds->length <= gpuMemAllocIOMapMaxLength() &&
 		rb_state->dfile != NULL)
@@ -2208,7 +2217,7 @@ arrowFdwLoadRecordBatch(ArrowFdwState *af_state,
 						Relation relation,
 						EState *estate,
 						GpuContext *gcontext,
-						int optimal_gpu)
+						const Bitmapset *optimal_gpus)
 {
 	RecordBatchState *rb_state;
 	uint32		rb_index;
@@ -2235,7 +2244,7 @@ retry:
 									 af_state->referenced,
 									 gcontext,
 									 estate->es_query_cxt,
-									 optimal_gpu);
+									 optimal_gpus);
 }
 
 /*
@@ -2251,7 +2260,7 @@ ExecScanChunkArrowFdw(GpuTaskState *gts)
 								  gts->css.ss.ss_currentRelation,
 								  gts->css.ss.ps.state,
 								  gts->gcontext,
-								  gts->optimal_gpu);
+								  gts->optimal_gpus);
 	InstrStopNode(&gts->outer_instrument,
 				  !pds ? 0.0 : (double)pds->kds.nitems);
 	return pds;
@@ -2280,7 +2289,8 @@ ArrowIterateForeignScan(ForeignScanState *node)
 		af_state->curr_pds = arrowFdwLoadRecordBatch(af_state,
 													 relation,
 													 estate,
-													 NULL, -1);
+													 NULL,
+													 NULL);
 		if (!af_state->curr_pds)
 			return NULL;
 	}
@@ -2561,7 +2571,7 @@ RecordBatchAcquireSampleRows(Relation relation,
 									referenced,
 									NULL,
 									CurrentMemoryContext,
-									-1);
+									NULL);
 	values = alloca(sizeof(Datum) * tupdesc->natts);
 	isnull = alloca(sizeof(bool)  * tupdesc->natts);
 	for (count = 0; count < nsamples; count++)
@@ -2762,14 +2772,12 @@ ArrowImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 
 			if (schema.endianness != stemp->endianness ||
 				schema._num_fields != stemp->_num_fields)
-				elog(ERROR, "file '%s' has incompatible schema definition",
-					 fname);
+				elog(ERROR, "file '%s' has incompatible schema definition", fname);
 			for (j=0; j < schema._num_fields; j++)
 			{
-				if (arrowTypeIsEqual(&schema.fields[j],
-									 &stemp->fields[j], 0))
-					elog(ERROR, "file '%s' has incompatible schema definition",
-						 fname);
+				if (arrowFieldTypeIsEqual(&schema.fields[j],
+										  &stemp->fields[j]))
+					elog(ERROR, "file '%s' has incompatible schema definition", fname);
 			}
 		}
 	}
@@ -3378,95 +3386,8 @@ pgstrom_arrow_fdw_handler(PG_FUNCTION_ARGS)
 PG_FUNCTION_INFO_V1(pgstrom_arrow_fdw_handler);
 
 /*
- * arrowTypeIsEqual
+ * arrowFieldGetPGTypeHint
  */
-static bool
-arrowTypeIsEqual(ArrowField *a, ArrowField *b, int depth)
-{
-	int		j;
-
-	if (a->type.node.tag != b->type.node.tag)
-		return false;
-	switch (a->type.node.tag)
-	{
-		case ArrowNodeTag__Int:
-			if (a->type.Int.bitWidth != b->type.Int.bitWidth)
-				return false;
-			break;
-		case ArrowNodeTag__FloatingPoint:
-			{
-				ArrowPrecision	p1 = a->type.FloatingPoint.precision;
-				ArrowPrecision	p2 = b->type.FloatingPoint.precision;
-
-				if (p1 != p2)
-					return false;
-			}
-			break;
-		case ArrowNodeTag__Utf8:
-		case ArrowNodeTag__Binary:
-		case ArrowNodeTag__Bool:
-			break;
-
-		case ArrowNodeTag__Decimal:
-			if (a->type.Decimal.precision != b->type.Decimal.precision ||
-				a->type.Decimal.scale != b->type.Decimal.scale)
-				return false;
-			break;
-
-		case ArrowNodeTag__Date:
-			if (a->type.Date.unit != b->type.Date.unit)
-				return false;
-			break;
-
-		case ArrowNodeTag__Time:
-			if (a->type.Time.unit != b->type.Time.unit)
-				return false;
-			break;
-
-		case ArrowNodeTag__Timestamp:
-			if (a->type.Timestamp.unit != b->type.Timestamp.unit ||
-				a->type.Timestamp.timezone != NULL ||
-				b->type.Timestamp.timezone != NULL)
-				return false;
-			break;
-
-		case ArrowNodeTag__Interval:
-			if (a->type.Interval.unit != b->type.Interval.unit)
-				return false;
-			break;
-
-		case ArrowNodeTag__Struct:
-			if (depth > 0)
-				elog(ERROR, "arrow: nested composite types are not supported");
-			if (a->_num_children != b->_num_children)
-				return false;
-			for (j=0; j < a->_num_children; j++)
-			{
-				if (!arrowTypeIsEqual(&a->children[j],
-									  &b->children[j],
-									  depth + 1))
-					return false;
-			}
-			break;
-
-		case ArrowNodeTag__List:
-			if (depth > 0)
-				elog(ERROR, "arrow_fdw: nested array types are not supported");
-			if (a->_num_children != 1 || b->_num_children != 1)
-				elog(ERROR, "Bug? List of arrow type is corrupted.");
-			if (!arrowTypeIsEqual(&a->children[0],
-								  &b->children[0],
-								  depth + 1))
-				return false;
-			break;
-
-		default:
-			elog(ERROR, "'%s' of arrow type is not supported",
-				 a->type.node.tagName);
-	}
-	return true;
-}
-
 static Oid
 arrowFieldGetPGTypeHint(ArrowField *field)
 {
@@ -3626,7 +3547,9 @@ arrowTypeToPGTypeOid(ArrowField *field, int *p_type_mod)
 		case ArrowNodeTag__Bool:
 			return BOOLOID;
 		case ArrowNodeTag__Decimal:
-			return NUMERICOID;
+			if (t->Decimal.bitWidth == 128)
+				return NUMERICOID;
+			break;
 		case ArrowNodeTag__Date:
 			return DATEOID;
 		case ArrowNodeTag__Time:

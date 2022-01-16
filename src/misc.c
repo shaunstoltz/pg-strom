@@ -43,6 +43,33 @@ make_flat_ands_explicit(List *andclauses)
 }
 
 /*
+ * fixup_varnode_to_origin
+ */
+Node *
+fixup_varnode_to_origin(Node *node, List *cscan_tlist)
+{
+	if (!node)
+		return NULL;
+	if (IsA(node, Var))
+	{
+		Var	   *varnode = (Var *)node;
+		TargetEntry *tle;
+
+		if (cscan_tlist != NIL)
+		{
+			Assert(varnode->varno == INDEX_VAR);
+			Assert(varnode->varattno >= 1 &&
+				   varnode->varattno <= list_length(cscan_tlist));
+			tle = list_nth(cscan_tlist, varnode->varattno - 1);
+			return (Node *)copyObject(tle->expr);
+		}
+		Assert(!IS_SPECIAL_VARNO(varnode->varno));
+	}
+	return expression_tree_mutator(node, fixup_varnode_to_origin,
+								   (void *)cscan_tlist);
+}
+
+/*
  * find_appinfos_by_relids_nofail
  *
  * It is almost equivalent to find_appinfos_by_relids(), but ignores
@@ -378,6 +405,37 @@ bms_to_cstring(Bitmapset *bms)
 	appendStringInfo(&buf, " }");
 
 	return buf.data;
+}
+
+/*
+ * Bitmapset <-> numeric List transition
+ */
+List *
+bms_to_pglist(const Bitmapset *bms)
+{
+	List   *pglist = NIL;
+	int		k;
+
+	for (k = bms_next_member(bms, -1);
+		 k >= 0;
+		 k = bms_next_member(bms, k))
+	{
+		pglist = lappend_int(pglist, k);
+	}
+	return pglist;
+}
+
+Bitmapset *
+bms_from_pglist(List *pglist)
+{
+	Bitmapset  *bms = NULL;
+	ListCell   *lc;
+
+	foreach (lc, pglist)
+	{
+		bms = bms_add_member(bms, lfirst_int(lc));
+	}
+	return bms;
 }
 
 /*

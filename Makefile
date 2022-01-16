@@ -18,7 +18,7 @@ include $(STROM_BUILD_ROOT)/Makefile.cuda
 #
 # PG-Strom version
 #
-PGSTROM_VERSION := 3.2
+PGSTROM_VERSION := 3.3
 PGSTROM_RELEASE := devel
 
 #
@@ -85,6 +85,14 @@ __SSBM_SQL_FILES = ssbm-11.sql ssbm-12.sql ssbm-13.sql \
                    ssbm-21.sql ssbm-22.sql ssbm-23.sql \
                    ssbm-31.sql ssbm-32.sql ssbm-33.sql ssbm-34.sql \
                    ssbm-41.sql ssbm-42.sql ssbm-43.sql
+
+#
+# Apache Arrow utilities
+#
+ARROW_BUILD_ROOT = $(STROM_BUILD_ROOT)/arrow-tools
+PG2ARROW     = $(ARROW_BUILD_ROOT)/pg2arrow
+MYSQL2ARROW  = $(ARROW_BUILD_ROOT)/mysql2arrow
+PCAP2ARROW   = $(ARROW_BUILD_ROOT)/pcap2arrow
 
 #
 # Markdown (document) files
@@ -200,7 +208,7 @@ REGRESS_OPTS = --inputdir=$(STROM_BUILD_ROOT)/test/$(MAJORVERSION) \
                --load-extension=plpython3u \
                --launcher="env PGDATABASE=$(REGRESS_DBNAME) PATH=$(shell dirname $(SSBM_DBGEN)):$$PATH PGAPPNAME=$(REGRESS_REVISION)" \
                $(shell test "`$(PSQL) -At -c $(REGRESS_REVISION_QUERY) $(REGRESS_DBNAME)`" = "t" && echo "--use-existing")
-REGRESS_PREP = $(SSBM_DBGEN) $(REGRESS_INIT_SQL)
+REGRESS_PREP = $(SSBM_DBGEN) $(PG2ARROW) $(REGRESS_INIT_SQL)
 
 #
 # Build chain of PostgreSQL
@@ -276,6 +284,24 @@ $(SSBM_DBGEN_DISTS_DSS): $(basename $(SSBM_DBGEN_DISTS_DSS))
 	  echo ";") > $@
 
 #
+# Arrow utilities
+#
+$(PG2ARROW):
+	make -C $(ARROW_BUILD_ROOT) pg2arrow
+
+pg2arrow: $(PG2ARROW)
+
+$(MYSQL2ARROW):
+	make -C $(ARROW_BUILD_ROOT) mysql2arrow
+
+mysql2arrow: $(MYSQL2ARROW)
+
+$(PCAP2ARROW):
+	make -C $(ARROW_BUILD_ROOT) pcap2arrow
+
+pcap2arrow: $(PCAP2ARROW)
+
+#
 # Tarball
 #
 tarball:
@@ -340,6 +366,17 @@ rpm-pcap2arrow: tarball
 	    > $(__SPECDIR)/pcap2arrow.spec
 	rpmbuild -ba $(__SPECDIR)/pcap2arrow.spec --undefine=_debugsource_packages
 
-rpm-arrow: rpm-pg2arrow rpm-mysql2arrow rpm-pcap2arrow
+rpm-arrow2csv: tarball
+	cp -f $(STROM_TGZ) $(__SOURCEDIR) || exit 1
+	(git show --format=raw $(PGSTROM_GITHASH):$(STROM_BUILD_ROOT)/files/pcap2arrow.spec.in; \
+	 git show --format=raw $(PGSTROM_GITHASH):$(STROM_BUILD_ROOT)/CHANGELOG) | \
+	sed -e "s/@@STROM_VERSION@@/$(PGSTROM_VERSION)/g"   \
+	    -e "s/@@STROM_RELEASE@@/$(PGSTROM_RELEASE)/g"   \
+	    -e "s/@@STROM_TARBALL@@/$(__STROM_TGZ)/g"       \
+	    -e "s/@@PGSTROM_GITHASH@@/$(PGSTROM_GITHASH)/g" \
+	    > $(__SPECDIR)/arrow2csv.spec
+	rpmbuild -ba $(__SPECDIR)/arrow2csv.spec --undefine=_debugsource_packages
+
+rpm-arrow: rpm-pg2arrow rpm-mysql2arrow rpm-pcap2arrow rpm-arrow2csv
 
 .PHONY: docs

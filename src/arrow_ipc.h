@@ -53,8 +53,14 @@ typedef unsigned int	Oid;
 typedef PG_INT128_TYPE			int128_t;
 typedef unsigned PG_INT128_TYPE	uint128_t;
 #else
+#ifndef HAVE_INT128_T
+#define HAVE_INT128_T 1
 typedef __int128				int128_t;
+#endif
+#ifndef HAVE_UINT128_T
+#define HAVE_UINT128_T 1
 typedef unsigned __int128		uint128_t;
+#endif
 #endif
 
 typedef struct SQLbuffer		SQLbuffer;
@@ -66,6 +72,7 @@ typedef union  SQLstat__datum	SQLstat__datum;
 typedef union  SQLtype			SQLtype;
 typedef struct SQLtype__pgsql	SQLtype__pgsql;
 typedef struct SQLtype__mysql	SQLtype__mysql;
+typedef struct SQLtype__fluent	SQLtype__fluent;
 
 struct SQLbuffer
 {
@@ -91,10 +98,17 @@ struct SQLtype__mysql
 	int			typeid;
 };
 
+struct SQLtype__fluent
+{
+	bool		ts_column;		/* source is 'ts' (timestamp) */
+	bool		tag_column;		/* source is 'tag' (string) */
+};
+
 union SQLtype
 {
 	SQLtype__pgsql	pgsql;
 	SQLtype__mysql	mysql;
+	SQLtype__fluent	fluent;
 };
 
 union SQLstat__datum
@@ -108,6 +122,8 @@ union SQLstat__datum
 	int64_t			i64;
 	int64_t			u64;
 	int128_t		i128;
+	float			f32;
+	double			f64;
 };
 
 struct SQLstat
@@ -226,6 +242,7 @@ extern void		__initArrowNode(ArrowNode *node, ArrowNodeTag tag);
 extern char	   *dumpArrowNode(ArrowNode *node);
 extern void		copyArrowNode(ArrowNode *dest, const ArrowNode *src);
 extern void		readArrowFileDesc(int fdesc, ArrowFileInfo *af_info);
+extern bool		arrowFieldTypeIsEqual(ArrowField *a, ArrowField *b);
 extern const char *arrowNodeName(ArrowNode *node);
 
 /* arrow_pgsql.c */
@@ -248,6 +265,7 @@ extern int		assignArrowTypePgSQL(SQLfield *column,
 /*
  * Error messages, and misc definitions for pg2arrow
  */
+#ifndef Elog
 #ifdef __PGSTROM_MODULE__
 #define Elog(fmt, ...)			elog(ERROR,(fmt),##__VA_ARGS__)
 #else /* __PGSTROM_MODULE__ */
@@ -257,7 +275,8 @@ extern int		assignArrowTypePgSQL(SQLfield *column,
 				__FILE__,__LINE__, ##__VA_ARGS__);	\
 		exit(1);									\
 	} while(0)
-#endif /* __PGSTROM_MODULE__ */
+#endif	/* __PGSTROM_MODULE__ */
+#endif	/* Elog() */
 
 /*
  * SQLbuffer related routines
@@ -274,6 +293,31 @@ sql_buffer_init(SQLbuffer *buf)
 	buf->data = NULL;
 	buf->usage = 0;
 	buf->length = 0;
+}
+
+/* nullmap + values */
+static inline size_t
+__buffer_usage_inline_type(SQLfield *column)
+{
+	size_t		usage;
+
+	usage = ARROWALIGN(column->values.usage);
+	if (column->nullcount > 0)
+		usage += ARROWALIGN(column->nullmap.usage);
+	return usage;
+}
+
+/* nullmap + index + values */
+static inline size_t
+__buffer_usage_varlena_type(SQLfield *column)
+{
+	size_t		usage;
+
+	usage = (ARROWALIGN(column->values.usage) +
+			 ARROWALIGN(column->extra.usage));
+	if (column->nullcount > 0)
+		usage += ARROWALIGN(column->nullmap.usage);
+	return usage;
 }
 
 static inline void

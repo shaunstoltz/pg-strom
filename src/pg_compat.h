@@ -46,6 +46,7 @@
 #define PgProcTupleGetOid(tuple)	HeapTupleGetOid(tuple)
 #define PgTypeTupleGetOid(tuple)	HeapTupleGetOid(tuple)
 #define PgTriggerTupleGetOid(tuple)	HeapTupleGetOid(tuple)
+#define PgExtensionTupleGetOid(tuple) HeapTupleGetOid(tuple)
 #define CreateTemplateTupleDesc(a)	CreateTemplateTupleDesc((a), false)
 #define ExecCleanTypeFromTL(a)		ExecCleanTypeFromTL((a),false)
 #define SystemAttributeDefinition(a)			\
@@ -62,6 +63,7 @@
 #define PgProcTupleGetOid(tuple)	(((Form_pg_proc)GETSTRUCT(tuple))->oid)
 #define PgTypeTupleGetOid(tuple)	(((Form_pg_type)GETSTRUCT(tuple))->oid)
 #define PgTriggerTupleGetOid(tuple)	(((Form_pg_trigger)GETSTRUCT(tuple))->oid)
+#define PgExtensionTupleGetOid(tuple) (((Form_pg_extension)GETSTRUCT(tuple))->oid)
 #endif
 
 /*
@@ -250,6 +252,22 @@ ExecFetchSlotHeapTuple(TupleTableSlot *slot,
 	return ExecFetchSlotTuple(slot);
 }
 #endif	/* < PG12 */
+
+/*
+ * PG12 adds RELKIND_HAS_STORAGE macro to determine the relation kind
+ * that usually has physical storage.
+ */
+#if PG_VERSION_NUM < 120000
+#define RELATION_HAS_STORAGE(rel)							\
+	(RelationGetForm(rel)->relkind == RELKIND_RELATION ||	\
+	 RelationGetForm(rel)->relkind == RELKIND_INDEX ||		\
+	 RelationGetForm(rel)->relkind == RELKIND_SEQUENCE ||	\
+	 RelationGetForm(rel)->relkind == RELKIND_TOASTVALUE || \
+	 RelationGetForm(rel)->relkind == RELKIND_MATVIEW)
+#else
+#define RELATION_HAS_STORAGE(rel)				\
+	RELKIND_HAS_STORAGE(RelationGetForm(rel)->relkind)
+#endif
 
 /*
  * At PG13, 6f38d4dac381b5b8bead302a0b4f81761042cd25 changed

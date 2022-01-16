@@ -63,6 +63,7 @@
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_tablespace.h"
@@ -78,6 +79,7 @@
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/explain.h"
+#include "commands/extension.h"
 #include "commands/proclang.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
@@ -337,8 +339,9 @@ struct GpuTaskState
 	GpuTaskKind		task_kind;		/* one of GpuTaskKind_* */
 	ProgramId		program_id;		/* CUDA Program (to be acquired) */
 	CUmodule		cuda_module;	/* CUDA binary module */
-	kern_parambuf  *kern_params;	/* Const/Param buffer */
-	cl_int			optimal_gpu;	/* GPU preference on plan time */
+	CUdeviceptr		kern_params;	/* Const/Param buffer */
+	List		   *used_params;	/* Const/Param expressions */
+	const Bitmapset *optimal_gpus;	/* GPUs preference on plan time */
 	bool			scan_done;		/* True, if no more rows to read */
 
 	/* fields for outer scan */
@@ -786,7 +789,7 @@ CHECK_FOR_GPUCONTEXT(GpuContext *gcontext)
 	CHECK_FOR_INTERRUPTS();
 }
 extern CUresult gpuInit(unsigned int flags);
-extern GpuContext *AllocGpuContext(int cuda_dindex,
+extern GpuContext *AllocGpuContext(const Bitmapset *optimal_gpus,
 								   bool activate_context,
 								   bool activate_workers);
 extern void ActivateGpuContext(GpuContext *gcontext);
@@ -904,16 +907,14 @@ CHECK_WORKER_TERMINATION(void)
 /*
  * gpu_tasks.c
  */
-extern kern_parambuf *construct_kern_parambuf(List *used_params,
-											  ExprContext *econtext,
-											  List *custom_scan_tlist);
+extern CUdeviceptr pgstromSetupKernParambuf(GpuTaskState *gts);
 extern void pgstromInitGpuTaskState(GpuTaskState *gts,
 									GpuContext *gcontext,
 									GpuTaskKind task_kind,
 									List *outer_quals,
 									List *outer_refs,
 									List *used_params,
-									cl_int optimal_gpu,
+									const Bitmapset *optimal_gpus,
 									cl_uint outer_nrows_per_block,
 									cl_int eflags);
 extern TupleTableSlot *pgstromExecGpuTaskState(GpuTaskState *gts);
@@ -968,6 +969,19 @@ extern void pgstrom_init_cuda_program(void);
  */
 #include "cuda_codegen.h"
 
+typedef struct codegen_context {
+	StringInfoData	decl;	/* declarations of functions for complex expression */
+	int				decl_count;	/* # of temporary variabes in decl */
+	PlannerInfo *root;		//not necessary?
+	RelOptInfo	*baserel;	/* scope of Var-node, if any */
+	List	   *used_params;/* list of Const/Param in use */
+	List	   *used_vars;	/* list of Var in use */
+	List	   *pseudo_tlist;	/* pseudo tlist expression, if any */
+	uint32_t	extra_flags;	/* external libraries to be included */
+	uint32_t	extra_bufsz;	/* required size of temporary varlena buffer */
+	int			devcost;	/* relative device cost */
+} codegen_context;
+
 extern size_t pgstrom_codegen_extra_devtypes(char *buf, size_t bufsz,
 											 uint32 extra_flags);
 extern devtype_info *pgstrom_devtype_lookup(Oid type_oid);
@@ -987,9 +1001,9 @@ extern devcast_info *pgstrom_devcast_lookup(Oid src_type_oid,
 											Oid dst_type_oid);
 extern bool pgstrom_devtype_can_relabel(Oid src_type_oid,
 										Oid dst_type_oid);
+extern devindex_info *pgstrom_devindex_lookup(Oid opcode,
+											  Oid opfamily);
 extern char *pgstrom_codegen_expression(Node *expr, codegen_context *context);
-extern void pgstrom_codegen_param_declarations(StringInfo buf,
-											   codegen_context *context);
 extern void pgstrom_union_type_declarations(StringInfo buf,
 											const char *name,
 											List *type_oid_list);
@@ -1127,9 +1141,8 @@ extern Bitmapset *pgstrom_pullup_outer_refs(PlannerInfo *root,
 											RelOptInfo *base_rel,
 											Bitmapset *referenced);
 
-extern int	GetOptimalGpuForFile(File fdesc);
-extern int	GetOptimalGpuForRelation(PlannerInfo *root,
-									 RelOptInfo *rel);
+extern const Bitmapset *GetOptimalGpusForRelation(PlannerInfo *root,
+												  RelOptInfo *rel);
 extern bool ScanPathWillUseNvmeStrom(PlannerInfo *root,
 									 RelOptInfo *baserel);
 extern bool RelationCanUseNvmeStrom(Relation relation);
@@ -1175,7 +1188,7 @@ extern bool pgstrom_pullup_outer_scan(PlannerInfo *root,
 									  const Path *outer_path,
 									  Index *p_outer_relid,
 									  List **p_outer_quals,
-									  cl_int *p_cuda_dindex,
+									  const Bitmapset **p_optimal_gpus,
 									  IndexOptInfo **p_index_opt,
 									  List **p_index_conds,
 									  List **p_index_quals,
@@ -1197,7 +1210,7 @@ extern bool pgstrom_path_is_gpujoin(const Path *pathnode);
 extern bool pgstrom_plan_is_gpujoin(const Plan *plannode);
 extern bool pgstrom_planstate_is_gpujoin(const PlanState *ps);
 extern Path *pgstrom_copy_gpujoin_path(const Path *pathnode);
-extern cl_int gpujoin_get_optimal_gpu(const Path *pathnode);
+extern const Bitmapset *gpujoin_get_optimal_gpus(const Path *pathnode);
 
 #if PG_VERSION_NUM >= 110000
 extern List *extract_partitionwise_pathlist(PlannerInfo *root,
@@ -1227,10 +1240,10 @@ extern bool GpuJoinInnerPreload(GpuTaskState *gts, CUdeviceptr *p_m_kmrels);
 extern void GpuJoinInnerUnload(GpuTaskState *gts, bool is_rescan);
 extern pgstrom_data_store *GpuJoinExecOuterScanChunk(GpuTaskState *gts);
 extern int  gpujoinNextRightOuterJoinIfAny(GpuTaskState *gts);
-extern TupleTableSlot *gpujoinNextTupleFallback(GpuTaskState *gts,
-												struct kern_gpujoin *kgjoin,
-												pgstrom_data_store *pds_src,
-												cl_int outer_depth);
+extern TupleTableSlot *gpujoinNextTupleFallbackUpper(GpuTaskState *gts,
+													 struct kern_gpujoin *kgjoin,
+													 pgstrom_data_store *pds_src,
+													 cl_int outer_depth);
 extern void gpujoinUpdateRunTimeStat(GpuTaskState *gts,
 									 struct kern_gpujoin *kgjoin);
 
@@ -1252,8 +1265,8 @@ extern void pgstrom_init_gpupreagg(void);
  */
 extern bool baseRelIsArrowFdw(RelOptInfo *baserel);
 extern bool RelationIsArrowFdw(Relation frel);
-extern cl_int GetOptimalGpuForArrowFdw(PlannerInfo *root,
-									   RelOptInfo *baserel);
+extern Bitmapset *GetOptimalGpusForArrowFdw(PlannerInfo *root,
+											RelOptInfo *baserel);
 extern bool KDS_fetch_tuple_arrow(TupleTableSlot *slot,
 								  kern_data_store *kds,
 								  size_t row_index);
@@ -1311,6 +1324,7 @@ extern void pgstrom_init_gpu_cache(void);
 /*
  * misc.c
  */
+extern Node *fixup_varnode_to_origin(Node *expr, List *cscan_tlist);
 extern Expr *make_flat_ands_explicit(List *andclauses);
 extern AppendRelInfo **find_appinfos_by_relids_nofail(PlannerInfo *root,
 													  Relids relids,
@@ -1339,6 +1353,8 @@ extern Oid	get_object_extension_oid(Oid class_id,
 									 int32 objsub_id,
 									 bool missing_ok);
 extern char *bms_to_cstring(Bitmapset *x);
+extern List *bms_to_pglist(const Bitmapset *bms);
+extern Bitmapset *bms_from_pglist(List *pglist);
 extern bool pathtree_has_gpupath(Path *node);
 extern bool pathtree_has_parallel_aware(Path *node);
 extern Path *pgstrom_copy_pathnode(const Path *pathnode);
@@ -1390,7 +1406,7 @@ extern void		gpuDirectFileReadIOV(const GPUDirectFileDesc *gds_fdesc,
 									 off_t m_offset,
 									 strom_io_vector *iovec);
 extern void	extraSysfsSetupDistanceMap(const char *manual_config);
-extern int	extraSysfsLookupOptimalGpu(int fdesc);
+extern Bitmapset *extraSysfsLookupOptimalGpus(int fdesc);
 extern ssize_t extraSysfsPrintNvmeInfo(int index, char *buffer, ssize_t buffer_sz);
 
 /*
@@ -1412,7 +1428,7 @@ extern ssize_t extraSysfsPrintNvmeInfo(int index, char *buffer, ssize_t buffer_s
  */
 extern int		pgstrom_num_users_extra;
 extern pgstromUsersExtraDescriptor pgstrom_users_extra_desc[];
-
+extern Path	   *pgstrom_create_dummy_path(PlannerInfo *root, Path *subpath);
 extern const Path *gpu_path_find_cheapest(PlannerInfo *root,
 										  RelOptInfo *rel,
 										  bool outer_parallel,
@@ -1457,52 +1473,6 @@ extern void show_instrumentation_count(const char *qlabel, int which,
 #ifndef SAMESIGN
 #define SAMESIGN(a,b)	(((a) < 0) == ((b) < 0))
 #endif
-/*
- * int/float reinterpret functions
- */
-static inline cl_double
-long_as_double(cl_long ival)
-{
-	union {
-		cl_long		ival;
-		cl_double	fval;
-	} datum;
-	datum.ival = ival;
-	return datum.fval;
-}
-
-static inline cl_long
-double_as_long(cl_double fval)
-{
-	union {
-		cl_long		ival;
-		cl_double	fval;
-	} datum;
-	datum.fval = fval;
-	return datum.ival;
-}
-
-static inline cl_float
-int_as_float(cl_int ival)
-{
-	union {
-		cl_int		ival;
-		cl_float	fval;
-	} datum;
-	datum.ival = ival;
-	return datum.fval;
-}
-
-static inline cl_int
-float_as_int(cl_float fval)
-{
-	union {
-		cl_int		ival;
-		cl_float	fval;
-	} datum;
-	datum.fval = fval;
-	return datum.ival;
-}
 
 /*
  * trim_cstring - remove spaces from head/tail
@@ -1661,15 +1631,19 @@ __trim(char *token)
 static inline int
 typealign_get_width(char type_align)
 {
-	if (type_align == 'c')
-		return sizeof(cl_char);
-	else if (type_align == 's')
-		return sizeof(cl_short);
-	else if (type_align == 'i')
-		return sizeof(cl_int);
-	else if (type_align == 'd')
-		return sizeof(cl_long);
-	elog(ERROR, "unexpected type alignment: %c", type_align);
+	switch (type_align)
+	{
+		case 'c':
+			return 1;
+		case 's':
+			return ALIGNOF_SHORT;
+		case 'i':
+			return ALIGNOF_INT;
+		case 'd':
+			return ALIGNOF_DOUBLE;
+		default:
+			elog(ERROR, "unexpected type alignment: %c", type_align);
+	}
 	return -1;	/* be compiler quiet */
 }
 

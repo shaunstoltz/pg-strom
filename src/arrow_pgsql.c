@@ -51,6 +51,7 @@ typedef struct
 #endif
 
 #include "arrow_ipc.h"
+#include "float2.h"
 
 /*
  * callbacks to write out min/max statistics
@@ -161,29 +162,6 @@ static inline uint64_t __fetch_64bit(const void *addr)
 #else
 	return be64toh(*((uint64_t *)addr));
 #endif
-}
-
-static inline size_t
-__buffer_usage_inline_type(SQLfield *column)
-{
-	size_t		usage;
-
-	usage = ARROWALIGN(column->values.usage);
-	if (column->nullcount > 0)
-		usage += ARROWALIGN(column->nullmap.usage);
-	return usage;
-}
-
-static inline size_t
-__buffer_usage_varlena_type(SQLfield *column)
-{
-	size_t		usage;
-
-	usage = (ARROWALIGN(column->values.usage) +
-			 ARROWALIGN(column->extra.usage));
-	if (column->nullcount > 0)
-		usage += ARROWALIGN(column->nullmap.usage);
-	return usage;
 }
 
 #define STAT_UPDATES(COLUMN,FIELD,VALUE)					\
@@ -420,7 +398,8 @@ static size_t
 put_float16_value(SQLfield *column, const char *addr, int sz)
 {
 	size_t		row_index = column->nitems++;
-	int16_t		value;
+	half_t		value;
+	float		fval;
 
 	if (!addr)
 		__put_inline_null_value(column, row_index, sizeof(uint16_t));
@@ -431,16 +410,28 @@ put_float16_value(SQLfield *column, const char *addr, int sz)
 		sql_buffer_setbit(&column->nullmap, row_index);
 		sql_buffer_append(&column->values, &value, sz);
 
-		STAT_UPDATES(column,i16,value);
+		fval = fp16_to_fp32(value);
+		STAT_UPDATES(column,f32,fval);
 	}
 	return __buffer_usage_inline_type(column);
 }
+
+static int
+write_float16_stat(SQLfield *attr, char *buf, size_t len,
+				   const SQLstat__datum *datum)
+{
+	half_t		ival = fp32_to_fp16(datum->f32);
+
+	return snprintf(buf, len, "%u", (uint32_t)ival);
+}
+
 
 static size_t
 put_float32_value(SQLfield *column, const char *addr, int sz)
 {
 	size_t		row_index = column->nitems++;
 	int32_t		value;
+	float		fval;
 
 	if (!addr)
 		__put_inline_null_value(column, row_index, sizeof(uint32_t));
@@ -451,7 +442,8 @@ put_float32_value(SQLfield *column, const char *addr, int sz)
 		sql_buffer_setbit(&column->nullmap, row_index);
 		sql_buffer_append(&column->values, &value, sz);
 
-		STAT_UPDATES(column,i32,value);
+		memcpy(&fval, &value, sizeof(float));
+		STAT_UPDATES(column,f32,fval);
 	}
 	return __buffer_usage_inline_type(column);
 }
@@ -461,6 +453,7 @@ put_float64_value(SQLfield *column, const char *addr, int sz)
 {
 	size_t		row_index = column->nitems++;
 	int64_t		value;
+	double		fval;
 
 	if (!addr)
 		__put_inline_null_value(column, row_index, sizeof(uint64_t));
@@ -471,7 +464,8 @@ put_float64_value(SQLfield *column, const char *addr, int sz)
 		sql_buffer_setbit(&column->nullmap, row_index);
 		sql_buffer_append(&column->values, &value, sz);
 
-		STAT_UPDATES(column,i64,value);
+		memcpy(&fval, &value, sizeof(double));
+		STAT_UPDATES(column,f64,fval);
 	}
 	return __buffer_usage_inline_type(column);
 }
@@ -555,8 +549,7 @@ init_var_from_num(NumericVar *nv, const char *addr, int sz)
 #endif	/* __PGSTROM_MODULE__ */
 
 static size_t
-put_decimal_value(SQLfield *column,
-			const char *addr, int sz)
+put_decimal_value(SQLfield *column, const char *addr, int sz)
 {
 	size_t		row_index = column->nitems++;
 
@@ -1448,7 +1441,7 @@ assignArrowTypeFloatingPoint(SQLfield *column, ArrowField *arrow_field)
 			column->arrow_type.FloatingPoint.precision
 				= ArrowPrecision__Half;
 			column->put_value = put_float16_value;
-			column->write_stat = write_int16_stat;
+			column->write_stat = write_float16_stat;
 			break;
 		case sizeof(float):
 			column->arrow_type.FloatingPoint.precision
@@ -1558,6 +1551,7 @@ assignArrowTypeDecimal(SQLfield *column, ArrowField *arrow_field)
 	initArrowNode(&column->arrow_type, Decimal);
 	column->arrow_type.Decimal.precision = precision;
 	column->arrow_type.Decimal.scale = scale;
+	column->arrow_type.Decimal.bitWidth = 128;
 	column->put_value = put_decimal_value;
 	column->write_stat = write_int128_stat;
 
