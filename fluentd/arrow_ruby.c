@@ -225,9 +225,9 @@ ruby_put_bool_value(SQLfield *column, const char *addr, int sz)
 	{
 		sql_buffer_setbit(&column->nullmap, row_index);
 		if (bval != 0)
-			sql_buffer_setbit(&column->values,  row_index);
+			sql_buffer_setbit(&column->values, row_index);
 		else
-			sql_buffer_clrbit(&column->values,  row_index);		
+			sql_buffer_clrbit(&column->values, row_index);		
 	}
 	return __buffer_usage_inline_type(column);
 }
@@ -235,10 +235,22 @@ ruby_put_bool_value(SQLfield *column, const char *addr, int sz)
 /*
  * IntXX/UintXX
  */
+static VALUE
+__ruby_fetch_integer_value(VALUE datum)
+{
+	if (datum != Qnil && CLASS_OF(datum) != rb_cInteger)
+	{
+		if (!rb_respond_to(datum, rb_intern("to_i")))
+			datum = rb_funcall(datum, rb_intern("to_s"), 0);
+		datum = rb_funcall(datum, rb_intern("to_i"), 0);
+	}
+	return datum;
+}
+
 static size_t
 put_ruby_int8_value(SQLfield *column, const char *addr, int sz)
 {
-	VALUE		datum = (VALUE)addr;
+	VALUE		datum = __ruby_fetch_integer_value((VALUE)addr);
 	size_t		row_index = column->nitems++;
 
 	if (datum == Qnil)
@@ -258,7 +270,7 @@ put_ruby_int8_value(SQLfield *column, const char *addr, int sz)
 static size_t
 put_ruby_int16_value(SQLfield *column, const char *addr, int sz)
 {
-	VALUE		datum = (VALUE)addr;
+	VALUE		datum = __ruby_fetch_integer_value((VALUE)addr);
 	size_t		row_index = column->nitems++;
 
 	if (datum == Qnil)
@@ -278,7 +290,7 @@ put_ruby_int16_value(SQLfield *column, const char *addr, int sz)
 static size_t
 put_ruby_int32_value(SQLfield *column, const char *addr, int sz)
 {
-	VALUE		datum = (VALUE)addr;
+	VALUE		datum = __ruby_fetch_integer_value((VALUE)addr);
 	size_t		row_index = column->nitems++;
 
 	if (datum == Qnil)
@@ -298,7 +310,7 @@ put_ruby_int32_value(SQLfield *column, const char *addr, int sz)
 static size_t
 put_ruby_int64_value(SQLfield *column, const char *addr, int sz)
 {
-	VALUE		datum = (VALUE)addr;
+	VALUE		datum = __ruby_fetch_integer_value((VALUE)addr);
 	size_t		row_index = column->nitems++;
 
 	if (datum == Qnil)
@@ -318,7 +330,7 @@ put_ruby_int64_value(SQLfield *column, const char *addr, int sz)
 static size_t
 put_ruby_uint8_value(SQLfield *column, const char *addr, int sz)
 {
-	VALUE		datum = (VALUE)addr;
+	VALUE		datum = __ruby_fetch_integer_value((VALUE)addr);
 	size_t		row_index = column->nitems++;
 
 	if (datum == Qnil)
@@ -340,7 +352,7 @@ put_ruby_uint8_value(SQLfield *column, const char *addr, int sz)
 static size_t
 put_ruby_uint16_value(SQLfield *column, const char *addr, int sz)
 {
-	VALUE		datum = (VALUE)addr;
+	VALUE		datum = __ruby_fetch_integer_value((VALUE)addr);
 	size_t		row_index = column->nitems++;
 
 	if (datum == Qnil)
@@ -362,7 +374,7 @@ put_ruby_uint16_value(SQLfield *column, const char *addr, int sz)
 static size_t
 put_ruby_uint32_value(SQLfield *column, const char *addr, int sz)
 {
-	VALUE		datum = (VALUE)addr;
+	VALUE		datum = __ruby_fetch_integer_value((VALUE)addr);
 	size_t		row_index = column->nitems++;
 
 	if (datum == Qnil)
@@ -382,7 +394,7 @@ put_ruby_uint32_value(SQLfield *column, const char *addr, int sz)
 static size_t
 put_ruby_uint64_value(SQLfield *column, const char *addr, int sz)
 {
-	VALUE		datum = (VALUE)addr;
+	VALUE		datum = __ruby_fetch_integer_value((VALUE)addr);
 	size_t		row_index = column->nitems++;
 
 	if (datum == Qnil)
@@ -402,10 +414,22 @@ put_ruby_uint64_value(SQLfield *column, const char *addr, int sz)
 /*
  * FloatingPointXX
  */
+static VALUE
+__ruby_fetch_float_value(VALUE datum)
+{
+	if (datum != Qnil && CLASS_OF(datum) != rb_cFloat)
+	{
+		if (!rb_respond_to(datum, rb_intern("to_f")))
+			datum = rb_funcall(datum, rb_intern("to_s"), 0);
+		datum = rb_funcall(datum, rb_intern("to_f"), 0);
+	}
+	return datum;
+}
+
 static size_t
 put_ruby_float16_value(SQLfield *column, const char *addr, int sz)
 {
-	VALUE		datum = (VALUE)addr;
+	VALUE		datum = __ruby_fetch_float_value((VALUE)addr);
 	size_t		row_index = column->nitems++;
 
 	if (datum == Qnil)
@@ -426,7 +450,7 @@ put_ruby_float16_value(SQLfield *column, const char *addr, int sz)
 static size_t
 put_ruby_float32_value(SQLfield *column, const char *addr, int sz)
 {
-	VALUE		datum = (VALUE)addr;
+	VALUE		datum = __ruby_fetch_float_value((VALUE)addr);
 	size_t		row_index = column->nitems++;
 
 	if (datum == Qnil)
@@ -446,7 +470,7 @@ put_ruby_float32_value(SQLfield *column, const char *addr, int sz)
 static size_t
 put_ruby_float64_value(SQLfield *column, const char *addr, int sz)
 {
-	VALUE		datum = (VALUE)addr;
+	VALUE		datum = __ruby_fetch_float_value((VALUE)addr);
 	size_t		row_index = column->nitems++;
 
 	if (datum == Qnil)
@@ -530,7 +554,7 @@ put_ruby_decimal_value(SQLfield *column, const char *addr, int sz)
 	else
 	{
 		sql_buffer_setbit(&column->nullmap, row_index);
-		sql_buffer_append(&column->values, &value, sizeof(double));
+		sql_buffer_append(&column->values, &value, sizeof(int128_t));
 
 		STAT_UPDATES(column,i128,value);
 	}
@@ -565,6 +589,13 @@ try_again:
 
 		*p_sec = NUM2ULONG(sec);
 		*p_nsec = NUM2ULONG(nsec);
+		return true;
+	}
+	/* Is it Integer (elapsed seconds from Epoch) */
+	if (CLASS_OF(datum) == rb_cInteger)
+	{
+		*p_sec = NUM2ULONG(datum);
+		*p_nsec = 0;
 		return true;
 	}
 	/* Is convertible to UTC? (should happen only once) */
@@ -620,6 +651,8 @@ put_ruby_date_day_value(SQLfield *column, const char *addr, int sz)
 
 		sql_buffer_setbit(&column->nullmap, row_index);
 		sql_buffer_append(&column->values, &value, sizeof(uint32_t));
+
+		STAT_UPDATES(column,u32,value);
 	}
 	return __buffer_usage_inline_type(column);
 }
@@ -635,10 +668,12 @@ put_ruby_date_ms_value(SQLfield *column, const char *addr, int sz)
 		__put_inline_null_value(column, row_index, sizeof(int64_t));
 	else
 	{
-		uint64_t	value = (sec * 1000000L) + (nsec / 1000L);
+		uint64_t	value = (sec * 1000L) + (nsec / 1000000L);
 
 		sql_buffer_setbit(&column->nullmap, row_index);
 		sql_buffer_append(&column->values, &value, sizeof(uint64_t));
+
+		STAT_UPDATES(column,u64,value);
 	}
 	return __buffer_usage_inline_type(column);
 }
@@ -652,15 +687,17 @@ put_ruby_time_sec_value(SQLfield *column, const char *addr, int sz)
 	size_t		row_index = column->nitems++;
 	uint64_t	sec;
 	uint64_t	nsec;
-	uint32_t	value;
 
 	if (!__ruby_fetch_timestamp_value((VALUE)addr, &sec, &nsec, false))
 		__put_inline_null_value(column, row_index, sizeof(uint32_t));
 	else
 	{
-		value = sec % SECS_PER_DAY;
+		uint32_t	value = sec % SECS_PER_DAY;
+
 		sql_buffer_setbit(&column->nullmap, row_index);
 		sql_buffer_append(&column->values, &value, sizeof(uint32_t));
+
+		STAT_UPDATES(column,u32,value);
 	}
 	return __buffer_usage_inline_type(column);
 }
@@ -671,15 +708,17 @@ put_ruby_time_ms_value(SQLfield *column, const char *addr, int sz)
 	size_t		row_index = column->nitems++;
 	uint64_t	sec;
 	uint64_t	nsec;
-	uint32_t	value;
 
 	if (!__ruby_fetch_timestamp_value((VALUE)addr, &sec, &nsec, false))
 		__put_inline_null_value(column, row_index, sizeof(uint32_t));
 	else
 	{
-		value = (sec % SECS_PER_DAY) * 1000 + (nsec / 1000000);
+		uint32_t	value = (sec % SECS_PER_DAY) * 1000 + (nsec / 1000000);
+
 		sql_buffer_setbit(&column->nullmap, row_index);
 		sql_buffer_append(&column->values, &value, sizeof(uint32_t));
+
+		STAT_UPDATES(column,u32,value);
 	}
 	return __buffer_usage_inline_type(column);
 }
@@ -690,15 +729,17 @@ put_ruby_time_us_value(SQLfield *column, const char *addr, int sz)
 	size_t		row_index = column->nitems++;
 	uint64_t	sec;
 	uint64_t	nsec;
-	uint64_t	value;
 
 	if (!__ruby_fetch_timestamp_value((VALUE)addr, &sec, &nsec, false))
 		__put_inline_null_value(column, row_index, sizeof(uint64_t));
 	else
 	{
-		value = (sec % SECS_PER_DAY) * 1000000L + (nsec / 1000L);
+		uint64_t	value = (sec % SECS_PER_DAY) * 1000000L + (nsec / 1000L);
+
 		sql_buffer_setbit(&column->nullmap, row_index);
 		sql_buffer_append(&column->values, &value, sizeof(uint64_t));
+
+		STAT_UPDATES(column,u64,value);
 	}
 	return __buffer_usage_inline_type(column);
 }
@@ -709,15 +750,17 @@ put_ruby_time_ns_value(SQLfield *column, const char *addr, int sz)
 	size_t		row_index = column->nitems++;
 	uint64_t	sec;
 	uint64_t	nsec;
-	uint64_t	value;
 
 	if (!__ruby_fetch_timestamp_value((VALUE)addr, &sec, &nsec, false))
 		__put_inline_null_value(column, row_index, sizeof(int64_t));
 	else
 	{
-		value = (sec % SECS_PER_DAY) * 1000000000L + nsec;
+		uint64_t	value = (sec % SECS_PER_DAY) * 1000000000L + nsec;
+
 		sql_buffer_setbit(&column->nullmap, row_index);
 		sql_buffer_append(&column->values, &value, sizeof(uint64_t));
+
+		STAT_UPDATES(column,u64,value);
 	}
 	return __buffer_usage_inline_type(column);
 }
@@ -738,6 +781,8 @@ put_ruby_timestamp_sec_value(SQLfield *column, const char *addr, int sz)
 	{
 		sql_buffer_setbit(&column->nullmap, row_index);
 		sql_buffer_append(&column->values, &sec, sizeof(uint64_t));
+
+		STAT_UPDATES(column,u64,sec);
 	}
 	return __buffer_usage_inline_type(column);
 }
@@ -748,15 +793,17 @@ put_ruby_timestamp_ms_value(SQLfield *column, const char *addr, int sz)
 	size_t		row_index = column->nitems++;
 	uint64_t	sec;
 	uint64_t	nsec;
-	uint64_t	value;
 
 	if (!__ruby_fetch_timestamp_value((VALUE)addr, &sec, &nsec, true))
 		__put_inline_null_value(column, row_index, sizeof(int64_t));
 	else
 	{
-		value = sec * 1000L + nsec / 1000000L;
+		uint64_t	value = sec * 1000L + nsec / 1000000L;
+
 		sql_buffer_setbit(&column->nullmap, row_index);
 		sql_buffer_append(&column->values, &value, sizeof(uint64_t));
+
+		STAT_UPDATES(column,u64,value);
 	}
 	return __buffer_usage_inline_type(column);
 }
@@ -767,15 +814,17 @@ put_ruby_timestamp_us_value(SQLfield *column, const char *addr, int sz)
 	size_t		row_index = column->nitems++;
 	uint64_t	sec;
 	uint64_t	nsec;
-	uint64_t	value;
 
 	if (!__ruby_fetch_timestamp_value((VALUE)addr, &sec, &nsec, true))
 		__put_inline_null_value(column, row_index, sizeof(int64_t));
 	else
 	{
-		value = sec * 1000000L + nsec / 1000L;
+		uint64_t	value = sec * 1000000L + nsec / 1000L;
+
 		sql_buffer_setbit(&column->nullmap, row_index);
 		sql_buffer_append(&column->values, &value, sizeof(uint64_t));
+
+		STAT_UPDATES(column,u64,value);
 	}
 	return __buffer_usage_inline_type(column);
 }
@@ -786,15 +835,17 @@ put_ruby_timestamp_ns_value(SQLfield *column, const char *addr, int sz)
 	size_t		row_index = column->nitems++;
 	uint64_t	sec;
 	uint64_t	nsec;
-	uint64_t	value;
 
 	if (!__ruby_fetch_timestamp_value((VALUE)addr, &sec, &nsec, true))
 		__put_inline_null_value(column, row_index, sizeof(int64_t));
 	else
 	{
-		value = sec * 1000000000L + nsec;
+		uint64_t	value = sec * 1000000000L + nsec;
+
 		sql_buffer_setbit(&column->nullmap, row_index);
 		sql_buffer_append(&column->values, &value, sizeof(uint64_t));
+
+		STAT_UPDATES(column,u64,value);
 	}
 	return __buffer_usage_inline_type(column);
 }
@@ -871,7 +922,7 @@ retry_again:
 			ival = rb_funcall(datum, rb_intern("to_i"), 0);
 
 			rb_integer_pack(ival, buf, IP4ADDR_LEN, 1, 0,
-							INTEGER_PACK_LITTLE_ENDIAN);
+							INTEGER_PACK_BIG_ENDIAN);
 			return true;
 		}
 		if ((ip_version == 6 || ip_version < 0) &&
@@ -880,7 +931,7 @@ retry_again:
 			ival = rb_funcall(datum, rb_intern("to_i"), 0);
 
 			rb_integer_pack(ival, buf, IP6ADDR_LEN, 1, 0,
-							INTEGER_PACK_LITTLE_ENDIAN);
+							INTEGER_PACK_BIG_ENDIAN);
 			return true;
 		}
 		Elog("IPAddr is not IPv%d format", ip_version);
@@ -1043,7 +1094,7 @@ write_ruby_uint64_stat(SQLfield *column, char *buf, size_t len,
  * ----------------------------------------------------------------
  */
 static void
-__arrowFilePathnameValidator(VALUE self, VALUE __pathname)
+__arrowFileWritePathnameValidator(VALUE self, VALUE __pathname)
 {
 	const char *str;
 	uint32_t	len, i;
@@ -1094,6 +1145,7 @@ arrowFieldAddCustomMetadata(SQLfield *column,
 	sz = sizeof(ArrowKeyValue) * (column->numCustomMetadata + 1);
 	column->customMetadata = repalloc(column->customMetadata, sz);
 	kv = &column->customMetadata[column->numCustomMetadata++];
+	initArrowNode(kv, KeyValue);
 	kv->key = pstrdup(key);
 	kv->_key_len = strlen(key);
 	kv->value = pstrdup(value);
@@ -1225,12 +1277,8 @@ __assignFieldTypeDecimal(SQLfield *column, const char *extra)
 
 		if (*tail != ')')
 			Elog("Arrow::Decimal definition syntax error");
-		if (sscanf(extra, "(%u,%u)", &precision, &scale) != 2)
-		{
-			precision = 30;		/* revert */
-			if (sscanf(extra, "(%u)", &scale) != 1)
-				Elog("Arrow::Decimal definition syntax error");
-		}
+		if (sscanf(extra, "(%d)", &scale) != 1)
+			Elog("Arrow::Decimal definition syntax error");
 	}
 	else if (*extra != '\0')
 		Elog("Arrow::Decimal definition syntax error");
@@ -1273,24 +1321,28 @@ __assignFieldTypeTime(SQLfield *column, const char *extra)
 	initArrowNode(&column->arrow_type, Time);
 	if (strcmp(extra, "[sec]") == 0 || strcmp(extra, "") == 0)
 	{
+		column->arrow_type.Time.unit = ArrowTimeUnit__Second;
 		column->arrow_type.Time.bitWidth = 32;
 		column->put_value = put_ruby_time_sec_value;
 		column->write_stat = write_ruby_int32_stat;
 	}
 	else if (strcmp(extra, "[ms]") == 0)
 	{
+		column->arrow_type.Time.unit = ArrowTimeUnit__MilliSecond;
 		column->arrow_type.Time.bitWidth = 32;
 		column->put_value = put_ruby_time_ms_value;
 		column->write_stat = write_ruby_int32_stat;
 	}
 	else if (strcmp(extra, "[us]") == 0)
 	{
+		column->arrow_type.Time.unit = ArrowTimeUnit__MicroSecond;
 		column->arrow_type.Time.bitWidth = 64;
 		column->put_value = put_ruby_time_us_value;
 		column->write_stat = write_ruby_int64_stat;
 	}
 	else if (strcmp(extra, "[ns]") == 0)
 	{
+		column->arrow_type.Time.unit = ArrowTimeUnit__NanoSecond;
 		column->arrow_type.Time.bitWidth = 64;
 		column->put_value = put_ruby_time_ns_value;
 		column->write_stat = write_ruby_int64_stat;
@@ -1349,12 +1401,6 @@ __assignFieldTypeTimestamp(SQLfield *column, const char *extra)
 		Elog("Arrow::Timestamp - not a supported unit size: %s", extra);
 
 	return 2;
-}
-
-static int
-__assignFieldTypeInterval(SQLfield *column, const char *extra)
-{
-	Elog("Arrow::Interval - not implemented yet");
 }
 
 static int
@@ -1417,23 +1463,20 @@ __arrowFileAssignFieldType(SQLfield *column,
 		return  __assignFieldTypeDate(column, field_type + 4);
 	else if (strncmp(field_type, "Time", 4) == 0)
 		return  __assignFieldTypeTime(column, field_type + 4);
-	else if (strncmp(field_type, "Interval", 8) == 0)
-		return  __assignFieldTypeInterval(column, field_type + 8);
     else if (strcmp(field_type, "Utf8") == 0)
 		return  __assignFieldTypeUtf8(column);
 	else if (strcmp(field_type, "Ipaddr4") == 0)
 		return  __assignFieldTypeIpaddr4(column);
 	else if (strcmp(field_type, "Ipaddr6") == 0)
 		return  __assignFieldTypeIpaddr6(column);
-
-	Elog("ArrowFile: not a supported type");
+	Elog("ArrowFileWrite: not a supported type");
 }
 
 /*
  * Parsing the Schema Definition
  */
 static void
-__arrowFileParseSchemaDefs(VALUE self, VALUE __schema_defs)
+__arrowFileWriteParseSchemaDefs(VALUE self, VALUE __schema_defs)
 {
 	VALUE		schema_defs;
 	VALUE		schema = Qnil;
@@ -1518,8 +1561,8 @@ __arrowFileParseSchemaDefs(VALUE self, VALUE __schema_defs)
 }
 
 static void
-__arrowFileParseParams(VALUE self,
-					   VALUE __params)
+__arrowFileWriteParseParams(VALUE self,
+							VALUE __params)
 {
 	VALUE		datum;
 	VALUE		schema;
@@ -1551,7 +1594,7 @@ __arrowFileParseParams(VALUE self,
 		}
 	}
 	else if (__params != Qnil)
-		Elog("ArrowFile: parameters must be Hash");
+		Elog("ArrowFileWrite: parameters must be Hash");
 
 	schema = rb_ivar_get(self, rb_intern("schema"));
 	datum = rb_funcall(schema, rb_intern("count"), 0);
@@ -1584,16 +1627,16 @@ __arrowFileParseParams(VALUE self,
 }
 
 static VALUE
-rb_ArrowFile__initialize(VALUE self,
-						 VALUE __pathname,
-						 VALUE __schema_defs,
-						 VALUE __params)
+rb_ArrowFileWrite__initialize(VALUE self,
+							  VALUE __pathname,
+							  VALUE __schema_defs,
+							  VALUE __params)
 {
 	rb_require("time");
 
-	__arrowFilePathnameValidator(self, __pathname);
-	__arrowFileParseSchemaDefs(self, __schema_defs);
-	__arrowFileParseParams(self, __params);
+	__arrowFileWritePathnameValidator(self, __pathname);
+	__arrowFileWriteParseSchemaDefs(self, __schema_defs);
+	__arrowFileWriteParseParams(self, __params);
 
 	return self;
 }
@@ -1854,6 +1897,9 @@ __arrowFileValidateColumn(SQLfield *column,
 			 c->node.tagName, f->node.tagName);
 	switch (c->node.tag)
 	{
+		case ArrowNodeTag__Bool:
+			break;
+
 		case ArrowNodeTag__Int:
 			if ((c->Int.is_signed && !f->Int.is_signed) ||
 				(!c->Int.is_signed && f->Int.is_signed))
@@ -1871,7 +1917,7 @@ __arrowFileValidateColumn(SQLfield *column,
 			break;
 
 		case ArrowNodeTag__Decimal:
-			if (c->Decimal.scale != f->Decimal.precision ||
+			if (c->Decimal.scale != f->Decimal.scale ||
 				c->Decimal.bitWidth != f->Decimal.bitWidth)
 				Elog("Not a compatible Decimal: Decimal%d(%d,%d) <-> Decimal%d(%d,%d)",
 					 c->Decimal.bitWidth,
@@ -2121,8 +2167,8 @@ __arrowFileWriteChunk(VALUE __args)
 }
 
 static VALUE
-rb_ArrowFile__writeChunk(VALUE self,
-						 VALUE chunk)
+rb_ArrowFileWrite__writeChunk(VALUE self,
+							  VALUE chunk)
 {
 	WriteChunkArgs args;
 	VALUE		retval;
@@ -2149,28 +2195,12 @@ rb_ArrowFile__writeChunk(VALUE self,
 	return retval;
 }
 
-#if 1
-static VALUE
-rb_ArrowFile__test(VALUE self, VALUE datum)
-{
-	VALUE	retval;
-
-	retval = rb_funcall(rb_cTime, rb_intern("parse"), 1, datum);
-
-	printf("classname [%s] -> [%s]\n",
-		   rb_class2name(CLASS_OF(datum)),
-		   rb_class2name(CLASS_OF(retval)));
-	return retval;
-}
-#endif
-
 void
-Init_arrow_file(void)
+Init_arrow_file_write(void)
 {
 	VALUE	klass;
 
-	klass = rb_define_class("ArrowFile",  rb_cObject);
-	rb_define_method(klass, "initialize", rb_ArrowFile__initialize, 3);
-	rb_define_method(klass, "writeChunk", rb_ArrowFile__writeChunk, 1);
-	rb_define_method(klass, "test",       rb_ArrowFile__test, 1);
+	klass = rb_define_class("ArrowFileWrite",  rb_cObject);
+	rb_define_method(klass, "initialize", rb_ArrowFileWrite__initialize, 3);
+	rb_define_method(klass, "writeChunk", rb_ArrowFileWrite__writeChunk, 1);
 }
