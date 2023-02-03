@@ -186,6 +186,7 @@ struct ArrowFdwState
 
 /* ---------- static variables ---------- */
 static FdwRoutine		pgstrom_arrow_fdw_routine;
+static shmem_request_hook_type shmem_request_next = NULL;
 static shmem_startup_hook_type shmem_startup_next = NULL;
 static arrowMetadataState *arrow_metadata_state = NULL;
 static dlist_head		arrow_write_redo_list;
@@ -583,24 +584,16 @@ ArrowGetForeignPlan(PlannerInfo *root,
 	Bitmapset  *referenced = NULL;
 	List	   *ref_list = NIL;
 	ListCell   *lc;
-	int			i, j, k;
+	int			j, k;
 
-	Assert(IS_SIMPLE_REL(baserel));
-	/* pick up referenced attributes */
 	foreach (lc, baserel->baserestrictinfo)
 	{
 		RestrictInfo   *rinfo = lfirst(lc);
 
 		pull_varattnos((Node *)rinfo->clause, baserel->relid, &referenced);
 	}
-	for (i=baserel->min_attr, j=0; i <= baserel->max_attr; i++, j++)
-	{
-		if (baserel->attr_needed[j] != NULL)
-		{
-			k = i - FirstLowInvalidHeapAttributeNumber;
-			referenced = bms_add_member(referenced, k);
-		}
-	}
+	referenced = pgstrom_pullup_outer_refs(root, baserel, referenced);
+
 	for (k = bms_next_member(referenced, -1);
 		 k >= 0;
 		 k = bms_next_member(referenced, k))
@@ -2577,8 +2570,7 @@ RecordBatchAcquireSampleRows(Relation relation,
 	for (count = 0; count < nsamples; count++)
 	{
 		/* fetch a row randomly */
-		i = (double)pds->kds.nitems * (((double) random()) /
-									   ((double)MAX_RANDOM_VALUE + 1));
+		i = (double)pds->kds.nitems * drand48();
 		Assert(i < pds->kds.nitems);
 
 		for (j=0; j < pds->kds.ncols; j++)
@@ -2775,8 +2767,8 @@ ArrowImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 				elog(ERROR, "file '%s' has incompatible schema definition", fname);
 			for (j=0; j < schema._num_fields; j++)
 			{
-				if (arrowFieldTypeIsEqual(&schema.fields[j],
-										  &stemp->fields[j]))
+				if (!arrowFieldTypeIsEqual(&schema.fields[j],
+										   &stemp->fields[j]))
 					elog(ERROR, "file '%s' has incompatible schema definition", fname);
 			}
 		}
@@ -4596,7 +4588,7 @@ __arrowFdwExtractFilesList(List *options_list,
 		{
 			if (parallel_nworkers >= 0)
 				elog(ERROR, "'parallel_workers' appeared twice");
-			parallel_nworkers = pg_atoi(strVal(defel->arg), sizeof(int), '\0');
+			parallel_nworkers = atoi(strVal(defel->arg));
 		}
 		else if (strcmp(defel->defname, "writable") == 0)
 		{
@@ -4653,7 +4645,7 @@ __arrowFdwExtractFilesList(List *options_list,
 		elog(ERROR, "no files are configured on behalf of the arrow_fdw foreign table");
 	foreach (lc, filesList)
 	{
-		const char *fname = strVal((Value *)lfirst(lc));
+		const char *fname = strVal(lfirst(lc));
 
 		if (!writable)
 		{
@@ -6096,6 +6088,17 @@ arrowFdwSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
 }
 
 /*
+ * pgstrom_request_arrow_fdw
+ */
+static void
+pgstrom_request_arrow_fdw(void)
+{
+	if (shmem_request_next)
+		shmem_request_next();
+	RequestAddinShmemSpace(MAXALIGN(sizeof(arrowMetadataState)));
+}
+
+/*
  * pgstrom_startup_arrow_fdw
  */
 static void
@@ -6222,7 +6225,8 @@ pgstrom_init_arrow_fdw(void)
 							NULL, NULL, NULL);
 
 	/* shared memory size */
-	RequestAddinShmemSpace(MAXALIGN(sizeof(arrowMetadataState)));
+	shmem_request_next = shmem_request_hook;
+	shmem_request_hook = pgstrom_request_arrow_fdw;
 	shmem_startup_next = shmem_startup_hook;
 	shmem_startup_hook = pgstrom_startup_arrow_fdw;
 

@@ -16,19 +16,24 @@ PGSTROM_RELEASE := devel
 #
 # Source of PG-Strom host code
 #
-__STROM_OBJS = main.o extra.o codegen.o misc.o executor.o brin.o relscan.o \
-               gpu_scan.o gpu_device.o gpu_service.o \
-               $(__XPU_COMMON_OBJS) \
-               float2.o tinyint.o
+__STROM_OBJS = main.o extra.o codegen.o misc.o executor.o relscan.o brin.o \
+               gpu_device.o gpu_service.o gpu_scan.o gpu_join.o \
+               dpu_device.o dpu_scan.o \
+               arrow_fdw.o arrow_nodes.o \
+               pcie.o float2.o tinyint.o
 STROM_OBJS = $(addprefix $(STROM_BUILD_ROOT)/next/,$(__STROM_OBJS))
+
+GPU_DEVATTRS_H = $(STROM_BUILD_ROOT)/next/gpu_devattrs.h
+GENERATED-HEADERS = $(GPU_DEVATTRS_H)
 
 #
 # Source of NVIDIA GPU device code
 #
 include $(STROM_BUILD_ROOT)/next/Makefile.cuda
-__CUDA_OBJS = cuda_common cuda_gpuscan \
-              cuda_basetype cuda_numeric cuda_timelib cuda_textlib cuda_misclib
-__CUDA_HEADERS = xpu_common.h xpu_common.c xpu_numeric.h
+__CUDA_OBJS = xpu_common cuda_gpuscan cuda_gpujoin \
+              xpu_basetype xpu_numeric xpu_timelib xpu_textlib xpu_misclib
+__CUDA_HEADERS = cuda_common.h xpu_common.h xpu_opcodes.h xpu_basetype.h \
+                 xpu_numeric.h xpu_textlib.h xpu_timelib.h xpu_misclib.h
 __CUDA_OPT_OBJS = $(addsuffix .fatbin,$(__CUDA_OBJS))
 __CUDA_DBG_OBJS = $(addsuffix .debug.fatbin,$(__CUDA_OBJS))
 CUDA_HEADERS = $(addprefix $(STROM_BUILD_ROOT)/next/,$(__CUDA_HEADERS))
@@ -73,7 +78,6 @@ PGSTROM_FLAGS += $(PGSTROM_FLAGS_CUSTOM)
 PGSTROM_FLAGS += -D__PGSTROM_MODULE__=1
 PGSTROM_FLAGS += "-DPGSTROM_VERSION=\"$(PGSTROM_VERSION)\""
 
-PGSTROM_DEBUG = 1
 ifeq ($(PGSTROM_DEBUG),1)
 PGSTROM_FLAGS += -g -O0 -DPGSTROM_DEBUG_BUILD=1
 endif
@@ -97,11 +101,25 @@ MODULEDIR  = pg_strom
 DATA = $(STROM_SQL)
 OBJS = $(STROM_OBJS)
 DATA_built = $(CUDA_OPT_OBJS) $(CUDA_DBG_OBJS)
-EXTRA_CLEAN = $(CUDA_OPT_OBJS) $(CUDA_DBG_OBJS)
+EXTRA_CLEAN = $(DATA_built) $(GENERATED-HEADERS)
 EXTENSION = pg_strom
 
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+#
+# Device Attributes
+#
+submake-generated-headers: $(GENERATED-HEADERS)
+
+$(GPU_DEVATTRS_H): $(CUDA_IPATH)/cuda.h
+	cat $(CUDA_IPATH)/cuda.h | \
+	grep -E '^[ ]+CU_DEVICE_ATTRIBUTE_' | \
+	grep -v -E 'CU_DEVICE_ATTRIBUTE_MAX$$' | \
+	grep -v 'Deprecated[,\.]' | \
+	sed -e 's|[ ]*CU_DEVICE_ATTRIBUTE_|DEV_ATTR(|g' \
+	    -e 's| =.*/\*\*<[ ]*|, "|g' \
+	    -e 's|[ ]*\*/|")|g' > $@
 
 #
 # GPU Device Code

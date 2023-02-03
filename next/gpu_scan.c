@@ -21,27 +21,11 @@ static bool					enable_gpuscan;		/* GUC */
 static bool					enable_pullup_outer_scan;	/* GUC */
 
 /*
- * form/deform private information of CustomScan(GpuScan)
+ * form_gpuscan_info
+ *
+ * GpuScanInfo --> custom_private/custom_exprs
  */
-typedef struct
-{
-	const Bitmapset *gpu_cache_devs; /* device for GpuCache, if any */
-	const Bitmapset *gpu_direct_devs; /* device for GPU-Direct SQL, if any */
-	bytea		   *kern_quals;		/* device qualifiers */
-	bytea		   *kern_projs;		/* device projection */
-	uint32_t		extra_flags;
-	uint32_t		extra_bufsz;
-	uint32_t		kvars_nslots;
-	uint32_t		nrows_per_block;	/* average # rows per block */
-	const Bitmapset *outer_refs;	/* referenced columns */
-	List		   *used_params;	/* Param list in use */
-	List		   *dev_quals;		/* Device qualifiers */
-	Oid				index_oid;		/* OID of BRIN-index, if any */
-	List		   *index_conds;	/* BRIN-index key conditions */
-	List		   *index_quals;	/* Original BRIN-index qualifier*/
-} GpuScanInfo;
-
-static void
+void
 form_gpuscan_info(CustomScan *cscan, GpuScanInfo *gs_info)
 {
 	List	   *privs = NIL;
@@ -49,27 +33,16 @@ form_gpuscan_info(CustomScan *cscan, GpuScanInfo *gs_info)
 
 	privs = lappend(privs, bms_to_pglist(gs_info->gpu_cache_devs));
 	privs = lappend(privs, bms_to_pglist(gs_info->gpu_direct_devs));
-	privs = lappend(privs, makeConst(BYTEAOID,
-									 -1,
-									 InvalidOid,
-									 -1,
-									 PointerGetDatum(gs_info->kern_quals),
-									 (gs_info->kern_quals == NULL),
-									 false));
-	privs = lappend(privs, makeConst(BYTEAOID,
-									 -1,
-									 InvalidOid,
-									 -1,
-									 PointerGetDatum(gs_info->kern_projs),
-									 (gs_info->kern_projs == NULL),
-									 false));
+	privs = lappend(privs, __makeByteaConst(gs_info->kern_quals));
+	privs = lappend(privs, __makeByteaConst(gs_info->kern_projs));
 	privs = lappend(privs, makeInteger(gs_info->extra_flags));
 	privs = lappend(privs, makeInteger(gs_info->extra_bufsz));
 	privs = lappend(privs, makeInteger(gs_info->kvars_nslots));
-	privs = lappend(privs, makeInteger(gs_info->nrows_per_block));
 	privs = lappend(privs, bms_to_pglist(gs_info->outer_refs));
 	exprs = lappend(exprs, gs_info->used_params);
 	exprs = lappend(exprs, gs_info->dev_quals);
+	privs = lappend(privs, __makeFloat(gs_info->scan_tuples));
+	privs = lappend(privs, __makeFloat(gs_info->scan_rows));
 	privs = lappend(privs, makeInteger(gs_info->index_oid));
 	privs = lappend(privs, gs_info->index_conds);
 	exprs = lappend(exprs, gs_info->index_quals);
@@ -78,30 +51,31 @@ form_gpuscan_info(CustomScan *cscan, GpuScanInfo *gs_info)
 	cscan->custom_exprs = exprs;
 }
 
-static void
+/*
+ * deform_gpuscan_info
+ *
+ * custom_private/custom_exprs -> GpuScanInfo
+ */
+void
 deform_gpuscan_info(GpuScanInfo *gs_info, CustomScan *cscan)
 {
 	List	   *privs = cscan->custom_private;
 	List	   *exprs = cscan->custom_exprs;
 	int			pindex = 0;
 	int			eindex = 0;
-	Const	   *con;
 
 	gs_info->gpu_cache_devs = bms_from_pglist(list_nth(privs, pindex++));
 	gs_info->gpu_direct_devs = bms_from_pglist(list_nth(privs, pindex++));
-	con = list_nth(privs, pindex++);
-	if (!con->constisnull)
-		gs_info->kern_quals	= DatumGetByteaP(con->constvalue);
-	con = list_nth(privs, pindex++);
-	if (!con->constisnull)
-		gs_info->kern_projs = DatumGetByteaP(con->constvalue);
+	gs_info->kern_quals	    = __getByteaConst(list_nth(privs, pindex++));
+	gs_info->kern_projs     = __getByteaConst(list_nth(privs, pindex++));
 	gs_info->extra_flags	= intVal(list_nth(privs, pindex++));
 	gs_info->extra_bufsz	= intVal(list_nth(privs, pindex++));
 	gs_info->kvars_nslots   = intVal(list_nth(privs, pindex++));
-	gs_info->nrows_per_block = intVal(list_nth(privs, pindex++));
 	gs_info->outer_refs		= bms_from_pglist(list_nth(privs, pindex++));
 	gs_info->used_params	= list_nth(exprs, eindex++);
 	gs_info->dev_quals		= list_nth(exprs, eindex++);
+	gs_info->scan_tuples    = floatVal(list_nth(privs, pindex++));
+	gs_info->scan_rows      = floatVal(list_nth(privs, pindex++));
 	gs_info->index_oid		= intVal(list_nth(privs, pindex++));
 	gs_info->index_conds	= list_nth(privs, pindex++);
 	gs_info->index_quals	= list_nth(exprs, eindex++);
@@ -139,39 +113,127 @@ typedef struct
 } GpuScanState;
 
 /*
- * create_gpuscan_path - constructor of CustomPath(GpuScan) node
+ * xpuOperatorCostRatio
  */
-static CustomPath *
-create_gpuscan_path(PlannerInfo *root,
-					RelOptInfo *baserel,
-					List *dev_quals,
-					List *host_quals,
-					bool parallel_aware,	/* for parallel-scan */
-					IndexOptInfo *indexOpt,	/* for BRIN-index */
-					List *indexConds,		/* for BRIN-index */
-					List *indexQuals,		/* for BRIN-index */
-					int64_t indexNBlocks)	/* for BRIN-index */
+double
+xpuOperatorCostRatio(uint32_t devkind)
 {
-	GpuScanInfo	   *gs_info = palloc0(sizeof(GpuScanInfo));
-	CustomPath	   *cpath = makeNode(CustomPath);
-	ParamPathInfo  *param_info;
+	double	xpu_ratio;
+
+	switch (devkind)
+	{
+		case DEVKIND__NVIDIA_GPU:
+			/* GPU computation cost */
+			if (cpu_operator_cost > 0.0)
+				xpu_ratio = pgstrom_gpu_operator_cost / cpu_operator_cost;
+			else if (pgstrom_gpu_operator_cost == 0.0)
+				xpu_ratio = 1.0;
+			else
+				xpu_ratio = disable_cost;	/* very large but still finite */
+			break;
+
+		case DEVKIND__NVIDIA_DPU:
+			/* DPU computation cost */
+			if (cpu_operator_cost > 0.0)
+				xpu_ratio = pgstrom_dpu_operator_cost / cpu_operator_cost;
+			else if (pgstrom_dpu_operator_cost == 0.0)
+				xpu_ratio = 1.0;
+			else
+				xpu_ratio = disable_cost;	/* very large but still finite */
+			break;
+
+		default:
+			xpu_ratio = 1.0;
+			break;
+	}
+	return xpu_ratio;
+}
+
+/*
+ * xpuTupleCost
+ */
+Cost
+xpuTupleCost(uint32_t devkind)
+{
+	switch (devkind)
+	{
+		case DEVKIND__NVIDIA_GPU:
+			return pgstrom_gpu_tuple_cost;
+		case DEVKIND__NVIDIA_DPU:
+			return pgstrom_dpu_tuple_cost;
+		default:
+			break;
+	}
+	return 0.0;		/* CPU don't need xPU-->Host DMA */
+}
+
+/*
+ * considerXpuScanPathParams
+ */
+bool
+considerXpuScanPathParams(PlannerInfo *root,
+						  RelOptInfo  *baserel,
+						  uint32_t devkind,
+						  bool parallel_aware,
+						  List *dev_quals,
+						  List *host_quals,
+						  int  *p_parallel_nworkers,
+						  Oid  *p_brin_index_oid,
+						  List **p_brin_index_conds,
+						  List **p_brin_index_quals,
+						  Cost *p_startup_cost,
+						  Cost *p_run_cost,
+						  Cost *p_final_cost,
+						  const Bitmapset **p_gpu_cache_devs,
+						  const Bitmapset **p_gpu_direct_devs,
+						  const DpuStorageEntry **p_ds_entry)
+{
+	RangeTblEntry  *rte = root->simple_rte_array[baserel->relid];
+	IndexOptInfo   *indexOpt = NULL;
+	List		   *indexConds = NIL;
+	List		   *indexQuals = NIL;
+	int64_t			indexNBlocks = 0;
 	int				parallel_nworkers = 0;
 	double			parallel_divisor = 1.0;
-	double			gpu_ratio = pgstrom_gpu_operator_cost / cpu_operator_cost;
-	double			brin_ratio = 1.0;
-	Cost			startup_cost = pgstrom_gpu_setup_cost;
-	Cost			startup_delay = 0.0;
+	const Bitmapset *gpu_cache_devs = NULL;
+	const Bitmapset *gpu_direct_devs = NULL;
+	const DpuStorageEntry *ds_entry = NULL;
+	Cost			startup_cost = 0.0;
+	Cost			disk_cost = 0.0;
 	Cost			run_cost = 0.0;
-	Cost			disk_scan_cost = 0.0;
-	double			selectivity;
+	Cost			final_cost = 0.0;
+	double			avg_seq_page_cost;
 	double			spc_seq_page_cost;
 	double			spc_rand_page_cost;
+	double			xpu_ratio = xpuOperatorCostRatio(devkind);
+	double			xpu_tuple_cost = xpuTupleCost(devkind);
 	QualCost		qcost;
 	double			ntuples;
-	double			nchunks;
-	int				nrows_per_block = 0;
+	double			selectivity;
 
-	/* CPU Parallel parameters */
+	/*
+	 * Brief check towards the supplied baserel
+	 */
+	Assert(IS_SIMPLE_REL(baserel));
+	Assert(devkind == DEVKIND__NVIDIA_GPU || devkind == DEVKIND__NVIDIA_DPU);
+	switch (rte->relkind)
+	{
+		case RELKIND_RELATION:
+		case RELKIND_MATVIEW:
+			if (get_relation_am(rte->relid, true) == HEAP_TABLE_AM_OID)
+				break;
+			return false;
+		case RELKIND_FOREIGN_TABLE:
+			if (baseRelIsArrowFdw(baserel))
+				break;
+			return false;
+		default:
+			return false;
+	}
+
+	/*
+	 * CPU Parallel parameters
+	 */
 	if (parallel_aware)
 	{
 		double	leader_contribution;
@@ -180,7 +242,7 @@ create_gpuscan_path(PlannerInfo *root,
 													baserel->pages, -1,
 													max_parallel_workers_per_gather);
 		if (parallel_nworkers <= 0)
-			return NULL;
+			return false;
 		parallel_divisor = (double)parallel_nworkers;
 		if (parallel_leader_participation)
 		{
@@ -189,148 +251,145 @@ create_gpuscan_path(PlannerInfo *root,
 				parallel_divisor += leader_contribution;
 		}
 	}
-	/* Has GpuCache? */
-//	gs_info->gpu_cache_devs = baseRelHasGpuCache(root, baserel);
-	/* Can use GPU-Direct SQL? */
-	gs_info->gpu_direct_devs = baseRelCanUseGpuDirect(root, baserel);
-	/* cost of full-disk scan */
+
+	/*
+	 * Check device special disk-scan mode
+	 */
 	get_tablespace_page_costs(baserel->reltablespace,
 							  &spc_rand_page_cost,
-							  &spc_seq_page_cost);
-	disk_scan_cost = spc_seq_page_cost * baserel->pages;
+							  &spc_seq_page_cost);	
+	switch (devkind)
+	{
+		case DEVKIND__NVIDIA_GPU:
+			startup_cost += pgstrom_gpu_setup_cost;
+			/* Is GPU-Cache available? */
+			//gpu_cache_devs = baseRelHasGpuCache(root, baserel);
+			/* Is GPU-Direct SQL available? */
+			gpu_direct_devs = GetOptimalGpuForBaseRel(root, baserel);
+			if (gpu_cache_devs)
+				avg_seq_page_cost = 0;
+			else if (gpu_direct_devs)
+				avg_seq_page_cost = spc_seq_page_cost * (1.0 - baserel->allvisfrac) +
+					pgstrom_gpu_direct_seq_page_cost * baserel->allvisfrac;
+			else
+				avg_seq_page_cost = spc_seq_page_cost;
+			break;
 
-	/* consideration of BRIN-index, if any */
+		case DEVKIND__NVIDIA_DPU:
+			startup_cost += pgstrom_dpu_setup_cost;
+			/* Is DPU-attached Storage available? */
+			ds_entry = GetOptimalDpuForBaseRel(root, baserel);
+			if (!ds_entry)
+				return false;
+			avg_seq_page_cost = (spc_seq_page_cost * (1.0 - baserel->allvisfrac) +
+								 pgstrom_dpu_seq_page_cost * baserel->allvisfrac);
+			break;
+
+		default:
+			/* should not happen */
+			avg_seq_page_cost = spc_seq_page_cost;
+			break;
+	}
+	/*
+	 * NOTE: ArrowGetForeignRelSize() already discount baserel->pages according
+	 * to the referenced columns, to adjust total amount of disk i/o.
+	 * So, we have nothing special to do here.
+	 */
+	disk_cost = avg_seq_page_cost * baserel->pages;
+	ntuples =  baserel->tuples;
+
+	/*
+	 * Is BRIN-index available?
+	 */
+	indexOpt = pgstromTryFindBrinIndex(root, baserel,
+									   &indexConds,
+									   &indexQuals,
+									   &indexNBlocks);
 	if (indexOpt)
 	{
-		BrinStatsData	statsData;
-		Relation		indexRel;
-		Cost			index_scan_cost;
-		double			index_nitems;
-		ListCell	   *lc;
-
-		indexRel = index_open(indexOpt->indexoid, AccessShareLock);
-		brinGetStats(indexRel, &statsData);
-		index_close(indexRel, AccessShareLock);
-
-		get_tablespace_page_costs(indexOpt->reltablespace,
-								  &spc_rand_page_cost,
-								  &spc_seq_page_cost);
-		index_scan_cost = spc_rand_page_cost * statsData.revmapNumPages;
-		index_nitems = ceil(baserel->pages / (double)statsData.pagesPerRange);
-		foreach (lc, indexQuals)
+		Cost	index_disk_cost = (cost_brin_bitmap_build(root,
+														  baserel,
+														  indexOpt,
+														  indexQuals) +
+								   avg_seq_page_cost * indexNBlocks);
+		if (disk_cost > index_disk_cost)
 		{
-			cost_qual_eval_node(&qcost, (Node *)lfirst(lc), root);
-			index_scan_cost += (qcost.startup +
-								qcost.per_tuple * index_nitems);
-		}
-		index_scan_cost += spc_seq_page_cost * indexNBlocks;
-		if (disk_scan_cost > index_scan_cost)
-		{
-			disk_scan_cost = index_scan_cost;
+			disk_cost = index_disk_cost;
 			if (baserel->pages > 0)
-				brin_ratio = (double)indexNBlocks / (double)baserel->pages;
+				ntuples *= (double)indexNBlocks / (double)baserel->pages;
 		}
 		else
 			indexOpt = NULL;	/* disables BRIN-index if no benefit */
 	}
+	run_cost += disk_cost;
 
 	/*
-	 * Cost discount for more efficient I/O with multiplexing.
-	 * PG background workers can issue read request to filesystem
-	 * concurrently. It enables to work I/O subsystem during blocking-
-	 * time for other workers, then, it pulls up usage ratio of the
-	 * storage system.
+	 * Cost for xPU qualifiers
 	 */
-	if (parallel_nworkers > 0)
-		disk_scan_cost /= Min(2.0, sqrt(parallel_divisor));
-
-	/*
-	 * Discount dist_scan_cost if we can use GPU-Direct SQL on the source
-	 * table. It offers much much efficient i/o subsystem to load database
-	 * blocks to GPU device.
-	 */
-	if (gs_info->gpu_direct_devs)
-		disk_scan_cost /= 2.0;
-	if (!gs_info->gpu_cache_devs)
-		run_cost += disk_scan_cost;
-
-	/*
-	 * Size estimation
-	 */
-	selectivity = clauselist_selectivity(root,
-										 dev_quals,
-										 baserel->relid,
-										 JOIN_INNER,
-										 NULL);
-	nchunks = ceil((double)baserel->pages /
-				   (double)(PGSTROM_CHUNK_SIZE / BLCKSZ - 1));
-	if (baserel->pages > 0)
-		nrows_per_block = ceil(baserel->tuples / (double)baserel->pages);
-
-	/* Cost for GPU qualifiers */
-	ntuples = baserel->tuples * brin_ratio;
-	cost_qual_eval_node(&qcost, (Node *)dev_quals, root);
-	startup_cost += qcost.startup;
-	run_cost += qcost.per_tuple * gpu_ratio * ntuples;
-	ntuples *= selectivity;		/* rows after dev_quals */
-
-	/* Cost for DMA receive (GPU-->Host) */
-	run_cost += pgstrom_gpu_dma_cost * ntuples;
-
-	/* cost for CPU qualifiers */
-	cost_qual_eval(&qcost, host_quals, root);
-	startup_cost += qcost.startup;
-	run_cost += qcost.per_tuple * ntuples;
-
-	/* PPI costs (as a part of host quals, if any) */
-	param_info = get_baserel_parampathinfo(root, baserel,
-										   baserel->lateral_relids);
-	if (param_info)
+	if (dev_quals != NIL)
 	{
-		List   *ppi_quals = param_info->ppi_clauses;
-
-		cost_qual_eval(&qcost, ppi_quals, root);
+		cost_qual_eval_node(&qcost, (Node *)dev_quals, root);
 		startup_cost += qcost.startup;
-		run_cost += qcost.per_tuple * ntuples;
+		run_cost += qcost.per_tuple * xpu_ratio * ntuples / parallel_divisor;
+
+		selectivity = clauselist_selectivity(root,
+											 dev_quals,
+											 baserel->relid,
+											 JOIN_INNER,
+											 NULL);
+		ntuples *= selectivity;		/* rows after dev_quals */
 	}
 
-	/* Cost for Projection */
-	startup_cost += baserel->reltarget->cost.startup;
-	run_cost += baserel->reltarget->cost.per_tuple * baserel->rows;
-
-	/* Latency to get the first chunk */
-	if (nchunks > 0)
-		startup_delay = run_cost * (1.0 / nchunks);
-
-	/* setup GpuScanInfo (Path phase) */
-	gs_info->nrows_per_block = nrows_per_block;
-	if (indexOpt)
+	/*
+	 * Cost for DMA receive (xPU-->Host)
+	 */
+	final_cost += xpu_tuple_cost * ntuples;
+	
+	/*
+	 * Cost for host qualifiers
+	 */
+	if (host_quals != NIL)
 	{
-		gs_info->index_oid = indexOpt->indexoid;
-		gs_info->index_conds = indexConds;
-		gs_info->index_quals = indexQuals;
-	}
-	/* setup CustomPath */
-	cpath->path.pathtype = T_CustomScan;
-    cpath->path.parent = baserel;
-    cpath->path.pathtarget = baserel->reltarget;
-    cpath->path.param_info = param_info;
-    cpath->path.parallel_aware = parallel_nworkers > 0 ? true : false;
-    cpath->path.parallel_safe = baserel->consider_parallel;
-    cpath->path.parallel_workers = parallel_nworkers;
-	if (param_info)
-		cpath->path.rows = param_info->ppi_rows / parallel_divisor;
-	else
-		cpath->path.rows = baserel->rows / parallel_divisor;
-	cpath->path.startup_cost = startup_cost + startup_delay;
-	cpath->path.total_cost = startup_cost + run_cost;
-	cpath->path.pathkeys = NIL; /* unsorted results */
-	cpath->flags = 0;
-	cpath->custom_paths = NIL;
-	cpath->custom_private = list_make1(gs_info);
-	cpath->methods = &gpuscan_path_methods;
+		cost_qual_eval_node(&qcost, (Node *)dev_quals, root);
+		startup_cost += qcost.startup;
+		final_cost += qcost.per_tuple * ntuples / parallel_divisor;
 
-	return cpath;
+		selectivity = clauselist_selectivity(root,
+											 host_quals,
+											 baserel->relid,
+											 JOIN_INNER,
+											 NULL);
+		ntuples *= selectivity;		/* rows after host_quals */
+	}
+	/*
+	 * Cost for host projection
+	 */
+	startup_cost += baserel->reltarget->cost.startup;
+	final_cost += baserel->reltarget->cost.per_tuple * baserel->rows;
+
+	/* Write back the result */
+	if (p_parallel_nworkers)
+		*p_parallel_nworkers = parallel_nworkers;
+	if (p_brin_index_oid)
+		*p_brin_index_oid = (indexOpt ? indexOpt->indexoid : InvalidOid);
+	if (p_brin_index_conds)
+		*p_brin_index_conds = (indexOpt ? indexConds : NIL);
+	if (p_brin_index_quals)
+		*p_brin_index_quals = (indexOpt ? indexQuals : NIL);
+	if (p_startup_cost)
+		*p_startup_cost = startup_cost;
+	if (p_run_cost)
+		*p_run_cost = run_cost;
+	if (p_final_cost)
+		*p_final_cost = final_cost;
+	if (p_gpu_cache_devs)
+		*p_gpu_cache_devs = gpu_cache_devs;
+	if (p_gpu_direct_devs)
+		*p_gpu_direct_devs = gpu_direct_devs;
+	if (p_ds_entry)
+		*p_ds_entry = ds_entry;
+
+	return true;
 }
 
 /*
@@ -342,13 +401,10 @@ GpuScanAddScanPath(PlannerInfo *root,
 				   Index rtindex,
 				   RangeTblEntry *rte)
 {
-	CustomPath *cpath;
+	List	   *input_rels_tlist;
 	List	   *dev_quals = NIL;
 	List	   *host_quals = NIL;
-	IndexOptInfo *indexOpt;
-	List	   *indexConds;
-	List	   *indexQuals;
-	int64_t		indexNBlocks;
+	ParamPathInfo *param_info;
 	ListCell   *lc;
 
 	/* call the secondary hook */
@@ -363,72 +419,98 @@ GpuScanAddScanPath(PlannerInfo *root,
 	/* It is the role of built-in Append node */
 	if (rte->inh)
 		return;
-
-	/* GpuScan can run on heap relations or arrow_fdw table */
-	switch (rte->relkind)
-	{
-		case RELKIND_RELATION:
-		case RELKIND_MATVIEW:
-			if (get_relation_am(rte->relid, true) != HEAP_TABLE_AM_OID)
-				return;
-			break;
-
-		case RELKIND_FOREIGN_TABLE:
-#if 0
-			if (!baseRelIsArrowFdw(baserel))
-				return;
-			break;
-#else
-			return;
-#endif
-		default:
-			/* not supported */
-			return;
-	}
-
-	/* Check whether the qualifier can run on GPU device */
+	/*
+	 * check whether the qualifier can run on GPU device
+	 */
+	input_rels_tlist = list_make1(makeInteger(baserel->relid));
 	foreach (lc, baserel->baserestrictinfo)
 	{
 		RestrictInfo *rinfo = lfirst(lc);
-		List	   *input_rels_tlist = list_make1(makeInteger(baserel->relid));
 
-		if (pgstrom_gpu_expression(rinfo->clause, input_rels_tlist, NULL))
+		if (pgstrom_gpu_expression(rinfo->clause,
+								   input_rels_tlist,
+								   NULL))
 			dev_quals = lappend(dev_quals, rinfo);
 		else
 			host_quals = lappend(host_quals, rinfo);
 	}
-	if (dev_quals == NIL)
-		return;
-
-	/* Check opportunity of GpuScan+BRIN-index */
-	indexOpt = pgstromTryFindBrinIndex(root, baserel,
-									   &indexConds,
-									   &indexQuals,
-									   &indexNBlocks);
-	/* add GpuScan path in single process */
-	cpath = create_gpuscan_path(root, baserel,
-								dev_quals,
-								host_quals,
-								false,
-								indexOpt,
-								indexConds,
-								indexQuals,
-								indexNBlocks);
-	if (cpath && custom_path_remember(root, baserel, false, false, cpath))
-		add_path(baserel, &cpath->path);
-	/* If appropriate, consider parallel GpuScan */
-	if (baserel->consider_parallel && baserel->lateral_relids == NULL)
+	/*
+	 * check parametalized qualifiers
+	 */
+	param_info = get_baserel_parampathinfo(root, baserel,
+										   baserel->lateral_relids);
+	if (param_info)
 	{
-		cpath = create_gpuscan_path(root, baserel,
-									dev_quals,
-									host_quals,
-									true,
-									indexOpt,
-									indexConds,
-									indexQuals,
-									indexNBlocks);
-		if (cpath && custom_path_remember(root, baserel, true, false, cpath))
-			add_partial_path(baserel, &cpath->path);
+		foreach (lc, param_info->ppi_clauses)
+		{
+			RestrictInfo *rinfo = lfirst(lc);
+
+			if (pgstrom_gpu_expression(rinfo->clause,
+									   input_rels_tlist,
+									   NULL))
+				dev_quals = lappend(dev_quals, rinfo);
+			else
+				host_quals = lappend(host_quals, rinfo);
+		}
+	}
+	
+	/* Creation of GpuScan path */
+	for (int try_parallel=0; try_parallel < 2; try_parallel++)
+	{
+		GpuScanInfo		gs_data;
+		GpuScanInfo	   *gs_info;
+		CustomPath	   *cpath;
+		ParamPathInfo  *param_info = NULL;
+		int				parallel_nworkers = 0;
+		Cost			startup_cost = 0.0;
+		Cost			run_cost = 0.0;
+		Cost			final_cost = 0.0;
+
+		memset(&gs_data, 0, sizeof(GpuScanInfo));
+		if (!considerXpuScanPathParams(root,
+									   baserel,
+									   DEVKIND__NVIDIA_GPU,
+									   try_parallel > 0,	/* parallel_aware */
+									   dev_quals,
+									   host_quals,
+									   &parallel_nworkers,
+									   &gs_data.index_oid,
+									   &gs_data.index_conds,
+									   &gs_data.index_quals,
+									   &startup_cost,
+									   &run_cost,
+									   &final_cost,
+									   &gs_data.gpu_cache_devs,
+									   &gs_data.gpu_direct_devs,
+									   NULL))
+			return;
+
+		/* setup GpuScanInfo (Path phase) */
+		gs_info = pmemdup(&gs_data, sizeof(GpuScanInfo));
+		cpath = makeNode(CustomPath);
+		cpath->path.pathtype = T_CustomScan;
+		cpath->path.parent = baserel;
+		cpath->path.pathtarget = baserel->reltarget;
+		cpath->path.param_info = param_info;
+		cpath->path.parallel_aware = (try_parallel > 0);
+		cpath->path.parallel_safe = baserel->consider_parallel;
+		cpath->path.parallel_workers = parallel_nworkers;
+		cpath->path.rows = (param_info ? param_info->ppi_rows : baserel->rows);
+		cpath->path.startup_cost = startup_cost;
+		cpath->path.total_cost = startup_cost + run_cost + final_cost;
+		cpath->path.pathkeys = NIL; /* unsorted results */
+		cpath->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+		cpath->custom_paths = NIL;
+		cpath->custom_private = list_make1(gs_info);
+		cpath->methods = &gpuscan_path_methods;
+
+		if (custom_path_remember(root, baserel, (try_parallel > 0), cpath))
+		{
+			if (try_parallel == 0)
+				add_path(baserel, &cpath->path);
+			else
+				add_partial_path(baserel, &cpath->path);
+		}
 	}
 }
 
@@ -529,17 +611,66 @@ gpuscan_build_projection(RelOptInfo *baserel,
 }
 
 /*
- * PlanGpuScanPath
+ * sort_device_qualifiers
  */
-static Plan *
-PlanGpuScanPath(PlannerInfo *root,
-				RelOptInfo *baserel,
-				CustomPath *best_path,
-				List *tlist,
-				List *clauses,
-				List *custom_children)
+void
+sort_device_qualifiers(List *dev_quals_list, List *dev_costs_list)
 {
-	GpuScanInfo	   *gs_info = linitial(best_path->custom_private);
+	int			nitems = list_length(dev_quals_list);
+	ListCell  **dev_quals = alloca(sizeof(ListCell *) * nitems);
+	int		   *dev_costs = alloca(sizeof(int) * nitems);
+	int			i, j, k;
+	ListCell   *lc1, *lc2;
+
+	i = 0;
+	forboth (lc1, dev_quals_list,
+			 lc2, dev_costs_list)
+	{
+		dev_quals[i] = lc1;
+		dev_costs[i] = lfirst_int(lc2);
+		i++;
+	}
+	Assert(i == nitems);
+
+	for (i=0; i < nitems; i++)
+	{
+		int		dcost = dev_costs[i];
+		void   *dqual = dev_quals[i]->ptr_value;
+
+		k = i;
+		for (j=i+1; j < nitems; j++)
+		{
+			if (dcost > dev_costs[j])
+			{
+				dcost = dev_costs[j];
+				dqual = dev_quals[j]->ptr_value;
+				k = j;
+			}
+		}
+
+		if (i != k)
+		{
+			dev_costs[k] = dev_costs[i];
+			dev_costs[i] = dcost;
+			dev_quals[k]->ptr_value = dev_quals[i]->ptr_value;
+			dev_quals[i]->ptr_value = dqual;
+		}
+	}
+}
+
+/*
+ * PlanXpuScanPathCommon
+ */
+CustomScan *
+PlanXpuScanPathCommon(PlannerInfo *root,
+					  RelOptInfo  *baserel,
+					  CustomPath  *best_path,
+					  List        *tlist,
+					  List        *clauses,
+					  GpuScanInfo *gs_info,
+					  const CustomScanMethods *xpuscan_plan_methods)
+{
+	codegen_context context;
 	CustomScan	   *cscan;
 	List		   *host_quals = NIL;
 	List		   *dev_quals = NIL;
@@ -547,25 +678,7 @@ PlanGpuScanPath(PlannerInfo *root,
 	List		   *tlist_dev = NIL;
 	List		   *input_rels_tlist = list_make1(makeInteger(baserel->relid));
 	Bitmapset	   *outer_refs = NULL;
-	uint32_t		qual_extra_bufsz = 0;
-	uint32_t		proj_extra_bufsz = 0;
-	uint32_t		qual_kvars_nslots = 0;
-	uint32_t		proj_kvars_nslots = 0;
-	int				j, k;
 	ListCell	   *cell;
-
-	/* sanity checks */
-	Assert(baserel->relid > 0 &&
-		   baserel->rtekind == RTE_RELATION &&
-		   custom_children == NIL);
-	/* check referenced columns */
-	for (j=baserel->min_attr; j <= baserel->max_attr; j++)
-	{
-		if (!baserel->attr_needed[j - baserel->min_attr])
-			continue;
-		k = j - FirstLowInvalidHeapAttributeNumber;
-		outer_refs = bms_add_member(outer_refs, k);
-	}
 
 	/*
 	 * Distribution of clauses into device executable and others.
@@ -578,25 +691,8 @@ PlanGpuScanPath(PlannerInfo *root,
 		Assert(exprType((Node *)rinfo->clause) == BOOLOID);
 		if (pgstrom_gpu_expression(rinfo->clause, input_rels_tlist, &devcost))
 		{
-			ListCell   *lc1, *lc2;
-			int			pos = 0;
-
-			forboth (lc1, dev_quals,
-					 lc2, dev_costs)
-			{
-				if (devcost < lfirst_int(lc2))
-				{
-					dev_quals = list_insert_nth(dev_quals, pos, rinfo);
-					dev_costs = list_insert_nth_int(dev_quals, pos, devcost);
-					break;
-				}
-				pos++;
-			}
-			if (!lc1 && !lc2)
-			{
-				dev_quals = lappend(dev_quals, rinfo);
-				dev_costs = lappend_int(dev_costs, devcost);
-			}
+			dev_quals = lappend(dev_quals, rinfo);
+			dev_costs = lappend_int(dev_costs, devcost);
 		}
 		else
 		{
@@ -606,38 +702,32 @@ PlanGpuScanPath(PlannerInfo *root,
 	}
 	if (dev_quals == NIL)
 		elog(ERROR, "GpuScan: Bug? no device executable qualifiers are given");
+	sort_device_qualifiers(dev_quals, dev_costs);
 	dev_quals = extract_actual_clauses(dev_quals, false);
 	host_quals = extract_actual_clauses(host_quals, false);
+	/* pickup referenced attributes */
+	outer_refs = pickup_outer_referenced(root, baserel, outer_refs);
 
 	/* code generation for WHERE-clause */
-	pgstrom_build_xpucode(&gs_info->kern_quals,
-						  (Expr *)dev_quals,
-						  input_rels_tlist,
-						  &gs_info->extra_flags,
-						  &qual_extra_bufsz,
-						  &qual_kvars_nslots,
-						  &gs_info->used_params);
+	codegen_context_init(&context, DEVKIND__NVIDIA_GPU);
+	context.input_rels_tlist = input_rels_tlist;
+	gs_info->kern_quals = codegen_build_qualifiers(&context, dev_quals);
 	/* code generation for the Projection */
 	tlist_dev = gpuscan_build_projection(baserel,
 										 tlist,
 										 host_quals,
 										 dev_quals,
 										 input_rels_tlist);
-	pgstrom_build_projection(&gs_info->kern_projs,
-							 tlist_dev,
-							 input_rels_tlist,
-							 &gs_info->extra_flags,
-							 &proj_extra_bufsz,
-							 &proj_kvars_nslots,
-							 &gs_info->used_params);
-	gs_info->extra_bufsz = Max(qual_extra_bufsz,
-							   proj_extra_bufsz);
-	gs_info->kvars_nslots = Max(qual_kvars_nslots,
-								proj_kvars_nslots);
-	elog(INFO, "qual_kvars_nslots=%d proj_kvars_nslots=%d", qual_kvars_nslots, proj_kvars_nslots);
+	gs_info->kern_projs = codegen_build_projection(&context, tlist_dev);
+	gs_info->extra_flags = context.extra_flags;
+	gs_info->extra_bufsz = context.extra_bufsz;
+	gs_info->kvars_nslots = context.kvars_nslots;
+	gs_info->used_params = context.used_params;
 	gs_info->dev_quals = dev_quals;
 	gs_info->outer_refs = outer_refs;
-	
+	gs_info->scan_tuples = baserel->tuples;
+	gs_info->scan_rows = baserel->rows;
+
 	/*
 	 * Build CustomScan(GpuScan) node
 	 */
@@ -646,11 +736,40 @@ PlanGpuScanPath(PlannerInfo *root,
 	cscan->scan.plan.qual = host_quals;
 	cscan->scan.scanrelid = baserel->relid;
 	cscan->flags = best_path->flags;
-	cscan->methods = &gpuscan_plan_methods;
+	cscan->methods = xpuscan_plan_methods;
 	cscan->custom_plans = NIL;
 	cscan->custom_scan_tlist = tlist_dev;
-	form_gpuscan_info(cscan, gs_info);
 
+	return cscan;
+}
+
+/*
+ * PlanGpuScanPath
+ */
+static Plan *
+PlanGpuScanPath(PlannerInfo *root,
+				RelOptInfo *baserel,
+				CustomPath *best_path,
+				List *tlist,
+				List *clauses,
+				List *custom_children)
+{
+	GpuScanInfo	   *gs_info = linitial(best_path->custom_private);
+	CustomScan	   *cscan;
+
+	/* sanity checks */
+	Assert(baserel->relid > 0 &&
+		   baserel->rtekind == RTE_RELATION &&
+		   custom_children == NIL);
+
+	cscan = PlanXpuScanPathCommon(root,
+								  baserel,
+								  best_path,
+								  tlist,
+								  clauses,
+								  gs_info,
+								  &gpuscan_plan_methods);
+	form_gpuscan_info(cscan, gs_info);
 	return &cscan->scan.plan;
 }
 
@@ -662,10 +781,12 @@ CreateGpuScanState(CustomScan *cscan)
 {
 	GpuScanState   *gss = palloc0(sizeof(GpuScanState));
 
+	Assert(cscan->methods == &gpuscan_plan_methods);
+
 	/* Set tag and executor callbacks */
 	NodeSetTag(gss, T_CustomScanState);
+	gss->pts.devkind = DEVKIND__NVIDIA_GPU;
 	gss->pts.css.flags = cscan->flags;
-	Assert(cscan->methods == &gpuscan_plan_methods);
 	gss->pts.css.methods = &gpuscan_exec_methods;
 	deform_gpuscan_info(&gss->gs_info, cscan);
 
@@ -684,13 +805,14 @@ ExecInitGpuScan(CustomScanState *node, EState *estate, int eflags)
 	Assert(node->ss.ss_currentRelation != NULL &&
 		   outerPlanState(node) == NULL &&
 		   innerPlanState(node) == NULL);
-	pgstromBrinIndexExecBegin(&gss->pts,
-							  gss->gs_info.index_oid,
-							  gss->gs_info.index_conds,
-							  gss->gs_info.index_quals);
-	//pgstromGpuCacheExecBegin here
-	//pgstromGpuDirectExecBegin here
-	pgstromExecInitTaskState(&gss->pts, gss->gs_info.dev_quals);
+	pgstromExecInitTaskState(&gss->pts,
+							 DEVKIND__NVIDIA_GPU,
+							 gss->gs_info.dev_quals,
+							 gss->gs_info.outer_refs,
+							 gss->gs_info.index_oid,
+							 gss->gs_info.index_conds,
+							 gss->gs_info.index_quals);
+	gss->pts.cb_cpu_fallback = ExecFallbackCpuScan;
 }
 
 /*
@@ -715,23 +837,22 @@ ExecGpuScan(CustomScanState *node)
 	GpuScanState   *gss = (GpuScanState *)node;
 
 	if (!gss->pts.ps_state)
-		pgstromSharedStateInitDSM(&gss->pts, NULL);
+		pgstromSharedStateInitDSM(&gss->pts, NULL, NULL);
 	if (!gss->pts.conn)
 	{
 		const XpuCommand *session;
-		const Bitmapset *gpuset = NULL;
 
 		session = pgstromBuildSessionInfo(&gss->pts.css.ss.ps,
 										  gss->gs_info.used_params,
 										  gss->gs_info.extra_bufsz,
 										  gss->gs_info.kvars_nslots,
 										  gss->gs_info.kern_quals,
-										  gss->gs_info.kern_projs);
-		if (gss->pts.gc_state)
-			gpuset = gss->gs_info.gpu_cache_devs;
-		else if (gss->pts.gd_state)
-			gpuset = gss->gs_info.gpu_direct_devs;
-		gpuClientOpenSession(&gss->pts, gpuset, session);
+										  gss->gs_info.kern_projs,
+										  NULL,	/* join_quals */
+										  NULL,	/* hash_values */
+										  NULL,	/* gist_quals */
+										  0);	/* No join_inner_handle */
+		gpuClientOpenSession(&gss->pts, gss->pts.optimal_gpus, session);
 	}
 	return ExecScan(&node->ss,
 					(ExecScanAccessMtd) pgstromExecTaskState,
@@ -778,20 +899,7 @@ InitializeGpuScanDSM(CustomScanState *node,
 					 ParallelContext *pcxt,
 					 void *dsm_addr)
 {
-	pgstromSharedStateInitDSM((pgstromTaskState *)node, dsm_addr);
-}
-
-/*
- * ReInitializeGpuScanDSM
- */
-static void
-ReInitializeGpuScanDSM(CustomScanState *node,
-					   ParallelContext *pcxt,
-					   void *dsm_addr)
-{
-	GpuScanState   *gss = (GpuScanState *)node;
-
-	pgstromSharedStateReInitDSM(&gss->pts);
+	pgstromSharedStateInitDSM((pgstromTaskState *)node, pcxt, dsm_addr);
 }
 
 /*
@@ -800,9 +908,7 @@ ReInitializeGpuScanDSM(CustomScanState *node,
 static void
 InitGpuScanWorker(CustomScanState *node, shm_toc *toc, void *dsm_addr)
 {
-	GpuScanState   *gss = (GpuScanState *)node;
-		
-	pgstromSharedStateAttachDSM(&gss->pts, dsm_addr);
+	pgstromSharedStateAttachDSM((pgstromTaskState *)node, dsm_addr);
 }
 
 /*
@@ -811,9 +917,7 @@ InitGpuScanWorker(CustomScanState *node, shm_toc *toc, void *dsm_addr)
 static void
 ExecShutdownGpuScan(CustomScanState *node)
 {
-	GpuScanState   *gss = (GpuScanState *)node;
-
-	pgstromSharedStateShutdownDSM(&gss->pts);
+	pgstromSharedStateShutdownDSM((pgstromTaskState *)node);
 }
 
 /*
@@ -825,47 +929,151 @@ ExplainGpuScan(CustomScanState *node,
 			   ExplainState *es)
 {
 	GpuScanState   *gss = (GpuScanState *) node;
-	StringInfoData	temp;
+	GpuScanInfo	   *gs_info = &gss->gs_info;
+	CustomScan	   *cscan = (CustomScan *)node->ss.ps.plan;
+	List		   *dcontext;
 
-	initStringInfo(&temp);
-	pgstrom_explain_xpucode(&temp,
-							gss->gs_info.kern_quals,
-							&gss->pts.css,
-							es, ancestors);
-	ExplainPropertyText("GPU Quals", temp.data, es);
+	/* setup deparsing context */
+	dcontext = set_deparse_context_plan(es->deparse_cxt,
+										node->ss.ps.plan,
+										ancestors);
+	pgstromExplainScanState(&gss->pts, es,
+							gs_info->dev_quals,
+							gs_info->kern_quals,
+							cscan->custom_scan_tlist,
+							gs_info->kern_projs,
+							gs_info->scan_tuples,
+							gs_info->scan_rows,
+							dcontext);
+	pgstromExplainTaskState(&gss->pts, es, dcontext);
+}
 
-	resetStringInfo(&temp);
-	pgstrom_explain_xpucode(&temp,
-							gss->gs_info.kern_projs,
-							&gss->pts.css,
-							es, ancestors);
-	ExplainPropertyText("GPU Projection", temp.data, es);
+/*
+ * ExecFallbackCpuScan
+ */
+void
+ExecFallbackCpuScan(pgstromTaskState *pts, HeapTuple tuple)
+{
+	TupleTableSlot *scan_slot = pts->base_slot;
+	bool			should_free = false;
+
+	ExecForceStoreHeapTuple(tuple, scan_slot, false);
+	/* check WHERE-clause if any */
+	if (pts->base_quals)
+	{
+		ExprContext	   *econtext = pts->css.ss.ps.ps_ExprContext;
+
+		econtext->ecxt_scantuple = scan_slot;
+		ResetExprContext(econtext);
+		if (!ExecQual(pts->base_quals, econtext))
+			return;
+	}
+	/* apply Projection if any */
+	if (pts->base_proj)
+	{
+		TupleTableSlot *proj_slot = ExecProject(pts->base_proj);
+
+		tuple = ExecFetchSlotHeapTuple(proj_slot, false, &should_free);
+	}
+	/* save the tuple on the fallback buffer */
+	pgstromStoreFallbackTuple(pts, tuple);
+	if (should_free)
+		pfree(tuple);
 }
 
 /*
  * Handle GpuScan Commands
  */
-static void
-handleGpuScanExecRow(gpuClient *gclient,
-					 kern_data_store *kds_src,
-					 kern_data_store *kds_dst_head)
+void
+gpuservHandleGpuScanExec(gpuClient *gclient, XpuCommand *xcmd)
 {
 	kern_gpuscan	*kgscan = NULL;
+	const char		*kds_src_pathname = NULL;
+	strom_io_vector *kds_src_iovec = NULL;
+	kern_data_store *kds_src = NULL;
+	kern_data_extra	*kds_extra = NULL;
 	kern_data_store *kds_dst = NULL;
+	kern_data_store *kds_dst_head = NULL;
 	kern_data_store **kds_dst_array = NULL;
 	int				kds_dst_nrooms = 0;
 	int				kds_dst_nitems = 0;
 	CUfunction		f_kern_gpuscan;
+	const gpuMemChunk *chunk = NULL;
+	CUdeviceptr		m_kds_src = 0UL;
 	CUdeviceptr		dptr;
 	CUresult		rc;
 	int				grid_sz;
 	int				block_sz;
+	unsigned int	shmem_sz;
 	size_t			sz;
 	void		   *kern_args[5];
 
+	if (xcmd->u.scan.kds_src_pathname)
+		kds_src_pathname = (char *)xcmd + xcmd->u.scan.kds_src_pathname;
+	if (xcmd->u.scan.kds_src_iovec)
+		kds_src_iovec = (strom_io_vector *)((char *)xcmd + xcmd->u.scan.kds_src_iovec);
+	if (xcmd->u.scan.kds_src_offset)
+		kds_src = (kern_data_store *)((char *)xcmd + xcmd->u.scan.kds_src_offset);
+	if (xcmd->u.scan.kds_dst_offset)
+		kds_dst_head = (kern_data_store *)((char *)xcmd + xcmd->u.scan.kds_dst_offset);
+
+	if (!kds_src)
+	{
+		gpuClientELog(gclient, "KDS_FORMAT_COLUMN is not yet implemented");
+		return;
+	}
+	else if (kds_src->format == KDS_FORMAT_ROW)
+	{
+		m_kds_src = (CUdeviceptr)kds_src;
+	}
+	else if (kds_src->format == KDS_FORMAT_BLOCK)
+	{
+		if (kds_src_pathname && kds_src_iovec)
+		{
+			chunk = gpuservLoadKdsBlock(gclient,
+										kds_src,
+										kds_src_pathname,
+										kds_src_iovec);
+			if (!chunk)
+				return;
+			m_kds_src = chunk->m_devptr;
+		}
+		else
+		{
+			Assert(kds_src->block_nloaded == kds_src->nitems);
+			m_kds_src = (CUdeviceptr)kds_src;
+		}
+	}
+	else if (kds_src->format == KDS_FORMAT_ARROW)
+	{
+		if (kds_src_iovec->nr_chunks == 0)
+			m_kds_src = (CUdeviceptr)kds_src;
+		else
+		{
+			if (!kds_src_pathname)
+			{
+				gpuClientELog(gclient, "GpuScan: arrow file is missing");
+				return;
+			}
+			chunk = gpuservLoadKdsArrow(gclient,
+										kds_src,
+										kds_src_pathname,
+										kds_src_iovec);
+			if (!chunk)
+				return;
+			m_kds_src = chunk->m_devptr;
+		}
+	}
+	else
+	{
+		gpuClientELog(gclient, "unknown GpuScan Source format (%c)",
+					  kds_src->format);
+		return;
+	}
+
 	rc = cuModuleGetFunction(&f_kern_gpuscan,
 							 gclient->cuda_module,
-							 "kern_gpuscan_main_row");
+							 "kern_gpuscan_main");
 	if (rc != CUDA_SUCCESS)
 	{
 		gpuClientFatal(gclient, "failed on cuModuleGetFunction: %s",
@@ -875,47 +1083,53 @@ handleGpuScanExecRow(gpuClient *gclient,
 
 	rc = gpuOptimalBlockSize(&grid_sz,
 							 &block_sz,
+							 &shmem_sz,
 							 f_kern_gpuscan,
-							 CU_DINDEX_PER_THREAD,
-							 0, 0);
+							 0,
+							 KERN_WARP_CONTEXT_UNITSZ(0));
 	if (rc != CUDA_SUCCESS)
 	{
 		gpuClientFatal(gclient, "failed on gpuOptimalBlockSize: %s",
-					  cuStrError(rc));
+					   cuStrError(rc));
 		goto bailout;
 	}
 	
 	/*
 	 * Allocation of the control structure
 	 */
-	grid_sz = Min3(gpuDevAttrs->MULTIPROCESSOR_COUNT * 3,
-				   (kds_src->nitems + block_sz - 1) / block_sz,
-				   grid_sz);
-	sz = offsetof(kern_gpuscan, suspend_context[grid_sz]);
+	grid_sz = Min(grid_sz, (kds_src->nitems + block_sz - 1) / block_sz);
+
+//	block_sz = 32;
+//	grid_sz = 1;
+
+	sz = offsetof(kern_gpuscan, data) + shmem_sz * grid_sz;
 	rc = cuMemAllocManaged(&dptr, sz, CU_MEM_ATTACH_GLOBAL);
 	if (rc != CUDA_SUCCESS)
 	{
 		gpuClientFatal(gclient, "failed on cuMemAllocManaged(%lu): %s",
-					  sz, cuStrError(rc));
+					   sz, cuStrError(rc));
 		goto bailout;
 	}
 	kgscan = (kern_gpuscan *)dptr;
 	memset(kgscan, 0, sz);
 	kgscan->grid_sz		= grid_sz;
 	kgscan->block_sz	= block_sz;
-	
-	/* prefetch source KDS */
-	rc = cuMemPrefetchAsync((CUdeviceptr)kds_src,
-							kds_src->length,
-							CU_DEVICE_PER_THREAD,
-							CU_STREAM_PER_THREAD);
-	if (rc != CUDA_SUCCESS)
+
+	/* prefetch source KDS, if managed memory */
+	if (!chunk)
 	{
-		gpuClientFatal(gclient, "failed on cuMemPrefetchAsync: %s",
-					  cuStrError(rc));
-		goto bailout;
+		rc = cuMemPrefetchAsync((CUdeviceptr)kds_src,
+								kds_src->length,
+								CU_DEVICE_PER_THREAD,
+								CU_STREAM_PER_THREAD);
+		if (rc != CUDA_SUCCESS)
+		{
+			gpuClientFatal(gclient, "failed on cuMemPrefetchAsync: %s",
+						   cuStrError(rc));
+			goto bailout;
+		}
 	}
-	
+
 	/*
 	 * Allocation of the destination buffer
 	 */
@@ -950,13 +1164,14 @@ resume_kernel:
 	 */
 	kern_args[0] = &gclient->session;
 	kern_args[1] = &kgscan;
-	kern_args[2] = &kds_src;
-	kern_args[3] = &kds_dst;
+	kern_args[2] = &m_kds_src;
+	kern_args[3] = &kds_extra;
+	kern_args[4] = &kds_dst;
 
 	rc = cuLaunchKernel(f_kern_gpuscan,
 						grid_sz, 1, 1,
 						block_sz, 1, 1,
-						0,
+						shmem_sz,
 						CU_STREAM_PER_THREAD,
 						kern_args,
 						NULL);
@@ -1035,6 +1250,8 @@ bailout:
 		if (rc != CUDA_SUCCESS)
 			fprintf(stderr, "warning: failed on cuMemFree: %s\n", cuStrError(rc));
 	}
+	if (chunk)
+		gpuMemFree(chunk);
 	while (kds_dst_nitems > 0)
 	{
 		kds_dst = kds_dst_array[--kds_dst_nitems];
@@ -1042,32 +1259,6 @@ bailout:
 		rc = cuMemFree((CUdeviceptr)kds_dst);
 		if (rc != CUDA_SUCCESS)
 			fprintf(stderr, "warning: failed on cuMemFree: %s\n", cuStrError(rc));
-	}
-}
-
-void
-gpuservHandleGpuScanExec(gpuClient *gclient, XpuCommand *xcmd)
-{
-	kernExecScan	*kscan = &xcmd->u.scan;
-	kern_data_store *kds_src = NULL;
-	kern_data_store *kds_dst = NULL;
-
-	if (kscan->kds_src_offset)
-		kds_src = (kern_data_store *)((char *)kscan + kscan->kds_src_offset);
-	if (kscan->kds_dst_offset)
-		kds_dst = (kern_data_store *)((char *)kscan + kscan->kds_dst_offset);
-
-	if (!kds_src)
-	{
-		gpuClientELog(gclient, "KDS_FORMAT_COLUMN is not yet implemented");
-	}
-	else if (kds_src->format == KDS_FORMAT_ROW)
-	{
-		handleGpuScanExecRow(gclient, kds_src, kds_dst);
-	}
-	else
-	{
-		gpuClientELog(gclient, "unknown GpuScan Source format (%c)", kds_src->format);
 	}
 }
 
@@ -1117,7 +1308,6 @@ pgstrom_init_gpu_scan(void)
     gpuscan_exec_methods.EstimateDSMCustomScan = EstimateGpuScanDSM;
     gpuscan_exec_methods.InitializeDSMCustomScan = InitializeGpuScanDSM;
     gpuscan_exec_methods.InitializeWorkerCustomScan = InitGpuScanWorker;
-    gpuscan_exec_methods.ReInitializeDSMCustomScan = ReInitializeGpuScanDSM;
     gpuscan_exec_methods.ShutdownCustomScan	= ExecShutdownGpuScan;
     gpuscan_exec_methods.ExplainCustomScan	= ExplainGpuScan;
 

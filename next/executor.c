@@ -38,149 +38,21 @@ extern TransactionId   *ParallelCurrentXids;
 /* static variables */
 static dlist_head		xpu_connections_list;
 static bool				pgstrom_use_debug_code;		/* GUC */
-
-/*
- * xpuConnectReceiveCommands
- */
-int
-xpuConnectReceiveCommands(pgsocket sockfd,
-						  void *(*alloc_f)(void *priv, size_t sz),
-						  void  (*attach_f)(void *priv, XpuCommand *xcmd),
-						  void *priv,
-						  const char *error_label)
-{
-	char		buffer_local[2 * BLCKSZ];
-	char	   *buffer;
-	size_t		bufsz, offset;
-	ssize_t		nbytes;
-	int			recv_flags;
-	int			count = 0;
-	XpuCommand *curr = NULL;
-
-#define __fprintf(filp,fmt,...)										\
-	fprintf((filp), "[%s; %s:%d] " fmt "\n",						\
-			error_label, __FILE_NAME__, __LINE__, ##__VA_ARGS__)
-	
-restart:
-	buffer = buffer_local;
-	bufsz  = sizeof(buffer_local);
-	offset = 0;
-	recv_flags = MSG_DONTWAIT;
-	curr   = NULL;
-
-	for (;;)
-	{
-		nbytes = recv(sockfd, buffer + offset, bufsz - offset, recv_flags);
-		if (nbytes < 0)
-		{
-			if (errno == EINTR)
-				continue;
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
-			{
-				/*
-				 * If we are under the read of a XpuCommand fraction,
-				 * we have to wait for completion of the XpuCommand.
-				 * (Its peer side should send the entire command very
-				 * soon.)
-				 * Elsewhere, we have no queued XpuCommand right now.
-				 */
-				if (!curr && offset == 0)
-					return count;
-				/* next recv(2) shall be blocking call */
-				recv_flags = 0;
-				continue;
-			}
-			__fprintf(stderr, "failed on recv(%d, %p, %ld, %d): %m",
-					  sockfd, buffer + offset, bufsz - offset, recv_flags);
-			return -1;
-		}
-		else if (nbytes == 0)
-		{
-			/* end of the stream */
-			if (curr || offset > 0)
-			{
-				__fprintf(stderr, "connection closed during XpuCommand read");
-				return -1;
-			}
-			return count;
-		}
-
-		offset += nbytes;
-		if (!curr)
-		{
-			XpuCommand *temp, *xcmd;
-		next:
-			if (offset < offsetof(XpuCommand, u))
-			{
-				if (buffer != buffer_local)
-				{
-					memmove(buffer_local, buffer, offset);
-					buffer = buffer_local;
-					bufsz  = sizeof(buffer_local);
-				}
-				recv_flags = 0;		/* next recv(2) shall be blockable */
-				continue;
-			}
-			temp = (XpuCommand *)buffer;
-			if (temp->length <= offset)
-			{
-				assert(temp->magic == XpuCommandMagicNumber);
-				xcmd = alloc_f(priv, temp->length);
-				if (!xcmd)
-				{
-					__fprintf(stderr, "out of memory (sz=%lu): %m", temp->length);
-					return -1;
-				}
-				memcpy(xcmd, temp, temp->length);
-				attach_f(priv, xcmd);
-				count++;
-
-				if (temp->length == offset)
-					goto restart;
-				/* read remained portion, if any */
-				buffer += temp->length;
-				offset -= temp->length;
-				goto next;
-			}
-			else
-			{
-				curr = alloc_f(priv, temp->length);
-				if (!curr)
-				{
-					__fprintf(stderr, "out of memory (sz=%lu): %m", temp->length);
-					return -1;
-				}
-				memcpy(curr, temp, offset);
-				buffer = (char *)curr;
-				bufsz  = temp->length;
-				recv_flags = 0;		/* blocking enabled */
-			}
-		}
-		else if (offset >= curr->length)
-		{
-			assert(curr->magic == XpuCommandMagicNumber);
-			assert(curr->length == offset);
-			attach_f(priv, curr);
-			count++;
-			goto restart;
-		}
-	}
-	__fprintf(stderr, "Bug? should not break this loop");
-	return -1;
-#undef __fprintf
-}
+static shmem_request_hook_type shmem_request_next = NULL;
+static shmem_startup_hook_type shmem_startup_next = NULL;
+static pg_atomic_uint32	*pgstrom_query_plan_id = NULL;
 
 /*
  * Worker thread to receive response messages
  */
 static void *
-__xpuConnectSessionWorkerAlloc(void *__priv, size_t sz)
+__xpuConnectAllocCommand(void *__priv, size_t sz)
 {
 	return malloc(sz);
 }
 
 static void
-__xpuConnectSessionWorkerAttach(void *__priv, XpuCommand *xcmd)
+__xpuConnectAttachCommand(void *__priv, XpuCommand *xcmd)
 {
 	XpuConnection *conn = __priv;
 
@@ -207,15 +79,12 @@ __xpuConnectSessionWorkerAttach(void *__priv, XpuCommand *xcmd)
 	SetLatch(MyLatch);
 	pthreadMutexUnlock(&conn->mutex);
 }
+TEMPLATE_XPU_CONNECT_RECEIVE_COMMANDS(__xpuConnect)
 
 static void *
 __xpuConnectSessionWorker(void *__priv)
 {
 	XpuConnection *conn = __priv;
-
-#define __fprintf(filp,fmt,...)										\
-	fprintf((filp), "[%s; %s:%d] " fmt "\n",						\
-			conn->devname, __FILE_NAME__, __LINE__, ##__VA_ARGS__)
 
 	for (;;)
 	{
@@ -234,7 +103,8 @@ __xpuConnectSessionWorker(void *__priv)
 		{
 			if (errno == EINTR)
 				continue;
-			__fprintf(stderr, "failed on poll(2): %m");
+			fprintf(stderr, "[%s; %s:%d] failed on poll(2): %m\n",
+					conn->devname, __FILE_NAME__, __LINE__);
 			break;
 		}
 		else if (nevents > 0)
@@ -242,7 +112,6 @@ __xpuConnectSessionWorker(void *__priv)
 			Assert(nevents == 1);
 			if (pfd.revents & ~POLLIN)
 			{
-				__fprintf(stderr, "peer socket closed.");
 				pthreadMutexLock(&conn->mutex);
 				conn->terminated = 1;
 				SetLatch(MyLatch);
@@ -251,10 +120,9 @@ __xpuConnectSessionWorker(void *__priv)
 			}
 			else if (pfd.revents & POLLIN)
 			{
-				if (xpuConnectReceiveCommands(conn->sockfd,
-											  __xpuConnectSessionWorkerAlloc,
-											  __xpuConnectSessionWorkerAttach,
-											  conn, conn->devname) < 0)
+				if (__xpuConnectReceiveCommands(conn->sockfd,
+												conn,
+												conn->devname) < 0)
 					break;
 			}
 		}
@@ -265,7 +133,6 @@ __xpuConnectSessionWorker(void *__priv)
 	pthreadMutexUnlock(&conn->mutex);
 
 	return NULL;
-#undef __fprintf
 }
 
 /*
@@ -424,21 +291,16 @@ xpuclientCleanupConnections(ResourceReleasePhase phase,
  * ----------------------------------------------------------------
  */
 static uint32_t
-__build_session_xact_id_vector(StringInfo buf)
+__build_session_xact_state(StringInfo buf)
 {
-	uint32_t	offset = 0;
+	Size		bufsz;
+	char	   *buffer;
 
-	if (nParallelCurrentXids > 0)
-	{
-		uint32_t	sz = VARHDRSZ + sizeof(TransactionId) * nParallelCurrentXids;
-		uint32_t	temp;
+	bufsz = EstimateTransactionStateSpace();
+	buffer = alloca(bufsz);
+	SerializeTransactionState(bufsz, buffer);
 
-		SET_VARSIZE(&temp, sz);
-		offset = __appendBinaryStringInfo(buf, &temp, sizeof(uint32_t));
-		appendBinaryStringInfo(buf, (char *)ParallelCurrentXids,
-							   sizeof(TransactionId) * nParallelCurrentXids);
-	}
-	return offset;
+	return __appendBinaryStringInfo(buf, buffer, bufsz);
 }
 
 static uint32_t
@@ -475,7 +337,11 @@ pgstromBuildSessionInfo(PlanState *ps,
 						uint32_t kcxt_extra_bufsz,
 						uint32_t kcxt_kvars_nslots,
 						const bytea *xpucode_scan_quals,
-						const bytea *xpucode_scan_projs)
+						const bytea *xpucode_scan_projs,
+						const bytea *xpucode_join_quals_packed,
+						const bytea *xpucode_hash_values_packed,
+						const bytea *xpucode_gist_quals_packed,
+						uint32_t join_inner_handle)
 {
 	ExprContext	   *econtext = ps->ps_ExprContext;
 	ParamListInfo	param_info = econtext->ecxt_param_list_info;
@@ -506,6 +372,30 @@ pgstromBuildSessionInfo(PlanState *ps,
 									 VARSIZE_ANY_EXHDR(xpucode_scan_projs));
 	}
 
+	if (xpucode_join_quals_packed)
+	{
+		session->xpucode_join_quals_packed =
+			__appendBinaryStringInfo(&buf,
+									 VARDATA_ANY(xpucode_join_quals_packed),
+									 VARSIZE_ANY_EXHDR(xpucode_join_quals_packed));
+	}
+
+	if (xpucode_hash_values_packed)
+	{
+		session->xpucode_hash_values_packed =
+			__appendBinaryStringInfo(&buf,
+									 VARDATA_ANY(xpucode_hash_values_packed),
+									 VARSIZE_ANY_EXHDR(xpucode_hash_values_packed));
+	}
+
+	if (xpucode_gist_quals_packed)
+	{
+		session->xpucode_gist_quals_packed =
+			__appendBinaryStringInfo(&buf,
+									 VARDATA_ANY(xpucode_gist_quals_packed),
+									 VARSIZE_ANY_EXHDR(xpucode_gist_quals_packed));
+	}
+	
 	/* put executor parameters */
 	if (param_info)
 	{
@@ -602,13 +492,16 @@ pgstromBuildSessionInfo(PlanState *ps,
 		}
 	}
 	/* other database session information */
+	session->query_plan_id = ((uint64_t)MyProcPid << 32) |
+		(uint64_t)pg_atomic_fetch_add_u32(pgstrom_query_plan_id, 1);
 	session->kcxt_extra_bufsz = kcxt_extra_bufsz;
 	session->kcxt_kvars_nslots = kcxt_kvars_nslots;
 	session->xpucode_use_debug_code = pgstrom_use_debug_code;
 	session->xactStartTimestamp = GetCurrentTransactionStartTimestamp();
-	session->xact_id_array = __build_session_xact_id_vector(&buf);
+	session->session_xact_state = __build_session_xact_state(&buf);
 	session->session_timezone = __build_session_timezone(&buf);
 	session->session_encode = __build_session_encode(&buf);
+	session->join_inner_handle = join_inner_handle;
 	memcpy(buf.data, session, session_sz);
 
 	/* setup XpuCommand */
@@ -725,6 +618,8 @@ __fetchNextXpuCommand(pgstromTaskState *pts)
 
 	while (!pts->scan_done)
 	{
+		CHECK_FOR_INTERRUPTS();
+
 		pthreadMutexLock(&conn->mutex);
 		/* device error checks */
 		if (conn->errorbuf.errcode != ERRCODE_STROM_SUCCESS)
@@ -802,65 +697,11 @@ __fetchNextXpuCommand(pgstromTaskState *pts)
 }
 
 static XpuCommand *
-pgstromScanChunkArrowFdw(pgstromTaskState *pts,
-						 struct iovec *xcmd_iov, int *xcmd_iovcnt)
-{
-	elog(ERROR, "not implemented yet");
-	return NULL;
-}
-
-static XpuCommand *
 pgstromScanChunkGpuCache(pgstromTaskState *pts,
 						 struct iovec *xcmd_iov, int *xcmd_iovcnt)
 {
 	elog(ERROR, "not implemented yet");
 	return NULL;
-}
-
-static XpuCommand *
-pgstromScanChunkGpuDirect(pgstromTaskState *pts,
-						  struct iovec *xcmd_iov, int *xcmd_iovcnt)
-{
-	elog(ERROR, "not implemented yet");
-	return NULL;
-}
-
-static XpuCommand *
-pgstromScanChunkNormal(pgstromTaskState *pts,
-					   struct iovec *xcmd_iov, int *xcmd_iovcnt)
-{
-	XpuCommand	   *xcmd = pts->xcmd_req;
-	kernExecScan   *kscan = &xcmd->u.scan;
-	kern_data_store	*kds;
-	void		   *__usage;
-	size_t			kds_length;
-	size_t			sz1, sz2;
-
-	kds = (kern_data_store *)((char *)kscan + kscan->kds_src_offset);
-	kds->nitems	= 0;
-	kds->usage	= 0;
-	kds_length	= pts->xcmd_len - (offsetof(XpuCommand, u.scan) +
-								   kscan->kds_src_offset);
-	if (!pgstromRelScanChunkNormal(pts, kds, kds_length))
-		return NULL;
-
-	/* setup iovec to skip the hole between row-index and tuples-buffer */
-	sz1 = KDS_HEAD_LENGTH(kds) + MAXALIGN(sizeof(uint32_t) * kds->nitems);
-	sz2 = __kds_unpack(kds->usage);
-	Assert(sz1 + sz2 <= kds_length);
-	__usage = ((char *)kds + kds_length - sz2);
-	kds->length = sz1 + sz2;
-
-	sz1 += (offsetof(XpuCommand, u.scan) + kscan->kds_src_offset);
-	xcmd->length = sz1 + sz2;
-
-	xcmd_iov[0].iov_base = xcmd;
-	xcmd_iov[0].iov_len  = sz1;
-	xcmd_iov[1].iov_base = __usage;
-	xcmd_iov[1].iov_len  = sz2;
-	*xcmd_iovcnt = 2;
-
-	return xcmd;
 }
 
 /*
@@ -869,6 +710,10 @@ pgstromScanChunkNormal(pgstromTaskState *pts,
 static TupleTableSlot *
 pgstromScanNextTuple(pgstromTaskState *pts)
 {
+	TupleTableSlot *slot = pts->css.ss.ss_ScanTupleSlot;
+
+	if (pgstromFetchFallbackTuple(pts, slot))
+		return slot;
 	for (;;)
 	{
 		kern_data_store *kds = pts->curr_kds;
@@ -876,7 +721,6 @@ pgstromScanNextTuple(pgstromTaskState *pts)
 
 		if (index < kds->nitems)
 		{
-			TupleTableSlot *slot = pts->css.ss.ss_ScanTupleSlot;
 			kern_tupitem   *tupitem = KDS_GET_TUPITEM(kds, index);
 
 			pts->curr_htup.t_len = tupitem->t_len;
@@ -900,42 +744,41 @@ static void
 __setupTaskStateRequestBuffer(pgstromTaskState *pts,
 							  TupleDesc tdesc_src,
 							  TupleDesc tdesc_dst,
-							  char format,
-							  size_t bufsz)
+							  char format)
 {
 	XpuCommand	   *xcmd;
-	kernExecScan   *kscan;
 	kern_data_store *kds;
+	size_t			bufsz;
 	size_t			off;
 
-	bufsz += MAXALIGN(offsetof(XpuCommand, u.scan.data));
+	initStringInfo(&pts->xcmd_buf);
+	bufsz = MAXALIGN(offsetof(XpuCommand, u.scan.data));
 	if (tdesc_src)
 		bufsz += estimate_kern_data_store(tdesc_src);
 	if (tdesc_dst)
 		bufsz += estimate_kern_data_store(tdesc_dst);
-	xcmd = palloc(bufsz);
+	enlargeStringInfo(&pts->xcmd_buf, bufsz);
 
+	xcmd = (XpuCommand *)pts->xcmd_buf.data;
 	memset(xcmd, 0, offsetof(XpuCommand, u.scan.data));
 	xcmd->magic  = XpuCommandMagicNumber;
 	xcmd->tag    = XpuCommandTag__XpuScanExec;
 	xcmd->length = bufsz;
 
-	kscan = &xcmd->u.scan;
-	off = offsetof(kernExecScan, data);
+	off = offsetof(XpuCommand, u.scan.data);
 	if (tdesc_dst)
 	{
-		kscan->kds_dst_offset = off;
-		kds  = (kern_data_store *)((char *)kscan + off);
+		xcmd->u.scan.kds_dst_offset = off;
+		kds  = (kern_data_store *)((char *)xcmd + off);
 		off += setup_kern_data_store(kds, tdesc_dst, 0, KDS_FORMAT_ROW);
 	}
 	if (tdesc_src)
 	{
-		kscan->kds_src_offset = off;
-		kds  = (kern_data_store *)((char *)kscan + off);
+		xcmd->u.scan.kds_src_offset = off;
+		kds  = (kern_data_store *)((char *)xcmd + off);
 		off += setup_kern_data_store(kds, tdesc_src, 0, format);
 	}
-	pts->xcmd_req = xcmd;
-	pts->xcmd_len = bufsz;
+	pts->xcmd_buf.len = off;
 }
 
 /*
@@ -943,7 +786,12 @@ __setupTaskStateRequestBuffer(pgstromTaskState *pts,
  */
 void
 pgstromExecInitTaskState(pgstromTaskState *pts,
-						 List *outer_dev_quals)
+						 uint64_t devkind_mask,	/* DEVKIND_* */
+						 List *outer_quals,
+						 const Bitmapset *outer_refs,
+						 Oid   brin_index_oid,
+						 List *brin_index_conds,
+						 List *brin_index_quals)
 {
 	EState		   *estate = pts->css.ss.ps.state;
 	CustomScan	   *cscan = (CustomScan *)pts->css.ss.ps.plan;
@@ -952,9 +800,6 @@ pgstromExecInitTaskState(pgstromTaskState *pts,
 	TupleDesc		tupdesc_dst;
 	List		   *tlist_dev = NIL;
 	ListCell	   *lc;
-//	ArrowFdwState  *af_state = NULL;
-	char			format;
-	size_t			bufsz;
 
 	/*
 	 * PG-Strom supports:
@@ -964,16 +809,32 @@ pgstromExecInitTaskState(pgstromTaskState *pts,
 	if (RelationGetForm(rel)->relkind == RELKIND_RELATION ||
 		RelationGetForm(rel)->relkind == RELKIND_MATVIEW)
 	{
-		Oid		am_oid = RelationGetForm(rel)->relam;
+		SMgrRelation smgr = RelationGetSmgr(rel);
+		Oid			am_oid = RelationGetForm(rel)->relam;
+		const char *kds_pathname = relpath(smgr->smgr_rnode, MAIN_FORKNUM);
 
 		if (am_oid != HEAP_TABLE_AM_OID)
 			elog(ERROR, "PG-Strom does not support table access method: %s",
 				 get_am_name(am_oid));
+
+		/* setup BRIN-index if any */
+		pgstromBrinIndexExecBegin(pts,
+								  brin_index_oid,
+								  brin_index_conds,
+								  brin_index_quals);
+		if ((devkind_mask & DEVKIND__NVIDIA_GPU) != 0)
+			pts->optimal_gpus = GetOptimalGpuForRelation(rel);
+		if ((devkind_mask & DEVKIND__NVIDIA_DPU) != 0)
+			pts->ds_entry = GetOptimalDpuForRelation(rel, &kds_pathname);
+		pts->kds_pathname = kds_pathname;
 	}
 	else if (RelationGetForm(rel)->relkind == RELKIND_FOREIGN_TABLE)
 	{
-		//call pgstromArrowFdwExecBegin here
-		elog(ERROR, "Arrow support is not implemented yet");
+		if (!pgstromArrowFdwExecInit(pts,
+									 devkind_mask,
+									 outer_quals,
+									 outer_refs))
+			elog(ERROR, "Bug? only arrow_fdw is supported in PG-Strom");
 	}
 	else
 	{
@@ -999,10 +860,10 @@ pgstromExecInitTaskState(pgstromTaskState *pts,
 	/*
 	 * Init resources for CPU fallbacks
 	 */
-	outer_dev_quals = (List *)
-		fixup_varnode_to_origin((Node *)outer_dev_quals,
+	outer_quals = (List *)
+		fixup_varnode_to_origin((Node *)outer_quals,
 								cscan->custom_scan_tlist);
-	pts->base_quals = ExecInitQual(outer_dev_quals, &pts->css.ss.ps);
+	pts->base_quals = ExecInitQual(outer_quals, &pts->css.ss.ps);
 	foreach (lc, cscan->custom_scan_tlist)
 	{
 		TargetEntry *tle = lfirst(lc);
@@ -1014,39 +875,51 @@ pgstromExecInitTaskState(pgstromTaskState *pts,
 											  table_slot_callbacks(rel));
 	pts->base_proj = ExecBuildProjectionInfo(tlist_dev,
 											 pts->css.ss.ps.ps_ExprContext,
-											 pts->base_slot,
+											 pts->css.ss.ss_ScanTupleSlot,
 											 &pts->css.ss.ps,
 											 RelationGetDescr(rel));
 	/*
 	 * Setup request buffer
 	 */
-	if (pts->af_state)
+	if (pts->arrow_state)		/* Apache Arrow */
 	{
 		pts->cb_next_chunk = pgstromScanChunkArrowFdw;
-		format = KDS_FORMAT_ARROW;
-		bufsz  = (1UL << 16);		/* 64kB for iovec */
+		pts->cb_next_tuple = pgstromScanNextTuple;
+	    __setupTaskStateRequestBuffer(pts,
+									  NULL,
+									  tupdesc_dst,
+									  KDS_FORMAT_ARROW);
 	}
-	else if (pts->gc_state)
+	else if (pts->gcache_state)		/* GPU-Cache */
 	{
 		pts->cb_next_chunk = pgstromScanChunkGpuCache;
-		tupdesc_src = NULL;			/* no kds_src with GpuCache */
-		format = KDS_FORMAT_COLUMN;
+		pts->cb_next_tuple = pgstromScanNextTuple;
+		__setupTaskStateRequestBuffer(pts,
+									  NULL,
+									  tupdesc_dst,
+									  KDS_FORMAT_COLUMN);
 	}
-	else if (pts->gd_state)
+	else if (!bms_is_empty(pts->optimal_gpus) ||	/* GPU-Direct SQL */
+			 pts->ds_entry)							/* DPU Storage */
 	{
-		pts->cb_next_chunk = pgstromScanChunkGpuDirect;
-		format = KDS_FORMAT_BLOCK;
-		bufsz  = (sizeof(BlockNumber) * PGSTROM_CHUNK_SIZE / BLCKSZ +
-				  (4UL << 20));	/* 4MB buffer for dirty cache */
+		pts->cb_next_chunk = pgstromRelScanChunkDirect;
+		pts->cb_next_tuple = pgstromScanNextTuple;
+		__setupTaskStateRequestBuffer(pts,
+									  tupdesc_src,
+									  tupdesc_dst,
+									  KDS_FORMAT_BLOCK);
 	}
-	else
+	else						/* Slow normal heap storage */
 	{
-		pts->cb_next_chunk = pgstromScanChunkNormal;
-		format = KDS_FORMAT_ROW;
-		bufsz  = PGSTROM_CHUNK_SIZE;
+		pts->cb_next_chunk = pgstromRelScanChunkNormal;
+		pts->cb_next_tuple = pgstromScanNextTuple;
+		__setupTaskStateRequestBuffer(pts,
+									  tupdesc_src,
+									  tupdesc_dst,
+									  KDS_FORMAT_ROW);
 	}
-	__setupTaskStateRequestBuffer(pts, tupdesc_src, tupdesc_dst, format, bufsz);
-	pts->cb_next_tuple = pgstromScanNextTuple;
+	/* other fields init */
+	pts->curr_vm_buffer = InvalidBuffer;
 }
 
 /*
@@ -1093,14 +966,30 @@ pgstromExecTaskState(pgstromTaskState *pts)
 void
 pgstromExecEndTaskState(pgstromTaskState *pts)
 {
+	pgstromSharedState *ps_state = pts->ps_state;
+	ListCell   *lc;
+
+	if (pts->curr_vm_buffer != InvalidBuffer)
+		ReleaseBuffer(pts->curr_vm_buffer);
 	if (pts->conn)
 		xpuClientCloseSession(pts->conn);
 	if (pts->br_state)
 		pgstromBrinIndexExecEnd(pts);
+	if (pts->arrow_state)
+		pgstromArrowFdwExecEnd(pts->arrow_state);
 	if (pts->base_slot)
 		ExecDropSingleTupleTableSlot(pts->base_slot);
 	if (pts->css.ss.ss_currentScanDesc)
 		table_endscan(pts->css.ss.ss_currentScanDesc);
+	if (pts->h_kmrels)
+		__munmapShmem(pts->h_kmrels);
+	if (!IsParallelWorker())
+	{
+		if (ps_state && ps_state->preload_shmem_handle != 0)
+			__shmemDrop(ps_state->preload_shmem_handle);
+	}
+	foreach (lc, pts->css.custom_ps)
+		ExecEndNode((PlanState *) lfirst(lc));
 }
 
 /*
@@ -1116,12 +1005,289 @@ pgstromExecResetTaskState(pgstromTaskState *pts)
 	}
 	if (pts->br_state)
 		pgstromBrinIndexExecReset(pts);
+	if (pts->arrow_state)
+		pgstromArrowFdwExecReset(pts->arrow_state);
+}
+
+/*
+ * pgstromSharedStateEstimateDSM
+ */
+Size
+pgstromSharedStateEstimateDSM(pgstromTaskState *pts)
+{
+	Relation	relation = pts->css.ss.ss_currentRelation;
+	EState	   *estate = pts->css.ss.ps.state;
+	Snapshot	snapshot = estate->es_snapshot;
+	int			num_rels = list_length(pts->css.custom_ps);
+	Size		len = 0;
+
+	if (pts->br_state)
+		len += pgstromBrinIndexEstimateDSM(pts);
+	len += MAXALIGN(offsetof(pgstromSharedState, inners[num_rels]));
+	if (!pts->arrow_state)
+		len += table_parallelscan_estimate(relation, snapshot);
+	return MAXALIGN(len);
+}
+
+/*
+ * pgstromSharedStateInitDSM
+ */
+void
+pgstromSharedStateInitDSM(pgstromTaskState *pts,
+						  ParallelContext *pcxt, char *dsm_addr)
+{
+	Relation	relation = pts->css.ss.ss_currentRelation;
+	EState	   *estate = pts->css.ss.ps.state;
+	Snapshot	snapshot = estate->es_snapshot;
+	int			num_rels = list_length(pts->css.custom_ps);
+	size_t		dsm_length = offsetof(pgstromSharedState, inners[num_rels]);
+	pgstromSharedState *ps_state;
+	TableScanDesc scan = NULL;
+
+	Assert(!IsBackgroundWorker);
+	if (pts->br_state)
+		dsm_addr += pgstromBrinIndexInitDSM(pts, dsm_addr);
+	Assert(!pts->css.ss.ss_currentScanDesc);
+	if (dsm_addr)
+	{
+		ps_state = (pgstromSharedState *) dsm_addr;
+		memset(ps_state, 0, dsm_length);
+		ps_state->ss_handle = dsm_segment_handle(pcxt->seg);
+		ps_state->ss_length = dsm_length;
+		dsm_addr += MAXALIGN(dsm_length);
+		if (pts->arrow_state)
+			pgstromArrowFdwInitDSM(pts->arrow_state, ps_state);
+		else
+		{
+			ParallelTableScanDesc pdesc = (ParallelTableScanDesc) dsm_addr;
+
+			table_parallelscan_initialize(relation, pdesc, snapshot);
+			scan = table_beginscan_parallel(relation, pdesc);
+		}
+	}
+	else
+	{
+		ps_state = MemoryContextAllocZero(estate->es_query_cxt, dsm_length);
+		ps_state->ss_handle = DSM_HANDLE_INVALID;
+		ps_state->ss_length = dsm_length;
+		if (pts->arrow_state)
+			pgstromArrowFdwInitDSM(pts->arrow_state, ps_state);
+		else
+			scan = table_beginscan(relation, estate->es_snapshot, 0, NULL);
+	}
+	ps_state->num_rels = num_rels;
+	ConditionVariableInit(&ps_state->preload_cond);
+	SpinLockInit(&ps_state->preload_mutex);
+	if (num_rels > 0)
+		ps_state->preload_shmem_handle = __shmemCreate();	
+	pts->ps_state = ps_state;
+	pts->css.ss.ss_currentScanDesc = scan;
+}
+
+/*
+ * pgstromSharedStateAttachDSM
+ */
+void
+pgstromSharedStateAttachDSM(pgstromTaskState *pts, char *dsm_addr)
+{
+	int		num_rels = list_length(pts->css.custom_ps);
+
+	if (pts->br_state)
+		dsm_addr += pgstromBrinIndexAttachDSM(pts, dsm_addr);
+	pts->ps_state = (pgstromSharedState *)dsm_addr;
+	Assert(pts->ps_state->num_rels == num_rels);
+	dsm_addr += MAXALIGN(offsetof(pgstromSharedState, inners[num_rels]));
+
+	if (pts->arrow_state)
+		pgstromArrowFdwAttachDSM(pts->arrow_state, pts->ps_state);
+	else
+	{
+		Relation	relation = pts->css.ss.ss_currentRelation;
+		ParallelTableScanDesc pdesc = (ParallelTableScanDesc) dsm_addr;
+
+		pts->css.ss.ss_currentScanDesc = table_beginscan_parallel(relation, pdesc);
+	}
+}
+
+/*
+ * pgstromSharedStateShutdownDSM
+ */
+void
+pgstromSharedStateShutdownDSM(pgstromTaskState *pts)
+{
+	pgstromSharedState *src_state = pts->ps_state;
+	pgstromSharedState *dst_state;
+	EState	   *estate = pts->css.ss.ps.state;
+
+	if (pts->br_state)
+		pgstromBrinIndexShutdownDSM(pts);
+	if (pts->arrow_state)
+		pgstromArrowFdwShutdown(pts->arrow_state);
+	if (src_state)
+	{
+		size_t	sz = offsetof(pgstromSharedState,
+							  inners[src_state->num_rels]);
+		dst_state = MemoryContextAllocZero(estate->es_query_cxt, sz);
+		memcpy(dst_state, src_state, sz);
+		pts->ps_state = dst_state;
+	}
+}
+
+/*
+ * pgstromExplainScanState
+ */
+void
+pgstromExplainScanState(pgstromTaskState *pts,
+						ExplainState *es,
+						List *dev_quals,
+						bytea *kern_dev_quals,
+						List *tlist_dev,
+						bytea *kern_dev_projs,
+						double scan_tuples,
+						double scan_rows,
+						List *dcontext)
+{
+	const char *devkind = DevKindLabel(pts->devkind, false);
+	StringInfoData buf;
+	char		label[100];
+	char	   *str;
+	ListCell   *lc;
+
+	initStringInfo(&buf);
+	if (dev_quals != NIL)
+	{
+		Expr   *expr;
+
+		snprintf(label, sizeof(label), "%s Quals", devkind);
+		if (list_length(dev_quals) > 1)
+			expr = make_andclause(dev_quals);
+		else
+			expr = linitial(dev_quals);
+		str = deparse_expression((Node *)expr, dcontext, false, true);
+		appendStringInfo(&buf, "%s [rows: %.0f -> %.0f]",
+						 str, scan_tuples, scan_rows);
+		ExplainPropertyText(label, buf.data, es);
+	}
+
+	resetStringInfo(&buf);
+	foreach (lc, tlist_dev)
+	{
+		TargetEntry	   *tle = lfirst(lc);
+
+		if (tle->resjunk)
+			continue;
+	    str = deparse_expression((Node *)tle->expr, dcontext, false, true);
+		if (buf.len > 0)
+			appendStringInfoString(&buf, ", ");
+		appendStringInfoString(&buf, str);
+	}
+	snprintf(label, sizeof(label), "%s Projection", devkind);
+	ExplainPropertyText(label, buf.data, es);
+
+	if (es->verbose && kern_dev_quals)
+	{
+		resetStringInfo(&buf);
+		pgstrom_explain_xpucode(&buf,
+								kern_dev_quals,
+								&pts->css,
+								es, dcontext);
+		snprintf(label, sizeof(label), "%s Quals Code", devkind);
+		ExplainPropertyText(label, buf.data, es);
+	}
+
+	if (es->verbose && kern_dev_projs)
+	{
+		resetStringInfo(&buf);
+		pgstrom_explain_xpucode(&buf,
+								kern_dev_projs,
+								&pts->css,
+								es, dcontext);
+		snprintf(label, sizeof(label), "%s Projection Code", devkind);
+		ExplainPropertyText(label, buf.data, es);
+	}
+}
+
+/*
+ * pgstromExplainTaskState
+ */
+void
+pgstromExplainTaskState(pgstromTaskState *pts,
+						ExplainState *es,
+						List *dcontext)
+{
+	StringInfoData buf;
+	int		k;
+
+	initStringInfo(&buf);
+	if (pts->arrow_state)
+	{
+		pgstromArrowFdwExplain(pts->arrow_state,
+							   pts->css.ss.ss_currentRelation,
+							   es, dcontext);
+	}
+	else if (pts->gcache_state)
+	{
+		/* GPU-Cache */
+	}
+	else if (!bms_is_empty(pts->optimal_gpus))
+	{
+		/* GPU-Direct */
+		resetStringInfo(&buf);
+		if (!es->analyze)
+		{
+			bool	is_first = true;
+
+			appendStringInfo(&buf, "enabled (");
+			for (k = bms_next_member(pts->optimal_gpus, -1);
+				 k >= 0;
+				 k = bms_next_member(pts->optimal_gpus, k))
+			{
+				if (!is_first)
+					appendStringInfo(&buf, ", ");
+				appendStringInfo(&buf, "GPU-%d", k);
+				is_first = false;
+			}
+			appendStringInfo(&buf, ")");
+		}
+		else
+		{
+			pgstromSharedState *ps_state = pts->ps_state;
+			XpuConnection  *conn = pts->conn;
+			uint32			count;
+
+			count = pg_atomic_read_u32(&ps_state->heap_direct_nblocks);
+			appendStringInfo(&buf, "enabled (%s; direct=%u", conn->devname, count);
+			count = pg_atomic_read_u32(&ps_state->heap_normal_nblocks);
+			if (count > 0)
+				appendStringInfo(&buf, ", buffer=%u", count);
+			count = pg_atomic_read_u32(&ps_state->heap_fallback_nblocks);
+			if (count > 0)
+				appendStringInfo(&buf, ", fallback=%u", count);
+			appendStringInfo(&buf, ")");
+		}
+		ExplainPropertyText("GPU-Direct SQL", buf.data, es);
+	}
+	else if (pts->ds_entry)
+	{
+		/* DPU-Entry */
+		explainDpuStorageEntry(pts->ds_entry, es);
+	}
+	else
+	{
+		/* Normal Heap Storage */
+	}
+
+	/* State of BRIN-index */
+	if (pts->br_state)
+		pgstromBrinIndexExplain(pts, dcontext, es);
+
+	pfree(buf.data);
 }
 
 /*
  * __xpuClientOpenSession
  */
-static void
+void
 __xpuClientOpenSession(pgstromTaskState *pts,
 					   const XpuCommand *session,
 					   pgsocket sockfd,
@@ -1177,66 +1343,33 @@ __xpuClientOpenSession(pgstromTaskState *pts,
 }
 
 /*
- * gpuClientOpenSession
+ * pgstrom_request_executor
  */
-static int
-__gpuClientChooseDevice(const Bitmapset *gpuset)
+static void
+pgstrom_request_executor(void)
 {
-	static bool		rr_initialized = false;
-	static uint32	rr_counter = 0;
-
-	if (!rr_initialized)
-	{
-		rr_counter = (uint32)getpid();
-		rr_initialized = true;
-	}
-
-	if (!bms_is_empty(gpuset))
-	{
-		int		num = bms_num_members(gpuset);
-		int	   *dindex = alloca(sizeof(int) * num);
-		int		i, k;
-
-		for (i=0, k=bms_next_member(gpuset, -1);
-			 k >= 0;
-			 i++, k=bms_next_member(gpuset, k))
-		{
-			dindex[i] = k;
-		}
-		Assert(i == num);
-		return dindex[rr_counter++ % num];
-	}
-	/* a simple round-robin if no GPUs preference */
-	return (rr_counter++ % numGpuDevAttrs);
+	if (shmem_request_next)
+		(*shmem_request_next)();
+	
+	RequestAddinShmemSpace(MAXALIGN(sizeof(pg_atomic_uint32)));
 }
 
-void
-gpuClientOpenSession(pgstromTaskState *pts,
-					 const Bitmapset *gpuset,
-					 const XpuCommand *session)
+/*
+ * pgstrom_startup_executor
+ */
+static void
+pgstrom_startup_executor(void)
 {
-	struct sockaddr_un addr;
-	pgsocket	sockfd;
-	int			cuda_dindex = __gpuClientChooseDevice(gpuset);
-	char		namebuf[32];
+	bool	found;
 
-	sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (sockfd < 0)
-		elog(ERROR, "failed on socket(2): %m");
+	if (shmem_startup_next)
+		(*shmem_startup_next)();
 
-	memset(&addr, 0, sizeof(addr));
-	addr.sun_family = AF_UNIX;
-	snprintf(addr.sun_path, sizeof(addr.sun_path),
-			 ".pg_strom.%u.gpu%u.sock",
-			 PostmasterPid, cuda_dindex);
-	if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) != 0)
-	{
-		close(sockfd);
-		elog(ERROR, "failed on connect('%s'): %m", addr.sun_path);
-	}
-	snprintf(namebuf, sizeof(namebuf), "GPU-%d", cuda_dindex);
-
-	__xpuClientOpenSession(pts, session, sockfd, namebuf);
+	pgstrom_query_plan_id = ShmemInitStruct("pgstrom_query_plan_id",
+											MAXALIGN(sizeof(pg_atomic_uint32)),
+											&found);
+	if (!found)
+		pg_atomic_init_u32(pgstrom_query_plan_id, 0);
 }
 
 /*
@@ -1255,4 +1388,9 @@ pgstrom_init_executor(void)
 							 NULL, NULL, NULL);
 	dlist_init(&xpu_connections_list);
 	RegisterResourceReleaseCallback(xpuclientCleanupConnections, NULL);
+	/* shared memory setup */
+	shmem_request_next = shmem_request_hook;
+	shmem_request_hook = pgstrom_request_executor;
+	shmem_startup_next = shmem_startup_hook;
+	shmem_startup_hook = pgstrom_startup_executor;
 }

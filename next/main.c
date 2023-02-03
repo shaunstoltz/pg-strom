@@ -18,13 +18,11 @@ bool		pgstrom_enabled;				/* GUC */
 bool		pgstrom_cpu_fallback_enabled;	/* GUC */
 bool		pgstrom_regression_test_mode;	/* GUC */
 int			pgstrom_max_async_tasks;		/* GUC */
-double		pgstrom_gpu_setup_cost;			/* GUC */
-double		pgstrom_gpu_dma_cost;			/* GUC */
-double		pgstrom_gpu_operator_cost;		/* GUC */
 long		PAGE_SIZE;
 long		PAGE_MASK;
 int			PAGE_SHIFT;
 long		PHYS_PAGES;
+long		PAGES_PER_BLOCK;
 
 static planner_hook_type	planner_hook_next = NULL;
 
@@ -108,47 +106,6 @@ pgstrom_init_gucs(void)
 }
 
 /*
- * pgstrom_init_gpu_options - init GUC params related to GPUs
- */
-static void
-pgstrom_init_gpu_options(void)
-{
-	/* cost factor for Gpu setup */
-	DefineCustomRealVariable("pg_strom.gpu_setup_cost",
-							 "Cost to setup GPU device to run",
-							 NULL,
-							 &pgstrom_gpu_setup_cost,
-							 100 * DEFAULT_SEQ_PAGE_COST,
-							 0,
-							 DBL_MAX,
-							 PGC_USERSET,
-							 GUC_NOT_IN_SAMPLE,
-							 NULL, NULL, NULL);
-	/* cost factor for each Gpu task */
-	DefineCustomRealVariable("pg_strom.gpu_dma_cost",
-							 "Cost to send/recv tuple via DMA",
-							 NULL,
-							 &pgstrom_gpu_dma_cost,
-							 DEFAULT_CPU_TUPLE_COST,
-							 0,
-							 DBL_MAX,
-							 PGC_USERSET,
-							 GUC_NOT_IN_SAMPLE,
-							 NULL, NULL, NULL);
-	/* cost factor for Gpu operator */
-	DefineCustomRealVariable("pg_strom.gpu_operator_cost",
-							 "Cost of processing each operators by GPU",
-							 NULL,
-							 &pgstrom_gpu_operator_cost,
-							 DEFAULT_CPU_OPERATOR_COST / 16.0,
-							 0,
-							 DBL_MAX,
-							 PGC_USERSET,
-							 GUC_NOT_IN_SAMPLE,
-							 NULL, NULL, NULL);
-}
-
-/*
  * xPU-aware path tracker
  *
  * motivation: add_path() and add_partial_path() keeps only cheapest paths.
@@ -161,8 +118,7 @@ typedef struct
 {
 	PlannerInfo	   *root;
 	Relids			relids;
-	bool			outer_parallel;
-	bool			inner_parallel;
+	bool			parallel_aware;
 	const char	   *custom_name;
 	const CustomPath *cpath;
 } custom_path_entry;
@@ -184,10 +140,8 @@ custom_path_entry_hashvalue(const void *key, Size keysize)
 		hash ^= hash_any((unsigned char *)relids,
 						 offsetof(Bitmapset, words[relids->nwords]));
 	}
-	if (cent->outer_parallel)
+	if (cent->parallel_aware)
 		hash ^= 0x9e3779b9U;
-	if (cent->inner_parallel)
-		hash ^= 0x49a0f4ddU;
 	hash ^= hash_any((unsigned char *)custom_name, strlen(custom_name));
 
 	return hash;
@@ -201,8 +155,7 @@ custom_path_entry_compare(const void *key1, const void *key2, Size keysize)
 
 	if (cent1->root == cent2->root &&
 		bms_equal(cent1->relids, cent2->relids) &&
-		cent1->outer_parallel == cent2->outer_parallel &&
-		cent1->inner_parallel == cent2->inner_parallel &&
+		cent1->parallel_aware == cent2->parallel_aware &&
 		strcmp(cent1->custom_name, cent2->custom_name) == 0)
 		return 0;
 	/* not equal */
@@ -217,8 +170,7 @@ custom_path_entry_keycopy(void *dest, const void *src, Size keysize)
 
 	dent->root = sent->root;
 	dent->relids = bms_copy(sent->relids);
-	dent->outer_parallel = sent->outer_parallel;
-	dent->inner_parallel = sent->inner_parallel;
+	dent->parallel_aware = sent->parallel_aware;
 	dent->custom_name = pstrdup(sent->custom_name);
 
 	return dest;
@@ -227,8 +179,7 @@ custom_path_entry_keycopy(void *dest, const void *src, Size keysize)
 const CustomPath *
 custom_path_find_cheapest(PlannerInfo *root,
 						  RelOptInfo *rel,
-						  bool outer_parallel,
-						  bool inner_parallel,
+						  bool parallel_aware,
 						  const char *custom_name)
 {
 	custom_path_entry  hkey;
@@ -237,8 +188,7 @@ custom_path_find_cheapest(PlannerInfo *root,
 	memset(&hkey, 0, sizeof(custom_path_entry));
 	hkey.root = root;
 	hkey.relids = rel->relids;
-	hkey.outer_parallel = outer_parallel;
-	hkey.inner_parallel = inner_parallel;
+	hkey.parallel_aware = (parallel_aware ? true : false);
 	hkey.custom_name = custom_name;
 
 	cent = hash_search(custom_path_htable, &hkey, HASH_FIND, NULL);
@@ -250,8 +200,7 @@ custom_path_find_cheapest(PlannerInfo *root,
 bool
 custom_path_remember(PlannerInfo *root,
 					 RelOptInfo *rel,
-					 bool outer_parallel,
-					 bool inner_parallel,
+					 bool parallel_aware,
 					 const CustomPath *cpath)
 {
 	custom_path_entry  hkey;
@@ -261,8 +210,7 @@ custom_path_remember(PlannerInfo *root,
 	memset(&hkey, 0, sizeof(custom_path_entry));
 	hkey.root = root;
 	hkey.relids = rel->relids;
-	hkey.outer_parallel = outer_parallel;
-	hkey.inner_parallel = inner_parallel;
+	hkey.parallel_aware = (parallel_aware ? true : false);
 	hkey.custom_name = cpath->methods->CustomName;
 
 	cent = hash_search(custom_path_htable, &hkey, HASH_ENTER, &found);
@@ -272,11 +220,6 @@ custom_path_remember(PlannerInfo *root,
 		if (cent->cpath->path.total_cost <= cpath->path.total_cost)
 			return false;
 	}
-	Assert(cent->root == root &&
-		   bms_equal(cent->relids, rel->relids) &&
-		   cent->outer_parallel == outer_parallel &&
-		   cent->inner_parallel == inner_parallel &&
-		   strcmp(cent->custom_name, cpath->methods->CustomName) == 0);
 	cent->cpath = (const CustomPath *)pgstrom_copy_pathnode(&cpath->path);
 
 	return true;
@@ -361,6 +304,7 @@ _PG_init(void)
 	PAGE_MASK = PAGE_SIZE - 1;
 	PAGE_SHIFT = get_next_log2(PAGE_SIZE);
 	PHYS_PAGES = sysconf(_SC_PHYS_PAGES);
+	PAGES_PER_BLOCK = BLCKSZ / PAGE_SIZE;
 
 	/* init pg-strom infrastructure */
 	pgstrom_init_gucs();
@@ -368,6 +312,7 @@ _PG_init(void)
 	pgstrom_init_codegen();
 	pgstrom_init_relscan();
 	pgstrom_init_brin();
+	pgstrom_init_arrow_fdw();
 	pgstrom_init_executor();
 	/* dump version number */
 	elog(LOG, "PG-Strom version %s built for PostgreSQL %s (git: %s)",
@@ -377,12 +322,19 @@ _PG_init(void)
 	/* init GPU related stuff */
 	if (pgstrom_init_gpu_device())
 	{
-		pgstrom_init_gpu_options();
 		pgstrom_init_gpu_service();
 		pgstrom_init_gpu_scan();
-		//pgstrom_init_gpu_join();
+		pgstrom_init_gpu_join();
 		//pgstrom_init_gpu_preagg();
 	}
+	/* init DPU related stuff */
+	if (pgstrom_init_dpu_device())
+	{
+		pgstrom_init_dpu_scan();
+		//pgstrom_init_dpu_join();
+		//pgstrom_init_dpu_preagg();
+	}
+	pgstrom_init_pcie();
 	/* post planner hook */
 	planner_hook_next = (planner_hook ? planner_hook : standard_planner);
 	planner_hook = pgstrom_post_planner;

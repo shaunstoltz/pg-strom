@@ -5,6 +5,19 @@
  */
 #ifndef _ARROW_DEFS_H_
 #define _ARROW_DEFS_H_
+
+#ifdef __cplusplus
+typedef bool			__boolean;
+#else
+typedef unsigned char	__boolean;
+#ifndef true
+#define true	((__boolean) 1)
+#endif
+#ifndef false
+#define false	((__boolean) 0)
+#endif
+#endif	/* !__CUDACC__ */
+
 /*
  * MetadataVersion : short
  */
@@ -181,7 +194,7 @@ typedef enum
  */
 #define ARROW_TYPE_OPTIONS_COMMON_FIELDS		\
 	ArrowTypeTag			tag;				\
-	int16_t					unitsz
+	unsigned short			unitsz
 
 typedef union		ArrowTypeOptions
 {
@@ -190,8 +203,8 @@ typedef union		ArrowTypeOptions
 	} common;
 	struct {
 		ARROW_TYPE_OPTIONS_COMMON_FIELDS;
-		uint16_t			bitWidth;
-		bool				is_signed;
+		unsigned short		bitWidth;
+		__boolean			is_signed;
 	} integer;
 	struct {
 		ARROW_TYPE_OPTIONS_COMMON_FIELDS;
@@ -232,17 +245,6 @@ typedef union		ArrowTypeOptions
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-#ifndef bool
-typedef unsigned char	bool;
-#endif
-#ifndef true
-#define true	((bool) 1)
-#endif
-#ifndef false
-#define false	((bool) 0)
-#endif
-
 /*
  * ArrowNode
  */
@@ -270,7 +272,7 @@ typedef struct		ArrowTypeInt
 {
 	ArrowNode		node;
 	int32_t			bitWidth;
-	bool			is_signed;
+	__boolean		is_signed;
 } ArrowTypeInt;
 
 /* FloatingPoint */
@@ -362,7 +364,7 @@ typedef struct		ArrowTypeFixedSizeList
 typedef struct		ArrowTypeMap
 {
 	ArrowNode		node;
-	bool			keysSorted;
+	__boolean		keysSorted;
 } ArrowTypeMap;
 
 /* Duration */
@@ -440,7 +442,7 @@ typedef struct		ArrowDictionaryEncoding
 	ArrowNode		node;
 	int64_t			id;
 	ArrowTypeInt	indexType;
-	bool			isOrdered;
+	__boolean		isOrdered;
 } ArrowDictionaryEncoding;
 
 /*
@@ -451,7 +453,7 @@ typedef struct		ArrowField
 	ArrowNode		node;
 	const char	   *name;
 	int				_name_len;
-	bool			nullable;
+	__boolean		nullable;
 	ArrowType		type;
 	ArrowDictionaryEncoding *dictionary;
 	/* vector of nested data types */
@@ -542,13 +544,13 @@ typedef struct		ArrowDictionaryBatch
 	ArrowNode		node;
 	int64_t			id;
 	ArrowRecordBatch data;
-	bool			isDelta;
+	__boolean		isDelta;
 } ArrowDictionaryBatch;
 
 /*
- * ArrowMessageHeader
+ * ArrowMessageBody
  */
-typedef union		ArrowMessageHeader
+typedef union
 {
 	ArrowNode		node;
 	ArrowSchema		schema;

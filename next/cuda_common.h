@@ -13,9 +13,9 @@
 #define CUDA_COMMON_H
 #include "xpu_common.h"
 
-#define WARP_SIZE				32
+#define WARPSIZE				32
 #define MAXTHREADS_PER_BLOCK	1024
-#define MAXWARPS_PER_BLOCK		(MAXTHREADS_PER_BLOCK / WARP_SIZE)
+#define MAXWARPS_PER_BLOCK		(MAXTHREADS_PER_BLOCK / WARPSIZE)
 
 #if defined(__CUDACC__)
 /*
@@ -27,24 +27,35 @@
 #define get_local_size()		(blockDim.x)
 #define get_global_id()			(threadIdx.x + blockIdx.x * blockDim.x)
 #define get_global_size()		(blockDim.x * gridDim.x)
-#define get_global_base()		(blockIdx.x * blockDim.x)
-#define get_warp_id()			(threadIdx.x / warpSize)
-#define get_lane_id()			(threadIdx.x & (warpSize-1))
 
-INLINE_FUNCTION(uint32_t) WarpId(void)
-{
-	uint32_t	rv;
-
-	asm volatile("mov.u32 %0, %warpid;" : "=r"(rv) );
-
-	return rv;
-}
+/* Dynamic shared memory entrypoint */
+extern __shared__ char __pgstrom_dynamic_shared_workmem[] __MAXALIGNED__;
+#define SHARED_WORKMEM(UNITSZ,INDEX)						\
+	(__pgstrom_dynamic_shared_workmem + (UNITSZ)*(INDEX))
 
 INLINE_FUNCTION(uint32_t) LaneId(void)
 {
 	uint32_t	rv;
 
 	asm volatile("mov.u32 %0, %laneid;" : "=r"(rv) );
+
+	return rv;
+}
+
+INLINE_FUNCTION(uint32_t) DynamicShmemSize(void)
+{
+	uint32_t	rv;
+
+	asm volatile("mov.u32 %0, %dynamic_smem_size;" : "=r"(rv) );
+
+	return rv;
+}
+
+INLINE_FUNCTION(uint32_t) TotalShmemSize(void)
+{
+	uint32_t	rv;
+
+	asm volatile("mov.u32 %0, %total_smem_size;" : "=r"(rv) );
 
 	return rv;
 }
@@ -95,22 +106,54 @@ STROM_WRITEBACK_ERROR_STATUS(kern_errorbuf *ebuf, kern_context *kcxt)
 
 /* ----------------------------------------------------------------
  *
- * Definitions related to GpuScan
+ * Definitions related to per-warp context
  *
  * ----------------------------------------------------------------
  */
-#define GPUSCAN_TUPLES_PER_WARP		(2 * WARP_SIZE)
-typedef struct {
-	uint32_t		write_pos;
-	uint32_t		read_pos;
-	kern_tupitem   *tupitems[GPUSCAN_TUPLES_PER_WARP];
-} kern_gpuscan_suspend_warp;
+#define UNIT_TUPLES_PER_WARP		(2 * WARPSIZE)
+typedef struct
+{
+	uint32_t		smx_row_count;	/* just for suspend/resume */
+	uint32_t		scan_done;	/* smallest depth that may produce more tuples */
+	int				depth;		/* current depth, if JOIN */
+	uint32_t		nrels;		/* number of inner relations, if JOIN */
+	/* only KDS_FORMAT_BLOCK */
+	uint32_t		block_id;	/* BLOCK format needs to keep htuples on the */
+	uint32_t		lp_count;	/* lp_items array once, to pull maximum GPU */
+	uint32_t		lp_wr_pos;	/* utilization by simultaneous execution of */
+	uint32_t		lp_rd_pos;	/* the kern_scan_quals. */
+	uint32_t		lp_items[UNIT_TUPLES_PER_WARP];
+	/* read/write_pos of the combination buffer for each depth */
+	struct {
+		uint32_t	read;		/* read_pos of depth=X */
+		uint32_t	write;		/* write_pos of depth=X */
+	} pos[1];		/* variable length */
+	/*
+	 * If length of the combination buffer is sufficient enough,
+	 * combuf shall be allocated here.
+	 */
+} kern_warp_context;
 
-typedef struct {
-	uint32_t		row_count;
-	kern_gpuscan_suspend_warp warps[MAXTHREADS_PER_BLOCK / WARP_SIZE];
-} kern_gpuscan_suspend_context;
+#define KERN_WARP_CONTEXT_UNITSZ(nrels)						\
+	MAXALIGN(offsetof(kern_warp_context, pos[(nrels)+1]))
+#define WARP_READ_POS(warp,depth)		((warp)->pos[(depth)].read)
+#define WARP_WRITE_POS(warp,depth)		((warp)->pos[(depth)].write)
 
+/*
+ * definitions related to generic device executor routines
+ */
+EXTERN_FUNCTION(int)
+execGpuScanLoadSource(kern_context *kcxt,
+					  kern_warp_context *wp,
+					  kern_data_store *kds_src,
+					  kern_data_extra *kds_extra,
+					  kern_expression *kern_scan_quals,
+					  uint32_t *combuf,
+					  uint32_t *p_smx_row_count);
+
+/*
+ * Definitions related to GpuScan
+ */
 typedef struct {
 	kern_errorbuf	kerror;
 	uint32_t		grid_sz;
@@ -118,32 +161,39 @@ typedef struct {
 	uint32_t		nitems_in;
 	uint32_t		nitems_out;
 	uint32_t		extra_sz;
-	/* suspend/resume support */
+	/* kern_warp_context array */
 	uint32_t		suspend_count;
-	kern_gpuscan_suspend_context suspend_context[1];	/* per SM */
+	char			data[1]	__MAXALIGNED__;
 } kern_gpuscan;
 
 KERNEL_FUNCTION(void)
-kern_gpuscan_main_row(kern_session_info *session,
-					  kern_gpuscan *kgscan,
-					  kern_data_store *kds_src,
-					  kern_data_store *kds_dst);
+kern_gpuscan_main(kern_session_info *session,
+				  kern_gpuscan *kgscan,
+				  kern_data_store *kds_src,
+				  kern_data_extra *kds_extra,
+				  kern_data_store *kds_dst);
+
+/*
+ * Definitions related to GpuJoin
+ */
+typedef struct
+{
+	kern_errorbuf	kerror;
+	uint32_t		grid_sz;
+	uint32_t		block_sz;
+	uint32_t		nitems_in;
+	uint32_t		nitems_out;
+	uint32_t		num_rels;
+	/* kern_warp_context array */
+	char			data[1]	__MAXALIGNED__;
+} kern_gpujoin;
 
 KERNEL_FUNCTION(void)
-kern_gpuscan_main_block(kern_session_info *session,
-						kern_gpuscan *kgscan,
-						kern_data_store *kds_src,
-						kern_data_store *kds_dst);
-KERNEL_FUNCTION(void)
-kern_gpuscan_main_arrow(kern_session_info *session,
-						kern_gpuscan *kgscan,
-						kern_data_store *kds_src,
-						kern_data_store *kds_dst);
-KERNEL_FUNCTION(void)
-kern_gpuscan_main_column(kern_session_info *session,
-						 kern_gpuscan *kgscan,
-						 kern_data_store *kds_src,
-						 kern_data_extra *kds_extra,
-						 kern_data_store *kds_dst);
+kern_gpujoin_main(kern_session_info *session,
+				  kern_gpujoin *kgjoin,
+				  kern_multirels *kmrels,
+				  kern_data_store *kds_src,
+				  kern_data_extra *kds_extra,
+				  kern_data_store *kds_dst);
 
 #endif	/* CUDA_COMMON_H */

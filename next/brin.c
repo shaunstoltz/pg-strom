@@ -407,6 +407,44 @@ pgstromTryFindBrinIndex(PlannerInfo *root,
 	return indexOpt;
 }
 
+/*
+ * cost_brin_bitmap_build
+ */
+Cost
+cost_brin_bitmap_build(PlannerInfo *root,
+					   RelOptInfo *baserel,
+					   IndexOptInfo *indexOpt,
+					   List *indexQuals)
+{
+	BrinStatsData	statsData;
+	Relation		indexRel;
+	Cost			index_build_cost;
+	double			index_nitems;
+	double			spc_rand_page_cost;
+	double			spc_seq_page_cost;
+	ListCell	   *lc;
+
+	indexRel = index_open(indexOpt->indexoid, AccessShareLock);
+	brinGetStats(indexRel, &statsData);
+	index_close(indexRel, AccessShareLock);
+
+	get_tablespace_page_costs(indexOpt->reltablespace,
+							  &spc_rand_page_cost,
+							  &spc_seq_page_cost);
+	index_build_cost = spc_rand_page_cost * statsData.revmapNumPages;
+	index_nitems = ceil(baserel->pages / (double)statsData.pagesPerRange);
+	foreach (lc, indexQuals)
+	{
+		Node	   *qual = lfirst(lc);
+		QualCost	qcost;
+
+		cost_qual_eval_node(&qcost, qual, root);
+		index_build_cost += (qcost.startup +
+							 qcost.per_tuple * index_nitems);
+	}
+	return index_build_cost;
+}
+
 
 typedef struct
 {
@@ -421,6 +459,7 @@ typedef struct
 struct BrinIndexState
 {
 	Relation		index_rel;
+	List		   *index_quals;
 	BlockNumber		nblocks;
 	BlockNumber		nchunks;
 	BlockNumber		pagesPerRange;
@@ -466,6 +505,7 @@ pgstromBrinIndexExecBegin(pgstromTaskState *pts,
 	 */
 	lockmode = exec_rt_fetch(scanrelid, estate)->rellockmode;
 	br_state->index_rel = index_open(index_oid, lockmode);
+	br_state->index_quals = copyObject(index_quals);
 	br_state->brinRevmap = brinRevmapInitialize(br_state->index_rel,
 												&br_state->pagesPerRange,
 												estate->es_snapshot);
@@ -512,6 +552,7 @@ pgstromBrinIndexExecReset(pgstromTaskState *pts)
 {
 	/* See, ExecReScanBitmapIndexScan */
 	BrinIndexState *br_state = pts->br_state;
+	BrinIndexResults *br_results = br_state->brinResults;
 
 	if (br_state->NumRuntimeKeys != 0)
 	{
@@ -526,6 +567,10 @@ pgstromBrinIndexExecReset(pgstromTaskState *pts)
 
 	br_state->curr_chunk_id = 0;
 	br_state->curr_block_id = UINT_MAX;
+
+	br_results->build_status = 0;
+	br_results->nitems   = 0;
+	pg_atomic_init_u32(&br_results->index, 0);
 }
 
 /*
@@ -585,6 +630,7 @@ static void
 __BrinIndexExecBuildResults(pgstromTaskState *pts)
 {
 	/* see bringetbitmap() */
+	pgstromSharedState *ps_state = pts->ps_state;
 	EState		   *estate = pts->css.ss.ps.state;
 	BrinIndexState *br_state = pts->br_state;
 	BrinIndexResults *br_results = br_state->brinResults;
@@ -816,6 +862,10 @@ __BrinIndexExecBuildResults(pgstromTaskState *pts)
 			br_results->chunks[idx] = chunk_id;
 		}
 	}
+	/* update statistics */
+	pg_atomic_fetch_add_u32(&ps_state->brin_index_fetched, br_results->nitems);
+	pg_atomic_fetch_add_u32(&ps_state->brin_index_skipped,
+							br_state->nchunks - br_results->nitems);
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(per_range_cxt);
 
@@ -867,21 +917,6 @@ __BrinIndexGetResults(pgstromTaskState *pts)
 	return br_results;
 }
 
-BlockNumber
-pgstromBrinIndexNextChunk(pgstromTaskState *pts, BlockNumber *p_chunk_sz)
-{
-	BrinIndexState *br_state = pts->br_state;
-	BrinIndexResults *br_results = __BrinIndexGetResults(pts);
-	uint32_t	index;
-
-	index = pg_atomic_fetch_add_u32(&br_results->index, 1);
-	if (index < br_results->nitems)
-		return InvalidBlockNumber;
-
-	*p_chunk_sz = br_state->pagesPerRange;
-	return br_results->chunks[index];
-}
-
 TBMIterateResult *
 pgstromBrinIndexNextBlock(pgstromTaskState *pts)
 {
@@ -907,6 +942,29 @@ pgstromBrinIndexNextBlock(pgstromTaskState *pts)
 	br_state->tbmres.ntuples = -1;
 	br_state->tbmres.recheck = true;
 	return &br_state->tbmres;
+}
+
+bool
+pgstromBrinIndexNextChunk(pgstromTaskState *pts)
+{
+	BrinIndexState *br_state = pts->br_state;
+	BrinIndexResults *br_results = __BrinIndexGetResults(pts);
+	uint32_t		index;
+
+	index = pg_atomic_fetch_add_u32(&br_results->index, 1);
+	if (index < br_results->nitems)
+	{
+		BlockNumber	pagesPerRange = br_state->pagesPerRange;
+
+		pts->curr_block_num  = br_results->chunks[index] * pagesPerRange;
+		pts->curr_block_tail = pts->curr_block_num + pagesPerRange;
+		if (pts->curr_block_num >= br_state->nblocks)
+			return false;
+		if (pts->curr_block_tail > br_state->nblocks)
+			pts->curr_block_tail = br_state->nblocks;
+		return true;
+	}
+	return false;
 }
 
 void
@@ -955,17 +1013,6 @@ pgstromBrinIndexInitDSM(pgstromTaskState *pts, char *dsm_addr)
 	return (dsm_addr ? dsm_len : 0);
 }
 
-void
-pgstromBrinIndexReInitDSM(pgstromTaskState *pts)
-{
-	BrinIndexState *br_state = pts->br_state;
-	BrinIndexResults *br_results = br_state->brinResults;
-
-	br_results->build_status = 0;
-	br_results->nitems   = 0;
-	pg_atomic_init_u32(&br_results->index, 0);
-}
-
 Size
 pgstromBrinIndexAttachDSM(pgstromTaskState *pts, char *dsm_addr)
 {
@@ -980,6 +1027,52 @@ void
 pgstromBrinIndexShutdownDSM(pgstromTaskState *pts)
 {
 	/* nothing to do */
+}
+
+void
+pgstromBrinIndexExplain(pgstromTaskState *pts,
+						List *dcontext,
+						ExplainState *es)
+{
+	pgstromSharedState *ps_state = pts->ps_state;
+	BrinIndexState *brin_state = pts->br_state;
+	StringInfoData	buf;
+	ListCell	   *lc;
+	uint32_t		count;
+
+	initStringInfo(&buf);
+	foreach (lc, brin_state->index_quals)
+	{
+		Node   *qual = (Node *)lfirst(lc);
+		char   *temp;
+
+		temp = deparse_expression(qual, dcontext, false, true);
+		if (buf.len > 0)
+			appendStringInfoString(&buf, ", ");
+		appendStringInfoString(&buf, temp);
+	}
+	ExplainPropertyText("Brin Quals", buf.data, es);
+
+	if (es->analyze)
+	{
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+		{
+			resetStringInfo(&buf);
+			appendStringInfo(&buf, "fetched=%u, skipped=%u",
+							 pg_atomic_read_u32(&ps_state->brin_index_fetched),
+							 pg_atomic_read_u32(&ps_state->brin_index_skipped));
+			ExplainPropertyText("Brin Stats", buf.data, es);
+		}
+		else
+		{
+			count = pg_atomic_read_u32(&ps_state->brin_index_fetched);
+			ExplainPropertyInteger("Brin Stats Fetched", NULL, count, es);
+
+			count = pg_atomic_read_u32(&ps_state->brin_index_skipped);
+			ExplainPropertyInteger("Brin Stats Skipped", NULL, count, es);
+		}
+	}
+	pfree(buf.data);
 }
 
 void

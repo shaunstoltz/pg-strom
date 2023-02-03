@@ -1,7 +1,7 @@
 /*
- * xpu_misclib.c
+ * xpu_misclib.cu
  *
- * Collection of misc functions and operators for xPU(GPU/DPU/SPU)
+ * Collection of misc functions and operators for both of GPU and DPU
  * ----
  * Copyright 2011-2022 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
  * Copyright 2014-2022 (C) PG-Strom Developers Team
@@ -361,8 +361,6 @@ xpu_inet_arrow_ref(kern_context *kcxt,
 		result->isnull = true;
 	else
 	{
-		int		sz = offsetof(inet_struct, ipaddr[len]);
-
 		if (len == 4)
 			result->value.family = PGSQL_AF_INET;
 		else if (len == 16)
