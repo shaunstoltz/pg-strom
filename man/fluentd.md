@@ -48,7 +48,7 @@ PG-Strom can handle two types of data formats: PostgreSQL Heap format (transacti
 
 @ja{
 以下では、Fluentdが収集したログデータをApache Arrow形式ファイルとして出力し、これをPG-Stromで参照するというアプローチについて説明します。
-また、Fluentdのパッケージには、Treasure Data社の提供する安定版`td-agent`を使用するものとします。
+また、Fluentdのパッケージには、Treasure Data社の提供する安定版`fluentd`を使用するものとします。
 
 PG-Stromに同梱のFluentd向けOutputプラグインの`fluent-plugin-arrow-file`モジュールを利用すると、Fluentdが収集したログデータを、指定したスキーマ構造を持つApache Arrow形式ファイルとして書き出すことができます。PG-StromのArrow_Fdw機能を使用すればこのApache Arrow形式ファイルを外部テーブルとして参照する事ができ、また保存先のストレージが適切に設定されていれば、GPU-Direct SQLを用いた高速な読み出しも可能です。
 
@@ -62,7 +62,7 @@ PG-Stromに同梱のFluentd向けOutputプラグインの`fluent-plugin-arrow-fi
 
 @en{
 This chapter describes the approach to write out the log data collected by Fluentd in Apache Arrow format, and to refere it with PG-Strom.
-We assume `td-agent` here, that is a stable version of Fluentd provided by Treasure Data.
+We assume `fluentd` here, that is a stable version of Fluentd provided by Treasure Data.
 
 PG-Strom includes the `fluent-plugin-arrow-file` module. This allows Fluentd to write out the log data it collects as an Apache Arrow format file with a specified schema structure.
 Using PG-Strom's Arrow_Fdw, this Apache Arrow format file can be accessed as an foreign table.
@@ -113,20 +113,18 @@ Therefore, the output destination file name and schema definition information (m
 @en:##Installation
 
 @ja{
-使用しているLinuxディストリビューション用の`td-agent`パッケージをインストールします。
-また、arrow-fileプラグインのインストールには`rake-compiler`モジュールが必要ですので、予めインストールしておきます。
+使用しているLinuxディストリビューション用の`fluent-package`パッケージをインストールします。
 
-詳しくは[こちら](https://docs.fluentd.org/installation/install-by-rpm)を参照してください。
+詳しくは[こちら](https://docs.fluentd.org/installation/install-fluent-package)を参照してください。
 }
 @en{
-Install the `td-agent` package for Linux distribution you are using.
-The `rake-compiler` module is required to install the arrow-file plugin, so please install it before.
+Install the `fluent-package` package for Linux distribution you are using.
+
+See the [Install fluent-package](https://docs.fluentd.org/installation/install-fluent-package) for details.
 }
 
 ```
-$ curl -L https://toolbelt.treasuredata.com/sh/install-redhat-td-agent4.sh | sh
-
-$ sudo /opt/td-agent/bin/fluent-gem install rake-compiler
+$ curl -fsSL https://fluentd.cdn.cncf.io/sh/install-redhat-fluent-package6-lts.sh | sh
 ```
 
 @ja{
@@ -139,8 +137,8 @@ Next, download the source code for PG-Strom and build arrow-file plugin in the `
 ```
 $ git clone https://github.com/heterodb/pg-strom.git
 $ cd pg-strom/fluentd
-$ make TD_AGENT=1 gem
-$ sudo make TD_AGENT=1 install
+$ make gem
+$ sudo make install
 ```
 
 @ja{
@@ -151,8 +149,8 @@ To confirm that the Fluentd plugin is installed, run the following command.
 }
 
 ```
-$ /opt/td-agent/bin/fluent-gem list | grep arrow
-fluent-plugin-arrow-file (0.2)
+$ /opt/fluent/bin/fluent-gem list | grep arrow
+fluent-plugin-arrow-file (0.5)
 ```
 
 @ja:##設定
@@ -161,16 +159,23 @@ fluent-plugin-arrow-file (0.2)
 @ja{
 前述の通り、arrow-fileプラグインを動作させるには、出力先のパス名とスキーマ定義を設定することが最低限必要です。
 
-これに加えて、Apache Arrowファイルの構造上、Record Batchと呼ばれるデータの固まりはある程度大きなサイズで区切っておいた方が、検索・集計処理を行う際の処理性能を引き出しやすいです。
-arrow-fileプラグインは、Bufferプラグインから渡されるchunkごとにRecord Batchを作成するため、Bufferプラグイン側のバッファサイズはこれに準じた設定を行うべきです。デフォルトでは 256MB のバッファサイズを取るように設定されています。
+FluentdのWriteプラグインの構造上、arrow-fileプラグインは、Bufferプラグインから渡されたデータチャンクを1個のRecord Batchとしてファイルに書き込みます（Parquet形式ではRow Groupと呼びますが、ほぼ同じ概念です）。
+検索・集計処理を行う際には、ある程度大きなサイズのRecord Batchを作っておいた方が処理性能を引き出しやすいですが、GPUメモリに収まりきらないようなサイズはPG-Strom利用の観点からは望ましくありません。
+arrow-fileプラグインは、Bufferプラグインから渡されるデータチャンクごとにRecord Batchを作成するため、Bufferプラグイン側のバッファサイズはこれに準じた設定を行うべきです。デフォルトでは 256MB のバッファサイズを取るように設定されています。必要に応じて256MB～2GB程度のバッファサイズを設定すべきでしょう。
+
+また、以前のバージョンのarrow-fileプラグインは、Bufferプラグインからデータチャンクが渡されるたびに、既に書き込まれたArrowファイルにRecord Batchを追記していましたが、v0.5以降では、1ファイル=1Record Batch (1Row Group)という構造になっています。
+これは、libarrowやlibparquetが追記をサポートしていない事と、生成されたファイルを使用する際に排他処理が必須になってしまう事が理由です。
 }
 
 @en{
 As mentioned above, the arrow-file plugin requires the output path of the file and the schema definition at least.
 
-In addition to this, in order to acquire the best performance for searching and aggregation processing, the single chunk of data inside the Apache Arrow file, called the Record Batch, needs to be reasonably large in size.
-The arrow-file plugin creates a Record Batch for each chunk passed from the Buffer plugin.
-Therefore, the buffer size of the Buffer plugin should be set with the size of the Record Batch in mind. By the default, the Buffer plugin is set to take a buffer size of 256MB.
+Due to the architecture of Fluentd's Write plugin, the arrow-file plugin writes data chunks passed from the Buffer plugin to a file as one Record Batch (this is called a Row Group in Parquet format, but it's roughly the same concept).
+When performing search and aggregation processing, a relatively larger Record Batch is easier to pull out high performance, but a size that does not fit into GPU memory is undesirable from the perspective of using PG-Strom.
+Since the arrow-file plugin creates a Record Batch for each data chunk passed from the Buffer plugin, the buffer size on the Buffer plugin side should be set accordingly. The default buffer size is set to 256MB. You should set the buffer size to around 256MB to 2GB as needed.
+
+Also, previous versions of the arrow-file plugin appended a Record Batch to an already written Arrow file each time a data chunk was passed from the Buffer plugin, but from v0.5 onwards, the structure is 1 file = 1 Record Batch (1 Row Group).
+This is because libarrow and libparquet do not support appending, and exclusive access is required when using the generated files.
 }
 
 @ja{
@@ -195,13 +200,10 @@ The configuration parameters for the arrow-file plugin are as follows:
 |`%S`|現在時刻の秒を00～59で表した2桁の数値で置き換えます。|
 |`%p`|現在の Fluentd プロセスのPIDで置き換えます。|
 
-書式文字列はチャンクを書き出すタイミングで評価され、同名のApache Arrow形式ファイルが存在する場合には、Record Batchを追記します。存在しない場合はApache Arrow形式ファイルを新規作成し、最初のRecord Batchを書き出します。
+書式文字列はデータチャンクを書き出すタイミングで評価され、その名前を持つApache Arrow形式ファイル（またはApache Parquet形式ファイル）を新規作成して、Record Batch（またはRow Group）を1個持つファイルを書き出します。
+同名のファイルが存在する場合、ファイルの末尾にシーケンス番号を付与するなどして、別名でのファイル作成を試みます。
 
-ただし、既存のApache Arrowファイルのサイズが後述の`filesize_threshold`設定値を越えている場合は、既存ファイルをリネームした後、新規にファイルを作成します。
-
-    （例）`path /tmp/arrow_logs/my_logs_%y%m%d.%p.log`
-
-出力先のApache Arrowファイルは、チャンクを書き出すたびにフッタ領域を更新して全てのRecord Batchをポイントします。したがって、生成されたApache Arrowファイルは即座に読み出すことができますが、アクセス競合を避けるためには`lockf(3)`を用いて排他処理を行う必要があります。
+例）`path /tmp/arrow_logs/my_logs_%y%m%d.%p.log`
 }
 @en{
 `path` [type: `String` ] (Required)
@@ -219,13 +221,10 @@ The configuration parameters for the arrow-file plugin are as follows:
 |`%S`|A two-digit number representing the second of the current time, 00-59.|
 |`%p`|The PID of the current Fluentd process.|
 
-The placeholder is replaced when the chunk is written out. If an Apache Arrow format file of the same name exists, the Record Batch will be appended to it. If it does not exist, a new Apache Arrow format file is created and the first Record Batch is written out.
-
-However, if the size of the existing Apache Arrow file exceeds the `filesize_threshold` setting described below, rename the existing file and then create a new one.
+The format string is evaluated when writing out a data chunk, and a new Apache Arrow format file (or Apache Parquet format file) with the specified name is created, and a file containing one Record Batch (or Row Group) is written to it.
+If a file with the same name exists, an attempt will be made to create a file with a different name, for example by adding a sequence number to the end of the file.
 
 (Example) `path /tmp/arrow_logs/my_logs_%y%m%d.%p.log`
-
-The output Apache Arrow file updates the footer area to point to all Record Batches each time a chunk is written out. Therefore, the generated Apache Arrow file can be read immediately. However, to avoid access conflicts, exclusive handling is required using `lockf(3)`.
 }
 @ja{
 `schema_defs` [type: `String` ] (必須パラメータ)
@@ -237,9 +236,11 @@ The output Apache Arrow file updates the footer area to point to all Record Batc
     - `<column_name>`は列の名前です。Fluentdからarrow-fileに渡される連想配列のキー値と一致している必要があります。
     - `<column_type>`は列のデータ型です。以下の表を参照してください。
     - `<column_attrs>`は列の付加属性です。現時点では以下の属性のみがサポートされています。
-        - `stat_enabled` ... 列の統計情報を収集し、Record Batchごとの最大値/最小値を`max_values=...`および`min_values=...`カスタムメタデータとして埋め込みます。
+        - `stat_enabled` ... Arrow形式において、列の統計情報を収集し、Record Batchごとの最大値/最小値を`max_values=...`および`min_values=...`カスタムメタデータとして埋め込みます。Parquet形式では無視されます。
+        - `stat_disabled` ... Parquet形式はデフォルトで列ごとの統計情報を採取しますが、それを無効化します。Apache形式では無視されます。
+        - 圧縮オプション ... 列単位の圧縮アルゴリズムを指定する事ができます。選択可能なアルゴリズムは`snappy`、`gzip`、`brotli`、`zstd`、`lz4`、`lzo`、`bz2`、`none`（無圧縮）のいずれかです。
 
-（例）`schema_defs "ts=Timestamp;stat_enabled,dev_id=Uint32,temperature=Float32,humidity=Float32"`
+（例）`schema_defs "ts=Timestamp;stat_enabled,dev_id=Uint32,temperature=Float32;bz2,humidity=Float32"`
 
 ***arrow-fileプラグインのサポートするデータ型***
 
@@ -267,8 +268,10 @@ The output Apache Arrow file updates the footer area to point to all Record Batc
     - `<column_type>` is the data type of the column. See the following table.
     - `<column_attrs>` is an additional attribute for columns. At this time, only the following attributes are supported.
         - `stat_enabled` ... The statistics for the configured columns will be collected and the maximum/minimum values for each Record Batch will be set as custom metadata in the form of `max_values=...` and `min_values=...`.
+        - `stat_disabled` ... Disables per-column statistics that are collected by default in Parquet format. Ignored by Apache format.
+        - Compression options: You can specify the compression algorithm for each column. One of the `snappy`, `gzip`, `brotli`, `zstd`, `lz4`, `lzo`, `bz2` or `none` (no compression) can be used.
 
-(Example) `schema_defs "ts=Timestamp;stat_enabled,dev_id=Uint32,temperature=Float32,humidity=Float32"`
+(Example) `schema_defs "ts=Timestamp;stat_enabled,dev_id=Uint32,temperature=Float32;bz2,humidity=Float32"`
 
 ***Data types supported by the arrow-file plugin***
 
@@ -307,14 +310,23 @@ The output Apache Arrow file updates the footer area to point to all Record Batc
 :    This parameter is usually a string type such as `utf8`.
 }
 @ja{
-`filesize_threshold` [type: `Integer` / default: 10000]
-:    `fluent-plugin-arrow-file`が出力先ファイルを切り替える閾値をMB単位で設定します。
-:    デフォルトではファイルサイズが約10GBを越えた辺りで出力先を切り替えます。
+`format` [type: `String` / default: `arrow`]
+:    `fluent-plugin-arrow-file`が出力するファイル形式を設定します。
+:    `arrow`を指定するとApache Arrow形式に、`parquet`を指定するとApache Parquet形式となります。
 }
 @en{
-`filesize_threshold` [type: `Integer` / default: 10000]
-:    Specify the threshold for switching the output destination file in MB.
-:    By default, the output destination is switched when the file size exceeds about 10GB.
+`format` [type: `String` / default: `arrow`]
+:    Specify the file format to be written by the `fluent-plugin-arrow-file`.
+:    `arrow` means Apache Arrow format, and `parquet` means Apache Parquet format.
+@ja{
+`compression` [type: `String` / default: `zstd`]
+:    Apache Parquet形式で使用する圧縮アルゴリズムを指定します。列単位での圧縮オプションがない場合は、こちらで指定した圧縮アルゴリズムが適用されます。
+:    選択可能なアルゴリズムは`snappy`、`gzip`、`brotli`、`zstd`、`lz4`、`lzo`、`bz2`、`none`（無圧縮）のいずれかです。
+}
+@en{
+`compression` [type: `String` / default: `zstd`]
+:    Specifies the compression algorithm to use for Apache Parquet format. If no specific compression option is given on per-column configuration, the compression algorithm specified here will be applied.
+:    One of the `snappy`, `gzip`, `brotli`, `zstd`, `lz4`, `lzo`, `bz2` or `none`(uncompressed) can be used.
 }
 
 @ja:##使用例
@@ -339,13 +351,13 @@ The fields are then passed to the arrow-file plugin as an associative array. In 
 For simplicity of explanation, the chunk size is set to a maximum of 4MB / 200 lines in the `<buffer>` tag, and it is set to pass to the Output plugin in 10 seconds at most.
 }
 
-@ja: `/etc/td-agent/td-agent.conf`の設定例
-@en: ***Example configuration of `/etc/td-agent/td-agent.conf`***
+@ja: `/etc/fluent/fluentd.conf`の設定例
+@en: ***Example configuration of `/etc/fluent/fluentd.conf`***
 ```
 <source>
   @type  tail
   path /var/log/httpd/access_log
-  pos_file /var/log/td-agent/httpd_access.pos
+  pos_file /var/log/fluent/httpd_access.pos
   tag httpd
   format apache2
   <parse>
@@ -369,13 +381,13 @@ For simplicity of explanation, the chunk size is set to a maximum of 4MB / 200 l
 ```
 
 @ja{
-`td-agent`を起動します。
+`fluentd`を起動します。
 }
 @en{
-Start the `td-agent` service.
+Start the `fluentd` service.
 }
 ```
-$ sudo systemctl start td-agent
+$ sudo systemctl start fluentd
 ```
 
 @ja{

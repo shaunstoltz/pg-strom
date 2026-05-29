@@ -4,286 +4,598 @@
  * miscellaneous and uncategorized routines but usefull for multiple subsystems
  * of PG-Strom.
  * ----
- * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2021 (C) PG-Strom Developers Team
+ * Copyright 2011-2026 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2026 (C) PG-Strom Developers Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the PostgreSQL License.
  */
 #include "pg_strom.h"
 
-/*
- * make_flat_ands_expr - similar to make_ands_explicit but it pulls up
- * underlying and-clause
+/* ----------------------------------------------------------------
+ *
+ * form/deform/copy pgstromPlanInfo
+ *
+ * ----------------------------------------------------------------
  */
-Expr *
-make_flat_ands_explicit(List *andclauses)
+static void
+__form_codegen_kvar_defitem(codegen_kvar_defitem *kvdef,
+							List **p__kv_privs,
+							List **p__kv_exprs)
 {
-	List	   *args = NIL;
+	List	   *__kv_privs = NIL;
+	List	   *__kv_exprs = NIL;
+	List	   *__sub_privs = NIL;
+	List	   *__sub_exprs = NIL;
 	ListCell   *lc;
 
-	if (andclauses == NIL)
-		return (Expr *) makeBoolConst(true, false);
-	else if (list_length(andclauses) == 1)
-		return (Expr *) linitial(andclauses);
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_slot_id));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_depth));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_resno));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_maxref));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_offset));
 
-	foreach (lc, andclauses)
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_type_oid));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_type_code));
+	__kv_privs = lappend(__kv_privs, makeBoolean(kvdef->kv_typbyval));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_typalign));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_typlen));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_xdatum_sizeof));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_kvec_sizeof));
+	__kv_privs = lappend(__kv_privs, makeInteger(kvdef->kv_fallback));
+	__kv_exprs = lappend(__kv_exprs, kvdef->kv_expr);
+	foreach (lc, kvdef->kv_subfields)
 	{
-		Expr   *expr = lfirst(lc);
+		codegen_kvar_defitem *__kvdef = lfirst(lc);
+		List   *__privs = NIL;
+		List   *__exprs = NIL;
 
-		Assert(exprType((Node *)expr) == BOOLOID);
-		if (IsA(expr, BoolExpr) &&
-			((BoolExpr *)expr)->boolop == AND_EXPR)
-			args = list_concat(args, ((BoolExpr *) expr)->args);
-		else
-			args = lappend(args, expr);
+		__form_codegen_kvar_defitem(__kvdef, &__privs, &__exprs);
+		__sub_privs = lappend(__sub_privs, __privs);
+		__sub_exprs = lappend(__sub_exprs, __exprs);
 	}
-	Assert(list_length(args) > 1);
-	return make_andclause(args);
+	__kv_privs = lappend(__kv_privs, __sub_privs);
+	__kv_exprs = lappend(__kv_exprs, __sub_exprs);
+
+	*p__kv_privs = __kv_privs;
+	*p__kv_exprs = __kv_exprs;
+}
+
+static codegen_kvar_defitem *
+__deform_codegen_kvar_defitem(List *__kv_privs, List *__kv_exprs)
+{
+	codegen_kvar_defitem *kvdef = palloc0(sizeof(codegen_kvar_defitem));
+	List	   *__sub_privs = NIL;
+	List	   *__sub_exprs = NIL;
+	ListCell   *lc1, *lc2;
+	int			pindex = 0;
+	int			eindex = 0;
+
+	kvdef->kv_slot_id   = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_depth     = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_resno     = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_maxref    = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_offset    = intVal(list_nth(__kv_privs, pindex++));
+
+	kvdef->kv_type_oid  = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_type_code = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_typbyval  = boolVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_typalign  = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_typlen    = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_xdatum_sizeof = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_kvec_sizeof = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_fallback  = intVal(list_nth(__kv_privs, pindex++));
+	kvdef->kv_expr      = list_nth(__kv_exprs, eindex++);
+	__sub_privs         = list_nth(__kv_privs, pindex++);
+	__sub_exprs         = list_nth(__kv_exprs, eindex++);
+	forboth (lc1, __sub_privs,
+			 lc2, __sub_exprs)
+	{
+		codegen_kvar_defitem *__kvdef;
+
+		__kvdef = __deform_codegen_kvar_defitem(lfirst(lc1),
+												lfirst(lc2));
+		kvdef->kv_subfields = lappend(kvdef->kv_subfields, __kvdef);
+	}
+	return kvdef;
+}
+
+void
+form_pgstrom_plan_info(CustomScan *cscan, pgstromPlanInfo *pp_info)
+{
+	List	   *privs = NIL;
+	List	   *exprs = NIL;
+	List	   *kvars_deflist_privs = NIL;
+	List	   *kvars_deflist_exprs = NIL;
+	List	   *scan_rels_list = NIL;
+	ListCell   *lc;
+
+	privs = lappend(privs, makeInteger(pp_info->xpu_task_flags));
+	/* plan information */
+	privs = lappend(privs, bms_to_pglist(pp_info->outer_refs));
+	exprs = lappend(exprs, pp_info->used_params);
+	privs = lappend(privs, pp_info->host_quals);
+	privs = lappend(privs, makeInteger(pp_info->base_relid));
+	exprs = lappend(exprs, pp_info->scan_quals);
+	privs = lappend(privs, __makeFloat(pp_info->scan_npages));
+	privs = lappend(privs, __makeFloat(pp_info->scan_tuples));
+	privs = lappend(privs, __makeFloat(pp_info->scan_nrows));
+	privs = lappend(privs, makeInteger(pp_info->parallel_nworkers));
+	privs = lappend(privs, __makeFloat(pp_info->parallel_divisor));
+	privs = lappend(privs, __makeFloat(pp_info->startup_cost));
+	privs = lappend(privs, __makeFloat(pp_info->inner_cost));
+	privs = lappend(privs, __makeFloat(pp_info->run_cost));
+	privs = lappend(privs, __makeFloat(pp_info->final_cost));
+	privs = lappend(privs, __makeFloat(pp_info->final_nrows));
+	/* XPU code */
+	privs = lappend(privs, __makeByteaConst(pp_info->kexp_load_vars_packed));
+	privs = lappend(privs, __makeByteaConst(pp_info->kexp_move_vars_packed));
+	privs = lappend(privs, __makeByteaConst(pp_info->kexp_scan_quals));
+	privs = lappend(privs, __makeByteaConst(pp_info->kexp_join_quals_packed));
+	privs = lappend(privs, __makeByteaConst(pp_info->kexp_hash_keys_packed));
+	privs = lappend(privs, __makeByteaConst(pp_info->kexp_gist_evals_packed));
+	privs = lappend(privs, __makeByteaConst(pp_info->kexp_projection));
+	privs = lappend(privs, __makeByteaConst(pp_info->kexp_groupby_keyhash));
+	privs = lappend(privs, __makeByteaConst(pp_info->kexp_groupby_keyload));
+	privs = lappend(privs, __makeByteaConst(pp_info->kexp_groupby_keycomp));
+	privs = lappend(privs, __makeByteaConst(pp_info->kexp_groupby_actions));
+	privs = lappend(privs, __makeByteaConst(pp_info->kexp_gpusort_keydesc));
+	/* Kvars definitions */
+	foreach (lc, pp_info->kvars_deflist)
+	{
+		codegen_kvar_defitem *kvdef = lfirst(lc);
+		List   *__kv_privs = NIL;
+		List   *__kv_exprs = NIL;
+
+		__form_codegen_kvar_defitem(kvdef, &__kv_privs, &__kv_exprs);
+		kvars_deflist_privs = lappend(kvars_deflist_privs, __kv_privs);
+		kvars_deflist_exprs = lappend(kvars_deflist_exprs, __kv_exprs);
+	}
+	/* other planner fields */
+	privs = lappend(privs, kvars_deflist_privs);
+	exprs = lappend(exprs, kvars_deflist_exprs);
+	privs = lappend(privs, makeInteger(pp_info->kvecs_bufsz));
+	privs = lappend(privs, makeInteger(pp_info->kvecs_ndims));
+	privs = lappend(privs, makeInteger(pp_info->extra_bufsz));
+	privs = lappend(privs, makeInteger(pp_info->cuda_stack_size));
+	privs = lappend(privs, pp_info->groupby_actions);
+	privs = lappend(privs, pp_info->groupby_typmods);
+	privs = lappend(privs, makeInteger(pp_info->groupby_prepfn_bufsz));
+	exprs = lappend(exprs, pp_info->gpusort_keys_expr);
+	privs = lappend(privs, pp_info->gpusort_keys_kind);
+	privs = lappend(privs, pp_info->gpusort_keys_refs);
+	privs = lappend(privs, makeInteger(pp_info->gpusort_htup_margin));
+	privs = lappend(privs, makeInteger(pp_info->gpusort_limit_count));
+	privs = lappend(privs, makeInteger(pp_info->window_rank_func));
+	privs = lappend(privs, makeInteger(pp_info->window_rank_limit));
+	privs = lappend(privs, makeInteger(pp_info->window_partby_nkeys));
+	privs = lappend(privs, makeInteger(pp_info->window_orderby_nkeys));
+	exprs = lappend(exprs, pp_info->projection_hashkeys);
+	privs = lappend(privs, makeInteger(pp_info->select_into_relid));
+	privs = lappend(privs, pp_info->select_into_proj);
+	/* scan relations */
+	foreach (lc, pp_info->scan_rels_list)
+	{
+		pgstromPlanScanInfo *pp_scan = lfirst(lc);
+		List   *__privs = NIL;
+
+		__privs = lappend(__privs, makeInteger(pp_scan->scan_relid));
+		__privs = lappend(__privs, __makeFloat(pp_scan->plan_ntuples_raw));
+		__privs = lappend(__privs, __makeFloat(pp_scan->plan_ntuples_in));
+		__privs = lappend(__privs, makeInteger(pp_scan->brin_oid));
+		__privs = lappend(__privs, pp_scan->brin_conds);
+		__privs = lappend(__privs, pp_scan->brin_quals);
+		scan_rels_list = lappend(scan_rels_list, __privs);
+	}
+	privs = lappend(privs, scan_rels_list);
+	/* inner relations */
+	privs = lappend(privs, makeInteger(pp_info->num_inner_rels));
+	for (int i=0; i < pp_info->num_inner_rels; i++)
+	{
+		pgstromPlanInnerInfo *pp_inner = &pp_info->inners[i];
+		List   *__exprs = NIL;
+		List   *__privs = NIL;
+
+		__privs = lappend(__privs, makeInteger(pp_inner->join_type));
+		__privs = lappend(__privs, __makeFloat(pp_inner->join_nrows));
+		__exprs = lappend(__exprs, pp_inner->hash_outer_keys);
+		__exprs = lappend(__exprs, pp_inner->hash_inner_keys);
+		__exprs = lappend(__exprs, pp_inner->join_quals);
+		__exprs = lappend(__exprs, pp_inner->other_quals);
+		__privs = lappend(__privs, makeInteger(pp_inner->gist_index_oid));
+		__privs = lappend(__privs, makeInteger(pp_inner->gist_index_col));
+		__privs = lappend(__privs, makeInteger(pp_inner->gist_ctid_resno));
+		__privs = lappend(__privs, makeInteger(pp_inner->gist_func_oid));
+		__privs = lappend(__privs, makeInteger(pp_inner->gist_slot_id));
+		__exprs = lappend(__exprs, pp_inner->gist_clause);
+		__privs = lappend(__privs, __makeFloat(pp_inner->gist_selectivity));
+		__privs = lappend(__privs, __makeFloat(pp_inner->gist_npages));
+		__privs = lappend(__privs, makeInteger(pp_inner->gist_height));
+		__privs = lappend(__privs, makeBoolean(pp_inner->inner_pinned_buffer));
+
+		exprs = lappend(exprs, __exprs);
+		privs = lappend(privs, __privs);
+	}
+	cscan->custom_exprs = exprs;
+	cscan->custom_private = privs;
 }
 
 /*
- * fixup_varnode_to_origin
+ * deform_pgstrom_plan_info
  */
-Node *
-fixup_varnode_to_origin(Node *node, List *cscan_tlist)
+pgstromPlanInfo *
+deform_pgstrom_plan_info(CustomScan *cscan)
+{
+	pgstromPlanInfo *pp_info;
+	pgstromPlanInfo	pp_data;
+	List	   *privs = cscan->custom_private;
+	List	   *exprs = cscan->custom_exprs;
+	int			pindex = 0;
+	int			eindex = 0;
+	int			rtoffset = 0;
+	List	   *kvars_deflist_privs;
+	List	   *kvars_deflist_exprs;
+	List	   *scan_rels_list;
+	ListCell   *lc1, *lc2;
+
+	memset(&pp_data, 0, sizeof(pgstromPlanInfo));
+	/* device identifiers */
+	pp_data.xpu_task_flags = intVal(list_nth(privs, pindex++));
+	/* plan information */
+	pp_data.outer_refs   = bms_from_pglist(list_nth(privs, pindex++));
+	pp_data.used_params  = list_nth(exprs, eindex++);
+	pp_data.host_quals   = list_nth(privs, pindex++);
+	pp_data.base_relid   = intVal(list_nth(privs, pindex++));
+	/*
+	 * setrefs.c may rewrite scanrelid (which is originally the same value as
+	 * pp_info->base_relid) when finalizing plan references.
+	 * However, scan_relids cached in the private state is not adjusted by
+	 * setrefs.c, so we have to apply the same fixup here before using it.
+	 */
+	Assert(cscan->scan.scanrelid != 0);
+	if (pp_data.base_relid != cscan->scan.scanrelid)
+	{
+		Assert(pp_data.base_relid < cscan->scan.scanrelid);
+		rtoffset = (cscan->scan.scanrelid - pp_data.base_relid);
+	}
+	pp_data.scan_quals   = list_nth(exprs, eindex++);
+	pp_data.scan_npages  = floatVal(list_nth(privs, pindex++));
+	pp_data.scan_tuples  = floatVal(list_nth(privs, pindex++));
+	pp_data.scan_nrows   = floatVal(list_nth(privs, pindex++));
+	pp_data.parallel_nworkers = intVal(list_nth(privs, pindex++));
+	pp_data.parallel_divisor = floatVal(list_nth(privs, pindex++));
+	pp_data.startup_cost = floatVal(list_nth(privs, pindex++));
+	pp_data.inner_cost   = floatVal(list_nth(privs, pindex++));
+	pp_data.run_cost     = floatVal(list_nth(privs, pindex++));
+	pp_data.final_cost   = floatVal(list_nth(privs, pindex++));
+	pp_data.final_nrows  = floatVal(list_nth(privs, pindex++));
+	/* XPU code */
+	pp_data.kexp_load_vars_packed  = __getByteaConst(list_nth(privs, pindex++));
+	pp_data.kexp_move_vars_packed  = __getByteaConst(list_nth(privs, pindex++));
+	pp_data.kexp_scan_quals        = __getByteaConst(list_nth(privs, pindex++));
+	pp_data.kexp_join_quals_packed = __getByteaConst(list_nth(privs, pindex++));
+	pp_data.kexp_hash_keys_packed  = __getByteaConst(list_nth(privs, pindex++));
+	pp_data.kexp_gist_evals_packed = __getByteaConst(list_nth(privs, pindex++));
+	pp_data.kexp_projection        = __getByteaConst(list_nth(privs, pindex++));
+	pp_data.kexp_groupby_keyhash   = __getByteaConst(list_nth(privs, pindex++));
+	pp_data.kexp_groupby_keyload   = __getByteaConst(list_nth(privs, pindex++));
+	pp_data.kexp_groupby_keycomp   = __getByteaConst(list_nth(privs, pindex++));
+	pp_data.kexp_groupby_actions   = __getByteaConst(list_nth(privs, pindex++));
+	pp_data.kexp_gpusort_keydesc   = __getByteaConst(list_nth(privs, pindex++));
+	/* Kvars definitions */
+	kvars_deflist_privs = list_nth(privs, pindex++);
+	kvars_deflist_exprs = list_nth(exprs, eindex++);
+	Assert(list_length(kvars_deflist_privs) == list_length(kvars_deflist_exprs));
+	forboth (lc1, kvars_deflist_privs,
+			 lc2, kvars_deflist_exprs)
+	{
+		codegen_kvar_defitem *kvdef;
+
+		kvdef = __deform_codegen_kvar_defitem(lfirst(lc1),
+											  lfirst(lc2));
+		pp_data.kvars_deflist = lappend(pp_data.kvars_deflist, kvdef);
+	}
+	pp_data.kvecs_bufsz = intVal(list_nth(privs, pindex++));
+	pp_data.kvecs_ndims = intVal(list_nth(privs, pindex++));
+	pp_data.extra_bufsz = intVal(list_nth(privs, pindex++));
+	pp_data.cuda_stack_size = intVal(list_nth(privs, pindex++));
+	pp_data.groupby_actions = list_nth(privs, pindex++);
+	pp_data.groupby_typmods = list_nth(privs, pindex++);
+	pp_data.groupby_prepfn_bufsz = intVal(list_nth(privs, pindex++));
+	pp_data.gpusort_keys_expr = list_nth(exprs, eindex++);
+	pp_data.gpusort_keys_kind = list_nth(privs, pindex++);
+	pp_data.gpusort_keys_refs = list_nth(privs, pindex++);
+	pp_data.gpusort_htup_margin = intVal(list_nth(privs, pindex++));
+	pp_data.gpusort_limit_count = intVal(list_nth(privs, pindex++));
+	pp_data.window_rank_func = intVal(list_nth(privs, pindex++));
+	pp_data.window_rank_limit = intVal(list_nth(privs, pindex++));
+	pp_data.window_partby_nkeys = intVal(list_nth(privs, pindex++));
+	pp_data.window_orderby_nkeys = intVal(list_nth(privs, pindex++));
+	pp_data.projection_hashkeys = list_nth(exprs, eindex++);
+	pp_data.select_into_relid = intVal(list_nth(privs, pindex++));
+	pp_data.select_into_proj = list_nth(privs, pindex++);
+	/* scan relations */
+	scan_rels_list = list_nth(privs, pindex++);
+	foreach (lc1, scan_rels_list)
+	{
+		pgstromPlanScanInfo *pp_scan = palloc0(sizeof(pgstromPlanScanInfo));
+		List   *__privs = lfirst(lc1);
+		int		__pindex = 0;
+
+		pp_scan->scan_relid       = intVal(list_nth(__privs, __pindex++)) + rtoffset;
+		pp_scan->plan_ntuples_raw = floatVal(list_nth(__privs, __pindex++));
+		pp_scan->plan_ntuples_in  = floatVal(list_nth(__privs, __pindex++));
+		pp_scan->brin_oid         = intVal(list_nth(__privs, __pindex++));
+		pp_scan->brin_conds       = list_nth(__privs, __pindex++);
+		pp_scan->brin_quals       = list_nth(__privs, __pindex++);
+
+		pp_data.scan_rels_list = lappend(pp_data.scan_rels_list, pp_scan);
+	}
+	/* inner relations */
+	pp_data.num_inner_rels = intVal(list_nth(privs, pindex++));
+	pp_info = palloc0(offsetof(pgstromPlanInfo, inners[pp_data.num_inner_rels]));
+	memcpy(pp_info, &pp_data, offsetof(pgstromPlanInfo, inners));
+	for (int i=0; i < pp_info->num_inner_rels; i++)
+	{
+		pgstromPlanInnerInfo *pp_inner = &pp_info->inners[i];
+		List   *__exprs = list_nth(exprs, eindex++);
+		List   *__privs = list_nth(privs, pindex++);
+		int		__eindex = 0;
+		int		__pindex = 0;
+
+		pp_inner->join_type       = intVal(list_nth(__privs, __pindex++));
+		pp_inner->join_nrows      = floatVal(list_nth(__privs, __pindex++));
+		pp_inner->hash_outer_keys = list_nth(__exprs, __eindex++);
+		pp_inner->hash_inner_keys = list_nth(__exprs, __eindex++);
+		pp_inner->join_quals      = list_nth(__exprs, __eindex++);
+		pp_inner->other_quals     = list_nth(__exprs, __eindex++);
+		pp_inner->gist_index_oid  = intVal(list_nth(__privs, __pindex++));
+		pp_inner->gist_index_col  = intVal(list_nth(__privs, __pindex++));
+		pp_inner->gist_ctid_resno = intVal(list_nth(__privs, __pindex++));
+		pp_inner->gist_func_oid   = intVal(list_nth(__privs, __pindex++));
+		pp_inner->gist_slot_id    = intVal(list_nth(__privs, __pindex++));
+		pp_inner->gist_clause     = list_nth(__exprs, __eindex++);
+		pp_inner->gist_selectivity = floatVal(list_nth(__privs, __pindex++));
+		pp_inner->gist_npages     = floatVal(list_nth(__privs, __pindex++));
+		pp_inner->gist_height     = intVal(list_nth(__privs, __pindex++));
+		pp_inner->inner_pinned_buffer = boolVal(list_nth(__privs, __pindex++));
+	}
+	return pp_info;
+}
+
+/*
+ * copy_pgstrom_plan_info
+ */
+pgstromPlanInfo *
+copy_pgstrom_plan_info(const pgstromPlanInfo *pp_orig)
+{
+	pgstromPlanInfo *pp_dest;
+	List	   *kvars_deflist = NIL;
+	List	   *scan_rels_list = NIL;
+	ListCell   *lc;
+
+	/*
+	 * NOTE: we add one pgstromPlanInnerInfo margin to be used for GpuJoin.
+	 */
+	pp_dest = palloc0(offsetof(pgstromPlanInfo, inners[pp_orig->num_inner_rels+1]));
+	memcpy(pp_dest, pp_orig, offsetof(pgstromPlanInfo,
+									  inners[pp_orig->num_inner_rels]));
+	pp_dest->used_params      = list_copy(pp_dest->used_params);
+	pp_dest->host_quals       = copyObject(pp_dest->host_quals);
+	pp_dest->scan_quals       = copyObject(pp_dest->scan_quals);
+	foreach (lc, pp_orig->kvars_deflist)
+	{
+		codegen_kvar_defitem *kvdef_orig = lfirst(lc);
+		codegen_kvar_defitem *kvdef_dest;
+
+		kvdef_dest = pmemdup(kvdef_orig, sizeof(codegen_kvar_defitem));
+		kvdef_dest->kv_expr = copyObject(kvdef_dest->kv_expr);
+		kvars_deflist = lappend(kvars_deflist, kvdef_dest);
+	}
+	pp_dest->kvars_deflist    = kvars_deflist;
+	pp_dest->groupby_actions  = list_copy(pp_dest->groupby_actions);
+	pp_dest->groupby_typmods  = list_copy(pp_dest->groupby_typmods);
+	pp_dest->projection_hashkeys = copyObject(pp_dest->projection_hashkeys);
+	foreach (lc, pp_orig->scan_rels_list)
+	{
+		pgstromPlanScanInfo *pp_scan;
+		pp_scan = pmemdup(lfirst(lc), sizeof(pgstromPlanScanInfo));
+		scan_rels_list = lappend(scan_rels_list, pp_scan);
+	}
+	pp_dest->scan_rels_list = scan_rels_list;
+
+	for (int j=0; j < pp_orig->num_inner_rels; j++)
+	{
+		pgstromPlanInnerInfo *pp_inner = &pp_dest->inners[j];
+
+		pp_inner->hash_outer_keys = copyObject(pp_inner->hash_outer_keys);
+		pp_inner->hash_inner_keys = copyObject(pp_inner->hash_inner_keys);
+		pp_inner->join_quals      = copyObject(pp_inner->join_quals);
+		pp_inner->other_quals     = copyObject(pp_inner->other_quals);
+		pp_inner->gist_clause     = copyObject(pp_inner->gist_clause);
+	}
+	return pp_dest;
+}
+
+/*
+ * fixup_scanstate_expressions
+ */
+static Node *
+__fixup_customscan_expressions_walker(Node *node, void *__priv)
 {
 	if (!node)
 		return NULL;
 	if (IsA(node, Var))
 	{
-		Var	   *varnode = (Var *)node;
-		TargetEntry *tle;
+		CustomScan *cscan = (CustomScan *)__priv;
+		Var	   *var = (Var *)node;
 
-		if (cscan_tlist != NIL)
+		if (var->varno == INDEX_VAR)
 		{
-			Assert(varnode->varno == INDEX_VAR);
-			Assert(varnode->varattno >= 1 &&
-				   varnode->varattno <= list_length(cscan_tlist));
-			tle = list_nth(cscan_tlist, varnode->varattno - 1);
-			return (Node *)copyObject(tle->expr);
+			if (var->varattno > 0 &&
+				var->varattno <= list_length(cscan->custom_scan_tlist))
+			{
+				TargetEntry *tle = list_nth(cscan->custom_scan_tlist,
+											var->varattno - 1);
+				Assert(var->vartype   == exprType((Node *)tle->expr) &&
+					   var->vartypmod == exprTypmod((Node *)tle->expr));
+				return copyObject((Node *)tle->expr);
+			}
+			else
+			{
+				elog(ERROR, "Bug? INDEX_VAR referenced out of the custom_scan_tlist");
+			}
 		}
-		Assert(!IS_SPECIAL_VARNO(varnode->varno));
+		else
+		{
+			Assert(!IS_SPECIAL_VARNO(var->varno));
+			Assert(cscan->custom_scan_tlist == NIL);
+			return copyObject(node);
+		}
 	}
-	return expression_tree_mutator(node, fixup_varnode_to_origin,
-								   (void *)cscan_tlist);
+	return expression_tree_mutator(node, __fixup_customscan_expressions_walker, __priv);
+}
+
+Expr *
+fixup_scanstate_expr(ScanState *ss, Expr *expr)
+{
+	if (IsA(ss, CustomScanState))
+		return (Expr *)__fixup_customscan_expressions_walker((Node *)expr,
+															 ss->ps.plan);
+	return expr;
+}
+
+List *
+fixup_scanstate_quals(ScanState *ss, List *quals)
+{
+	if (IsA(ss, CustomScanState))
+		return (List *)__fixup_customscan_expressions_walker((Node *)quals,
+															 ss->ps.plan);
+	return quals;
 }
 
 /*
- * find_appinfos_by_relids_nofail
- *
- * It is almost equivalent to find_appinfos_by_relids(), but ignores
- * relations that are not partition leafs, instead of ereport().
- * In addition, it tries to solve multi-leve parent-child relations.
+ * append a binary chunk at the aligned block
  */
-static AppendRelInfo *
-build_multilevel_appinfos(PlannerInfo *root,
-						  AppendRelInfo **appstack, int nlevels)
+int
+__appendBinaryStringInfo(StringInfo buf, const void *data, int datalen)
 {
-	AppendRelInfo *apinfo = appstack[nlevels-1];
-	AppendRelInfo *apleaf = appstack[0];
-	AppendRelInfo *result;
-	ListCell   *lc;
-	int			i;
+	static uint64_t __zero = 0;
+	int		padding = (MAXALIGN(buf->len) - buf->len);
+	int		pos;
 
-	foreach (lc, root->append_rel_list)
-	{
-		AppendRelInfo *aptemp = lfirst(lc);
-
-		if (aptemp->child_relid == apinfo->parent_relid)
-		{
-			appstack[nlevels] = aptemp;
-			return build_multilevel_appinfos(root, appstack, nlevels+1);
-		}
-	}
-	/* shortcut if a simple single-level relationship */
-	if (nlevels == 1)
-		return apinfo;
-
-	result = makeNode(AppendRelInfo);
-	result->parent_relid = apinfo->parent_relid;
-	result->child_relid = apleaf->child_relid;
-	result->parent_reltype = apinfo->parent_reltype;
-	result->child_reltype = apleaf->child_reltype;
-	foreach (lc, apinfo->translated_vars)
-	{
-		Var	   *var = lfirst(lc);
-
-		for (i=nlevels-1; i>=0; i--)
-		{
-			AppendRelInfo *apcurr = appstack[i];
-			Var	   *temp;
-
-			if (var->varattno > list_length(apcurr->translated_vars))
-				elog(ERROR, "attribute %d of relation \"%s\" does not exist",
-					 var->varattno, get_rel_name(apcurr->parent_reloid));
-			temp = list_nth(apcurr->translated_vars, var->varattno - 1);
-			if (!temp)
-				elog(ERROR, "attribute %d of relation \"%s\" does not exist",
-					 var->varattno, get_rel_name(apcurr->parent_reloid));
-			var = temp;
-		}
-		result->translated_vars = lappend(result->translated_vars, var);
-	}
-	result->parent_reloid = apinfo->parent_reloid;
-
-	return result;
+	if (padding > 0)
+		appendBinaryStringInfo(buf, (char *)&__zero, padding);
+	pos = buf->len;
+	appendBinaryStringInfo(buf, data, datalen);
+	return pos;
 }
-
-AppendRelInfo **
-find_appinfos_by_relids_nofail(PlannerInfo *root,
-							   Relids relids,
-							   int *nappinfos)
-{
-	AppendRelInfo **appstack;
-	AppendRelInfo **appinfos;
-	ListCell   *lc;
-	int			nrooms = bms_num_members(relids);
-	int			nitems = 0;
-
-	appinfos = palloc0(sizeof(AppendRelInfo *) * nrooms);
-	appstack = alloca(sizeof(AppendRelInfo *) * root->simple_rel_array_size);
-	foreach (lc, root->append_rel_list)
-	{
-		AppendRelInfo *apinfo = lfirst(lc);
-
-		if (bms_is_member(apinfo->child_relid, relids))
-		{
-			appstack[0] = apinfo;
-			appinfos[nitems++] = build_multilevel_appinfos(root, appstack, 1);
-		}
-	}
-	Assert(nitems <= nrooms);
-	*nappinfos = nitems;
-
-	return appinfos;
-}
-
-/*
- * get_parallel_divisor - Estimate the fraction of the work that each worker
- * will do given the number of workers budgeted for the path.
- */
-double
-get_parallel_divisor(Path *path)
-{
-	double		parallel_divisor = path->parallel_workers;
-
-#if PG_VERSION_NUM >= 110000
-	if (parallel_leader_participation)
-#endif
-	{
-		double	leader_contribution;
-
-		leader_contribution = 1.0 - (0.3 * path->parallel_workers);
-		if (leader_contribution > 0)
-			parallel_divisor += leader_contribution;
-	}
-	return parallel_divisor;
-}
-
-/*
- * Usefulll wrapper routines like lsyscache.c
- */
-#if PG_VERSION_NUM < 110000
-char
-get_func_prokind(Oid funcid)
-{
-	HeapTuple	tup;
-	Form_pg_proc procForm;
-	char		prokind;
-
-	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
-	if (!HeapTupleIsValid(tup))
-		elog(ERROR, "cache lookup failed for function %u", funcid);
-	procForm = (Form_pg_proc) GETSTRUCT(tup);
-	if (procForm->proisagg)
-	{
-		Assert(!procForm->proiswindow);
-		prokind = PROKIND_AGGREGATE;
-	}
-	else if (procForm->proiswindow)
-	{
-		Assert(!procForm->proisagg);
-		prokind = PROKIND_WINDOW;
-	}
-	else
-	{
-		prokind = PROKIND_FUNCTION;
-	}
-	ReleaseSysCache(tup);
-
-	return prokind;
-}
-#endif		/* <PG11 */
 
 int
-get_relnatts(Oid relid)
+__appendZeroStringInfo(StringInfo buf, int nbytes)
 {
-	HeapTuple	tup;
-	int			relnatts = -1;
+	static uint64_t __zero = 0;
+	int		padding = (MAXALIGN(buf->len) - buf->len);
+	int		pos;
 
-	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
-	if (HeapTupleIsValid(tup))
+	if (padding > 0)
+		appendBinaryStringInfo(buf, (char *)&__zero, padding);
+	pos = buf->len;
+	if (nbytes > 0)
 	{
-        Form_pg_class reltup = (Form_pg_class) GETSTRUCT(tup);
-
-        relnatts = reltup->relnatts;
-        ReleaseSysCache(tup);
+		enlargeStringInfo(buf, nbytes);
+		memset(buf->data + pos, 0, nbytes);
+		buf->len += nbytes;
 	}
-	return relnatts;
+	return pos;
 }
 
 /*
- * get_function_oid
+ * StringInfo in 64bit length
  */
-Oid
-get_function_oid(const char *func_name,
-				 oidvector *func_args,
-				 Oid namespace_oid,
-				 bool missing_ok)
+void
+initLargeStringInfo(LargeStringInfo buf)
 {
-	Oid		func_oid;
-
-	func_oid = GetSysCacheOid3(PROCNAMEARGSNSP,
-#if PG_VERSION_NUM >= 120000
-							   Anum_pg_proc_oid,
-#endif
-							   CStringGetDatum(func_name),
-							   PointerGetDatum(func_args),
-							   ObjectIdGetDatum(namespace_oid));
-	if (!missing_ok && !OidIsValid(func_oid))
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_FUNCTION),
-				 errmsg("function %s is not defined",
-						funcname_signature_string(func_name,
-												  func_args->dim1,
-												  NIL,
-												  func_args->values))));
-	return func_oid;
+	buf->maxlen = (4UL << 20);		/* start from 4MB */
+	buf->len = 0;
+	buf->data = (char *)palloc_extended(buf->maxlen, MCXT_ALLOC_HUGE);
 }
-
-/*
- * get_type_oid
- */
-Oid
-get_type_oid(const char *type_name,
-			 Oid namespace_oid,
-			 bool missing_ok)
+void
+resetLargeStringInfo(LargeStringInfo buf)
 {
-	Oid		type_oid;
+	buf->data[0] = '\0';
+	buf->len = 0;
+}
+size_t
+appendBinaryLargeStringInfo(LargeStringInfo buf,
+							const void *data, size_t len)
+{
+	size_t	padding = (MAXALIGN(buf->len) - buf->len);
+	size_t	pos;
 
-	type_oid = GetSysCacheOid2(TYPENAMENSP,
-#if PG_VERSION_NUM >= 120000
-							   Anum_pg_type_oid,
-#endif
-							   CStringGetDatum(type_name),
-							   ObjectIdGetDatum(namespace_oid));
-	if (!missing_ok && !OidIsValid(type_oid))
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("type %s is not defined", type_name)));
+	/* Make more room if needed */
+	enlargeLargeStringInfo(buf, padding + len);
+	/* Ensure max-alignment */
+	if (padding > 0)
+	{
+		memset(buf->data + buf->len, 0, padding);
+		buf->len += padding;
+	}
+	pos = buf->len;
+	/* OK, append the data */
+	memcpy(buf->data + buf->len, data, len);
+	buf->len += len;
+	/* keep a trailing null in place */
+	buf->data[buf->len] = '\0';
 
-	return type_oid;
+	return pos;
+}
+size_t
+appendStringLargeStringInfo(LargeStringInfo buf, const char *str)
+{
+	return appendBinaryLargeStringInfo(buf, str, strlen(str)+1);
+}
+size_t
+appendZeroLargeStringInfo(LargeStringInfo buf, size_t nbytes)
+{
+	size_t	padding = (MAXALIGN(buf->len) - buf->len);
+	size_t	pos;
+
+	/* Make more room if needed */
+	enlargeLargeStringInfo(buf, padding + nbytes);
+	/* Ensure max-alignment */
+	if (padding > 0)
+	{
+		memset(buf->data + buf->len, 0, padding);
+		buf->len += padding;
+	}
+	pos = buf->len;
+	if (nbytes > 0)
+	{
+		memset(buf->data + pos, 0, nbytes);
+		buf->len += nbytes;
+	}
+	return pos;
+}
+void
+enlargeLargeStringInfo(LargeStringInfo buf, size_t needed)
+{
+	size_t	newlen;
+
+	needed += buf->len + 1;		/* total space required now */
+	if (needed <= buf->maxlen)
+		return;					/* got enough space already */
+	/*
+	 * We don't want to allocate just a little more space with each append;
+	 * for efficiency, double the buffer size each time it overflows.
+	 * Actually, we might need to more than double it if 'needed' is big...
+	 */
+	newlen = 2 * buf->maxlen;
+	while (needed > newlen)
+		newlen = 2 * newlen;
+
+	buf->data = (char *)repalloc_huge(buf->data, newlen);
+	buf->maxlen = newlen;
 }
 
 /*
@@ -309,102 +621,157 @@ get_type_name(Oid type_oid, bool missing_ok)
 }
 
 /*
- * get_proc_library
+ * get_type_namespace
+ */
+Oid
+get_type_namespace(Oid type_oid)
+{
+	HeapTuple	tup;
+	Oid			namespace_oid = InvalidOid;
+
+	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type_oid));
+	if (HeapTupleIsValid(tup))
+	{
+		namespace_oid = ((Form_pg_type) GETSTRUCT(tup))->typnamespace;
+		ReleaseSysCache(tup);
+	}
+	return namespace_oid;
+}
+
+/*
+ * get_type_extension_name
  */
 char *
-get_proc_library(HeapTuple protup)
+get_type_extension_name(Oid type_oid)
 {
-	Form_pg_proc	proc = (Form_pg_proc)GETSTRUCT(protup);
+	Oid		ext_oid = getExtensionOfObject(TypeRelationId, type_oid);
 
-	if (proc->prolang == ClanguageId)
-	{
-		Datum		datum;
-		bool		isnull;
-
-		datum = SysCacheGetAttr(PROCOID, protup,
-								Anum_pg_proc_probin,
-								&isnull);
-		if (!isnull)
-			return TextDatumGetCString(datum);
-	}
-	else if (proc->prolang != INTERNALlanguageId &&
-			 proc->prolang != SQLlanguageId)
-	{
-		return (void *)(~0UL);
-	}
+	if (OidIsValid(ext_oid))
+		return get_extension_name(ext_oid);
 	return NULL;
 }
 
 /*
- * get_object_extension_oid
+ * get_func_extension_name
  */
-Oid
-get_object_extension_oid(Oid class_id,
-						 Oid object_id,
-						 int32 objsub_id,
-						 bool missing_ok)
+char *
+get_func_extension_name(Oid func_oid)
 {
-	Relation	drel;
-	ScanKeyData	skeys[3];
-	SysScanDesc	sscan;
-	HeapTuple	tup;
-	Oid			ext_oid = InvalidOid;
+	Oid		ext_oid = getExtensionOfObject(ProcedureRelationId, func_oid);
 
-	drel = table_open(DependRelationId, AccessShareLock);
-
-	ScanKeyInit(&skeys[0],
-				Anum_pg_depend_classid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(class_id));
-	ScanKeyInit(&skeys[1],
-				Anum_pg_depend_objid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(object_id));
-	ScanKeyInit(&skeys[2],
-				Anum_pg_depend_objsubid,
-				BTEqualStrategyNumber, F_INT4EQ,
-				Int32GetDatum(objsub_id));
-	sscan = systable_beginscan(drel, DependDependerIndexId, true,
-							   NULL, 3, skeys);
-	while (HeapTupleIsValid(tup = systable_getnext(sscan)))
-	{
-		Form_pg_depend	dep = (Form_pg_depend) GETSTRUCT(tup);
-
-		if (dep->refclassid == ExtensionRelationId &&
-			dep->refobjsubid == 0 &&
-			(dep->deptype == DEPENDENCY_EXTENSION ||
-			 dep->deptype == DEPENDENCY_AUTO_EXTENSION))
-		{
-			ext_oid = dep->refobjid;
-			break;
-		}
-	}
-	systable_endscan(sscan);
-	table_close(drel, AccessShareLock);
-
-	if (!missing_ok && !OidIsValid(ext_oid))
-		elog(ERROR, "couldn't find out references (class:%u, objid:%u, subid:%d) by pg_extension at pg_depend",
-			 class_id, object_id, objsub_id);
-
-	return ext_oid;
+	if (OidIsValid(ext_oid))
+		return get_extension_name(ext_oid);
+	return NULL;
 }
 
 /*
- * bms_to_cstring - human readable Bitmapset
+ * get_relation_am
+ */
+Oid
+get_relation_am(Oid rel_oid, bool missing_ok)
+{
+	HeapTuple	tup;
+	Oid			relam;
+
+	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(rel_oid));
+	if (!HeapTupleIsValid(tup))
+	{
+		if (!missing_ok)
+			elog(ERROR, "cache lookup failed for relation %u", rel_oid);
+		return InvalidOid;
+	}
+	relam = ((Form_pg_class) GETSTRUCT(tup))->relam;
+	ReleaseSysCache(tup);
+
+	return relam;
+}
+
+/*
+ * __getRelOptInfoName
  */
 char *
-bms_to_cstring(Bitmapset *bms)
+__getRelOptInfoName(char *buffer, size_t bufsz,
+					PlannerInfo *root, RelOptInfo *rel)
 {
-	StringInfoData buf;
-	int			bit = -1;
+	if (IS_JOIN_REL(rel))
+	{
+		char   *pos = buffer;
+		bool	need_comma = false;
+		int		k, nbytes;
 
-	initStringInfo(&buf);
-	appendStringInfo(&buf, "{");
-	while ((bit = bms_next_member(bms, bit)) >= 0)
-		appendStringInfo(&buf, " %d", bit);
-	appendStringInfo(&buf, " }");
+		for (k = bms_next_member(rel->relids, -1);
+			 k >= 0;
+			 k = bms_next_member(rel->relids, k))
+		{
+			RelOptInfo *__rel = root->simple_rel_array[k];
+			char	   *prev = pos;
 
-	return buf.data;
+			if (need_comma)
+			{
+				nbytes = snprintf(pos, bufsz, ",");
+				pos += nbytes;
+				bufsz -= nbytes;
+			}
+			pos = __getRelOptInfoName(pos, bufsz, root, __rel);
+			pos = strchr(pos, '\0');
+			Assert(pos != NULL && pos >= prev && pos - prev <= bufsz);
+			bufsz -= (pos - prev);
+
+			need_comma = true;
+		}
+	}
+	else if (IS_SIMPLE_REL(rel))
+	{
+		RangeTblEntry  *rte = root->simple_rte_array[rel->relid];
+		/* see get_rte_alias() */
+		if (rte->alias != NULL)
+		{
+			if (rte->rtekind == RTE_RELATION)
+				snprintf(buffer, bufsz, "%s as %s",
+						 get_rel_name(rte->relid),
+						 rte->alias->aliasname);
+			else
+				snprintf(buffer, bufsz, "%s",
+						 rte->alias->aliasname);
+		}
+		else if (rte->rtekind == RTE_RELATION)
+			snprintf(buffer, bufsz, "%s",
+					 get_rel_name(rte->relid));
+		else if (rte->eref != NULL)
+			snprintf(buffer, bufsz, "%s",
+					 rte->eref->aliasname);
+		else
+			snprintf(buffer, bufsz, "base:relid=%u", rte->relid);
+	}
+	else
+	{
+		static const char *upper_labels[] = {
+			"upper:setop",
+			"upper:partial-group-agg",
+			"upper:window",
+			"upper:partial-distinct",
+			"upper:ordered",
+			"upper:final"
+		};
+		Assert(IS_UPPER_REL(rel));
+		for (int k=UPPERREL_SETOP; k <= UPPERREL_FINAL; k++)
+		{
+			ListCell   *lc;
+
+			foreach (lc, root->upper_rels[k])
+			{
+				RelOptInfo *upper_rel = lfirst(lc);
+
+				if (upper_rel == rel)
+				{
+					snprintf(buffer, bufsz, "(%s)", upper_labels[k]);
+					return buffer;
+				}
+			}
+		}
+		snprintf(buffer, bufsz, "(unknown-upper)");
+	}
+	return buffer;
 }
 
 /*
@@ -438,195 +805,30 @@ bms_from_pglist(List *pglist)
 	return bms;
 }
 
-/*
- * pathnode_tree_walker
- */
-static bool
-pathnode_tree_walker(Path *node,
-					 bool (*walker)(),
-					 void *context)
+Float *
+__makeFloat(double fval)
 {
-	ListCell   *lc;
-
-	if (!node)
-		return false;
-
-	check_stack_depth();
-	switch (nodeTag(node))
-	{
-		case T_Path:
-		case T_IndexPath:
-		case T_BitmapHeapPath:
-		case T_BitmapAndPath:
-		case T_BitmapOrPath:
-		case T_TidPath:
-#if PG_VERSION_NUM < 120000
-		case T_ResultPath:
-#else
-		case T_GroupResultPath:
-#endif
-		case T_MinMaxAggPath:
-			/* primitive path nodes */
-			break;
-		case T_SubqueryScanPath:
-			if (walker(((SubqueryScanPath *)node)->subpath, context))
-				return true;
-			break;
-		case T_ForeignPath:
-			if (walker(((ForeignPath *)node)->fdw_outerpath, context))
-				return true;
-			break;
-		case T_CustomPath:
-			foreach (lc, ((CustomPath *)node)->custom_paths)
-			{
-				if (walker((Path *)lfirst(lc), context))
-					return true;
-			}
-			break;
-		case T_NestPath:
-		case T_MergePath:
-		case T_HashPath:
-			if (walker(((JoinPath *)node)->outerjoinpath, context))
-				return true;
-			if (walker(((JoinPath *)node)->innerjoinpath, context))
-				return true;
-			break;
-		case T_AppendPath:
-			foreach (lc, ((AppendPath *)node)->subpaths)
-			{
-				if (walker((Path *)lfirst(lc), context))
-					return true;
-			}
-			break;
-		case T_MergeAppendPath:
-			foreach (lc, ((MergeAppendPath *)node)->subpaths)
-			{
-				if (walker((Path *)lfirst(lc), context))
-					return true;
-			}
-			break;
-		case T_MaterialPath:
-			if (walker(((MaterialPath *)node)->subpath, context))
-				return true;
-			break;
-		case T_UniquePath:
-			if (walker(((UniquePath *)node)->subpath, context))
-				return true;
-			break;
-		case T_GatherPath:
-			if (walker(((GatherPath *)node)->subpath, context))
-				return true;
-			break;
-#if PG_VERSION_NUM >= 100000
-		case T_GatherMergePath:
-			if (walker(((GatherMergePath *)node)->subpath, context))
-				return true;
-			break;
-#endif		/* >= PG10 */
-		case T_ProjectionPath:
-			if (walker(((ProjectionPath *)node)->subpath, context))
-				return true;
-			break;
-#if PG_VERSION_NUM >= 100000
-		case T_ProjectSetPath:
-			if (walker(((ProjectSetPath *)node)->subpath, context))
-				return true;
-			break;
-#endif		/* >= PG10 */
-		case T_SortPath:
-			if (walker(((SortPath *)node)->subpath, context))
-				return true;
-			break;
-		case T_GroupPath:
-			if (walker(((GroupPath *)node)->subpath, context))
-				return true;
-			break;
-		case T_UpperUniquePath:
-			if (walker(((UpperUniquePath *)node)->subpath, context))
-				return true;
-			break;
-		case T_AggPath:
-			if (walker(((AggPath *)node)->subpath, context))
-				return true;
-			break;
-		case T_GroupingSetsPath:
-			if (walker(((GroupingSetsPath *)node)->subpath, context))
-				return true;
-			break;
-		case T_WindowAggPath:
-			if (walker(((WindowAggPath *)node)->subpath, context))
-				return true;
-			break;
-		case T_SetOpPath:
-			if (walker(((SetOpPath *)node)->subpath, context))
-				return true;
-			break;
-		case T_RecursiveUnionPath:
-			if (walker(((RecursiveUnionPath *)node)->leftpath, context))
-				return true;
-			if (walker(((RecursiveUnionPath *)node)->rightpath, context))
-				return true;
-			break;
-		case T_LockRowsPath:
-			if (walker(((LockRowsPath *)node)->subpath, context))
-				return true;
-			break;
-		case T_ModifyTablePath:
-#if PG_VERSION_NUM < 140000
-			foreach (lc, ((ModifyTablePath *)node)->subpaths)
-			{
-				if (walker((Path *)lfirst(lc), context))
-					return true;
-			}
-#else
-			if (walker(((ModifyTablePath *)node)->subpath))
-				return true;
-#endif
-			break;
-		case T_LimitPath:
-			if (walker(((LimitPath *)node)->subpath, context))
-				return true;
-			break;
-		default:
-			elog(ERROR, "unrecognized path-node type: %d",
-				 (int) nodeTag(node));
-			break;
-	}
-	return false;
+	return makeFloat(psprintf("%e", fval));
 }
 
-static bool
-__pathtree_has_gpupath(Path *node, void *context)
+Const *
+__makeByteaConst(bytea *data)
 {
-	if (!node)
-		return false;
-	if (pgstrom_path_is_gpuscan(node) ||
-		pgstrom_path_is_gpujoin(node) ||
-		pgstrom_path_is_gpupreagg(node))
-		return true;
-	return pathnode_tree_walker(node, __pathtree_has_gpupath, context);
+	return makeConst(BYTEAOID,
+					 -1,
+					 InvalidOid,
+					 -1,
+					 PointerGetDatum(data),
+					 data == NULL,
+					 false);
 }
 
-bool
-pathtree_has_gpupath(Path *node)
+bytea *
+__getByteaConst(Const *con)
 {
-	return __pathtree_has_gpupath(node, NULL);
-}
+	Assert(IsA(con, Const) && con->consttype == BYTEAOID);
 
-static bool
-__pathtree_has_parallel_aware(Path *path, void *context)
-{
-	bool	rv = path->parallel_aware;
-
-	if (!rv)
-		rv = pathnode_tree_walker(path, __pathtree_has_parallel_aware, context);
-	return rv;
-}
-
-bool
-pathtree_has_parallel_aware(Path *node)
-{
-	return __pathtree_has_parallel_aware(node, NULL);
+	return (con->constisnull ? NULL : DatumGetByteaP(con->constvalue));
 }
 
 /*
@@ -670,6 +872,8 @@ pgstrom_copy_pathnode(const Path *pathnode)
 			return pmemdup(pathnode, sizeof(BitmapOrPath));
 		case T_TidPath:
 			return pmemdup(pathnode, sizeof(TidPath));
+		case T_TidRangePath:
+			return pmemdup(pathnode, sizeof(TidRangePath));
 		case T_SubqueryScanPath:
 			{
 				SubqueryScanPath *a = (SubqueryScanPath *)pathnode;
@@ -685,22 +889,19 @@ pgstrom_copy_pathnode(const Path *pathnode)
 				return &b->path;
 			}
 		case T_CustomPath:
-			if (pgstrom_path_is_gpuscan(pathnode))
-				return pgstrom_copy_gpuscan_path(pathnode);
-			else if (pgstrom_path_is_gpujoin(pathnode))
-				return pgstrom_copy_gpujoin_path(pathnode);
-			else if (pgstrom_path_is_gpupreagg(pathnode))
-				return pgstrom_copy_gpupreagg_path(pathnode);
-			else
 			{
 				CustomPath	   *a = (CustomPath *)pathnode;
 				CustomPath	   *b = pmemdup(a, sizeof(CustomPath));
 				List		   *subpaths = NIL;
 				ListCell	   *lc;
+
 				foreach (lc, a->custom_paths)
-					subpaths = lappend(subpaths,
-									   pgstrom_copy_pathnode(lfirst(lc)));
+				{
+					Path	   *sp = pgstrom_copy_pathnode(lfirst(lc));
+					subpaths = lappend(subpaths, sp);
+				}
 				b->custom_paths = subpaths;
+				b->custom_private = list_copy(a->custom_private);
 				return &b->path;
 			}
 		case T_NestPath:
@@ -735,17 +936,19 @@ pgstrom_copy_pathnode(const Path *pathnode)
 				b->subpaths = subpaths;
 				return &b->path;
 			}
-#if PG_VERSION_NUM < 120000
-		case T_ResultPath:
-			return pmemdup(pathnode, sizeof(ResultPath));
-#else
 		case T_GroupResultPath:
 			return pmemdup(pathnode, sizeof(GroupResultPath));
-#endif
 		case T_MaterialPath:
 			{
 				MaterialPath   *a = (MaterialPath *)pathnode;
 				MaterialPath   *b = pmemdup(a, sizeof(MaterialPath));
+				b->subpath = pgstrom_copy_pathnode(a->subpath);
+				return &b->path;
+			}
+		case T_MemoizePath:
+			{
+				MemoizePath	   *a = (MemoizePath *)pathnode;
+				MemoizePath	   *b = pmemdup(a, sizeof(MemoizePath));
 				b->subpath = pgstrom_copy_pathnode(a->subpath);
 				return &b->path;
 			}
@@ -791,6 +994,13 @@ pgstrom_copy_pathnode(const Path *pathnode)
 				b->subpath = pgstrom_copy_pathnode(a->subpath);
 				return &b->path;
 			}
+		case T_IncrementalSortPath:
+			{
+				IncrementalSortPath *a = (IncrementalSortPath *)pathnode;
+				IncrementalSortPath *b = pmemdup(a, sizeof(IncrementalSortPath));
+				b->spath.subpath = pgstrom_copy_pathnode(a->spath.subpath);
+				return &b->spath.path;
+			}
 		case T_GroupPath:
 			{
 				GroupPath	   *a = (GroupPath *)pathnode;
@@ -832,7 +1042,12 @@ pgstrom_copy_pathnode(const Path *pathnode)
 			{
 				SetOpPath	   *a = (SetOpPath *)pathnode;
 				SetOpPath	   *b = pmemdup(a, sizeof(SetOpPath));
+#if PG_VERSION_NUM < 180000
 				b->subpath = pgstrom_copy_pathnode(a->subpath);
+#else
+				b->leftpath = pgstrom_copy_pathnode(a->leftpath);
+				b->rightpath = pgstrom_copy_pathnode(a->rightpath);
+#endif
 				return &b->path;
 			}
 		case T_RecursiveUnionPath:
@@ -854,16 +1069,7 @@ pgstrom_copy_pathnode(const Path *pathnode)
 			{
 				ModifyTablePath *a = (ModifyTablePath *)pathnode;
 				ModifyTablePath *b = pmemdup(a, sizeof(ModifyTablePath));
-#if PG_VERSION_NUM < 140000
-				List	   *subpaths = NIL;
-				ListCell   *lc;
-				foreach (lc, a->subpaths)
-					subpaths = lappend(subpaths,
-									   pgstrom_copy_pathnode(lfirst(lc)));
-				b->subpaths = subpaths;
-#else
 				b->subpath = pgstrom_copy_pathnode(a->subpath);
-#endif
 				return &b->path;
 			}
 		case T_LimitPath:
@@ -880,28 +1086,328 @@ pgstrom_copy_pathnode(const Path *pathnode)
 }
 
 /*
- * errorText - string form of the error code
+ * pathNameMatchByPattern
+ *
+ * It excludes the path-names which don't match with the given pattern.
+ * The pattern can use the following special characters as wildcard. 
+ *
+ * '?' : any character
+ * '*' : any characters (more than 0-length)
+ * '\' : escape character
+ * '${KEY}' : this token is considered as a content of the KEY attribute.
+ * '@{KEY}' : this token is considered as a content of the KEY attribute (only numeric)
+ *
+ * Entire logic is similar to textlike(), see MatchText() in like_match.c
  */
-const char *
-errorText(int errcode)
-{
-	static __thread char buffer[160];
-	const char *error_name;
-	const char *error_desc;
+#define LIKE_TRUE		1
+#define LIKE_FALSE		0
+#define LIKE_ABORT		(-1)
 
-	if (errcode >= 0 && errcode <= CUDA_ERROR_UNKNOWN)
+#define NextByte(p,plen)	((p)++, (plen)--)
+#define NextChar(p,plen)	\
+	do { int __l = pg_mblen(p); (p) +=__l; (plen) -=__l; } while(0)
+static inline int
+CHAREQ(const char *p1, const char *p2)
+{
+	int		p1_len;
+
+	/* Optimization:  quickly compare the first byte. */
+	if (*p1 != *p2)
+		return 0;
+
+	p1_len = pg_mblen(p1);
+	if (pg_mblen(p2) != p1_len)
+		return 0;
+
+	/* They are the same length */
+	while (p1_len--)
 	{
-		if (cuGetErrorName(errcode, &error_name) == CUDA_SUCCESS &&
-			cuGetErrorString(errcode, &error_desc) == CUDA_SUCCESS)
-		{
-			snprintf(buffer, sizeof(buffer), "%s - %s",
-					 error_name, error_desc);
-			return buffer;
-		}
+		if (*p1++ != *p2++)
+			return 0;
 	}
-	snprintf(buffer, sizeof(buffer),
-			 "%d - unknown", errcode);
-	return buffer;
+	return 1;
+}
+
+static int
+__fetchWildCard(const char *p, int plen, char *keybuf)
+{
+	if (*p == '*')
+	{
+		return 1;
+	}
+	else if (*p == '$' || *p == '@')
+	{
+		const char *start = p;
+
+		NextByte(p, plen);
+		if (plen <= 0 || *p != '{')
+			elog(ERROR, "Path pattern contains wrong wildcard");
+		NextByte(p, plen);
+		while (plen > 0 && *p != '}')
+		{
+			if (*p == '\\')
+			{
+				NextByte(p, plen);
+				if (plen <= 0)
+					elog(ERROR, "Path pattern must not end with escape character");
+			}
+			for (int cnt = pg_mblen(p); cnt > 0; cnt--)
+			{
+				*keybuf++ = *p;
+				NextByte(p, plen);
+			}
+		}
+		if (plen <= 0)
+			elog(ERROR, "Path pattern contains unclosed key phrase");
+		*keybuf++ = '\0';
+		Assert(*p == '}');
+		NextByte(p, plen);
+		return (p - start);
+	}
+	return 0;
+}
+
+static int
+__matchByPattern(const char *t, int tlen,
+				 const char *p, int plen,
+				 List **p_attrKinds,
+				 List **p_attrKeys,
+				 List **p_attrValues)
+{
+	char   *keybuf = alloca(plen+10);
+	List   *attrKinds = NIL;
+	List   *attrKeys = NIL;
+	List   *attrValues = NIL;
+	int		cnt;
+
+	/* Since this function recurses, it could be driven to stack overflow */
+	check_stack_depth();
+
+	/*
+	 * In this loop, we advance by char when matching wildcards (and thus on
+	 * recursive entry to this function we are properly char-synced). On other
+	 * occasions it is safe to advance by byte, as the text and pattern will
+	 * be in lockstep. This allows us to perform all comparisons between the
+	 * text and pattern on a byte by byte basis, even for multi-byte
+	 * encodings.
+	 */
+	while (tlen > 0 && plen > 0)
+	{
+		if (*p == '\\')
+		{
+			/* Next pattern byte must match literally, whatever it is */
+			NextByte(p, plen);
+			/* ... and there had better be one, per SQL standard */
+			if (plen <= 0)
+				elog(ERROR, "Path pattern must not end with escape character");
+			if (*p != *t)
+			{
+				list_free(attrKinds);
+				list_free_deep(attrKeys);
+				list_free_deep(attrValues);
+				return LIKE_FALSE;
+			}
+		}
+		else if ((cnt = __fetchWildCard(p, plen, keybuf)) > 0)
+		{
+			const char *t_base = t;
+			char	wildcard = *p;
+
+			Assert(wildcard == '*' || wildcard == '$' || wildcard == '@');
+			Assert(cnt <= plen);
+			p += cnt;
+			plen -= cnt;
+
+			/*
+			 * If we're at end of pattern, match: we have a trailing % which
+			 * matches any remaining text string.
+			 * In case of '${KEY}' wildcard, remained characters must be numeric.
+			 */
+			if (plen <= 0)
+			{
+				if (wildcard == '@')
+				{
+					const char *__t = t;
+					int			__tlen = tlen;
+
+					while (tlen > 0)
+					{
+						if (*t < '0' || *t > '9')
+						{
+							list_free(attrKinds);
+							list_free_deep(attrKeys);
+							list_free_deep(attrValues);
+							return LIKE_FALSE;
+						}
+						NextByte(t, tlen);
+					}
+					attrKinds  = lappend_int(attrKinds, wildcard);
+					attrKeys   = lappend(attrKeys,   pstrdup(keybuf));
+					attrValues = lappend(attrValues, pnstrdup(__t, __tlen));
+				}
+				else if (wildcard == '$')
+				{
+					attrKinds  = lappend_int(attrKinds, wildcard);
+					attrKeys   = lappend(attrKeys,   pstrdup(keybuf));
+					attrValues = lappend(attrValues, pnstrdup(t, tlen));
+				}
+				*p_attrKinds  = attrKinds;
+				*p_attrKeys   = attrKeys;
+				*p_attrValues = attrValues;
+				return LIKE_TRUE;
+			}
+
+			/*
+			 * Otherwise, scan for a text position at which we can match the
+			 * rest of the pattern.  The first remaining pattern char is known
+			 * to be a regular or escaped literal character, so we can compare
+			 * the first pattern byte to each text byte to avoid recursing
+			 * more than we have to.  This fact also guarantees that we don't
+			 * have to consider a match to the zero-length substring at the
+			 * end of the text.
+			 */
+			while (tlen > 0)
+			{
+				List   *__attrKinds = NIL;
+				List   *__attrKeys = NIL;
+				List   *__attrValues = NIL;
+				int		status = __matchByPattern(t, tlen,
+												  p, plen,
+												  &__attrKinds,
+												  &__attrKeys,
+												  &__attrValues);
+				if (status == LIKE_TRUE)
+				{
+					attrKinds  = lappend_int(attrKinds, wildcard);
+					attrKeys   = lappend(attrKeys,   pstrdup(keybuf));
+					attrValues = lappend(attrValues, pnstrdup(t_base, t - t_base));
+					*p_attrKinds  = list_concat(attrKinds,  __attrKinds);
+					*p_attrKeys   = list_concat(attrKeys,   __attrKeys);
+					*p_attrValues = list_concat(attrValues, __attrValues);
+					list_free(__attrKinds);
+					list_free(__attrKeys);
+					list_free(__attrValues);
+					return LIKE_TRUE;
+				}
+				else
+				{
+					list_free(__attrKinds);
+					list_free_deep(__attrKeys);
+					list_free_deep(__attrValues);
+					if (status == LIKE_ABORT)
+						return status;
+					if (wildcard == '@' && !isdigit(*t))
+						return LIKE_FALSE;
+				}
+				NextChar(t, tlen);
+			}
+			/*
+			 * End of text with no match, so no point in trying later places
+			 * to start matching this pattern.
+			 */
+			list_free(attrKinds);
+			list_free_deep(attrKeys);
+			list_free_deep(attrValues);
+			return LIKE_ABORT;
+		}
+		else if (*p == '?')
+		{
+			/* '?' matches any single character, and we know there is one */
+			NextChar(t, tlen);
+			NextByte(p, plen);
+			continue;
+		}
+		else if (*p != *t)
+		{
+			/* non-wildcard pattern char fails to match text char */
+			list_free(attrKinds);
+			list_free_deep(attrKeys);
+			list_free_deep(attrValues);
+			return LIKE_FALSE;
+		}
+
+		/*
+		 * Pattern and text match, so advance.
+		 *
+		 * It is safe to use NextByte instead of NextChar here, even for
+		 * multi-byte character sets, because we are not following immediately
+		 * after a wildcard character. If we are in the middle of a multibyte
+		 * character, we must already have matched at least one byte of the
+		 * character from both text and pattern; so we cannot get out-of-sync
+		 * on character boundaries.  And we know that no backend-legal
+		 * encoding allows ASCII characters such as '%' to appear as non-first
+		 * bytes of characters, so we won't mistakenly detect a new wildcard.
+		 */
+		NextByte(t, tlen);
+		NextByte(p, plen);
+	}
+	if (tlen > 0)
+	{
+		list_free(attrKinds);
+		list_free_deep(attrKeys);
+		list_free_deep(attrValues);
+		return LIKE_FALSE;		/* end of pattern, but not of text */
+	}
+
+	/*
+	 * End of text, but perhaps not of pattern.  Match iff the remaining
+	 * pattern can match a zero-length string, ie, it's zero or more %'s.
+	 */
+	while (plen > 0 && *p == '*')
+		NextByte(p, plen);
+	if (plen <= 0)
+	{
+		*p_attrKinds  = attrKinds;
+		*p_attrKeys   = attrKeys;
+		*p_attrValues = attrValues;
+		return LIKE_TRUE;
+	}
+	/*
+	 * End of text with no match, so no point in trying later places to start
+	 * matching this pattern.
+	 */
+	list_free(attrKinds);
+	list_free_deep(attrKeys);
+	list_free_deep(attrValues);
+	return LIKE_ABORT;
+}
+
+bool
+pathNameMatchByPattern(const char *pathname,
+					   const char *pattern,
+					   List **p_attrKinds,
+					   List **p_attrKeys,
+					   List **p_attrValues)
+{
+	char	   *namebuf = alloca(strlen(pathname) + 10);
+	char	   *filename;
+	List	   *attrKinds = NIL;
+	List	   *attrKeys = NIL;
+	List	   *attrValues = NIL;
+
+	strcpy(namebuf, pathname);
+	filename = basename(namebuf);
+	if (__matchByPattern(filename, strlen(filename),
+						 pattern,  strlen(pattern),
+						 &attrKinds,
+						 &attrKeys,
+						 &attrValues) == LIKE_TRUE)
+	{
+		if (p_attrKinds)
+			*p_attrKinds = attrKinds;
+		else
+			list_free(attrKinds);
+		if (p_attrKeys)
+			*p_attrKeys = attrKeys;
+		else
+			list_free_deep(attrKeys);
+		if (p_attrValues)
+			*p_attrValues = attrValues;
+		else
+			list_free_deep(attrValues);
+		return true;
+	}
+	return false;
 }
 
 /*
@@ -911,30 +1417,11 @@ errorText(int errcode)
  *
  * ----------------------------------------------------------------
  */
-Datum pgstrom_random_setseed(PG_FUNCTION_ARGS);
-Datum pgstrom_random_int(PG_FUNCTION_ARGS);
-Datum pgstrom_random_float(PG_FUNCTION_ARGS);
-Datum pgstrom_random_date(PG_FUNCTION_ARGS);
-Datum pgstrom_random_time(PG_FUNCTION_ARGS);
-Datum pgstrom_random_timetz(PG_FUNCTION_ARGS);
-Datum pgstrom_random_timestamp(PG_FUNCTION_ARGS);
-Datum pgstrom_random_timestamptz(PG_FUNCTION_ARGS);
-Datum pgstrom_random_interval(PG_FUNCTION_ARGS);
-Datum pgstrom_random_macaddr(PG_FUNCTION_ARGS);
-Datum pgstrom_random_inet(PG_FUNCTION_ARGS);
-Datum pgstrom_random_text(PG_FUNCTION_ARGS);
-Datum pgstrom_random_text_length(PG_FUNCTION_ARGS);
-Datum pgstrom_random_int4range(PG_FUNCTION_ARGS);
-Datum pgstrom_random_int8range(PG_FUNCTION_ARGS);
-Datum pgstrom_random_tsrange(PG_FUNCTION_ARGS);
-Datum pgstrom_random_tstzrange(PG_FUNCTION_ARGS);
-Datum pgstrom_random_daterange(PG_FUNCTION_ARGS);
-Datum pgstrom_abort_if(PG_FUNCTION_ARGS);
-
 static unsigned int		pgstrom_random_seed = 0;
 static bool				pgstrom_random_seed_set = false;
 
-Datum
+PG_FUNCTION_INFO_V1(pgstrom_random_setseed);
+PUBLIC_FUNCTION(Datum)
 pgstrom_random_setseed(PG_FUNCTION_ARGS)
 {
 	unsigned int	seed = PG_GETARG_UINT32(0);
@@ -944,17 +1431,16 @@ pgstrom_random_setseed(PG_FUNCTION_ARGS)
 
 	PG_RETURN_VOID();
 }
-PG_FUNCTION_INFO_V1(pgstrom_random_setseed);
 
-static cl_long
+static int64_t
 __random(void)
 {
 	if (!pgstrom_random_seed_set)
 	{
-		pgstrom_random_seed = (unsigned int)MyProcPid ^ 0xdeadbeaf;
+		pgstrom_random_seed = (unsigned int)MyProcPid ^ 0xdeadbeafU;
 		pgstrom_random_seed_set = true;
 	}
-	return (cl_ulong)rand_r(&pgstrom_random_seed);
+	return (uint64_t)rand_r(&pgstrom_random_seed);
 }
 
 static inline double
@@ -973,13 +1459,14 @@ generate_null(double ratio)
 	return false;
 }
 
-Datum
+PG_FUNCTION_INFO_V1(pgstrom_random_int);
+PUBLIC_FUNCTION(Datum)
 pgstrom_random_int(PG_FUNCTION_ARGS)
 {
 	float8		ratio = (!PG_ARGISNULL(0) ? PG_GETARG_FLOAT8(0) : 0.0);
 	int64		lower = (!PG_ARGISNULL(1) ? PG_GETARG_INT64(1) : 0);
 	int64		upper = (!PG_ARGISNULL(2) ? PG_GETARG_INT64(2) : INT_MAX);
-	cl_ulong	v;
+	uint64_t	v;
 
 	if (upper < lower)
 		elog(ERROR, "%s: lower bound is larger than upper", __FUNCTION__);
@@ -991,9 +1478,9 @@ pgstrom_random_int(PG_FUNCTION_ARGS)
 
 	PG_RETURN_INT64(lower + v % (upper - lower));
 }
-PG_FUNCTION_INFO_V1(pgstrom_random_int);
 
-Datum
+PG_FUNCTION_INFO_V1(pgstrom_random_float);
+PUBLIC_FUNCTION(Datum)
 pgstrom_random_float(PG_FUNCTION_ARGS)
 {
 	float8	ratio = (!PG_ARGISNULL(0) ? PG_GETARG_FLOAT8(0) : 0.0);
@@ -1009,15 +1496,15 @@ pgstrom_random_float(PG_FUNCTION_ARGS)
 
 	PG_RETURN_FLOAT8((upper - lower) * __drand48() + lower);
 }
-PG_FUNCTION_INFO_V1(pgstrom_random_float);
 
-Datum
+PG_FUNCTION_INFO_V1(pgstrom_random_date);
+PUBLIC_FUNCTION(Datum)
 pgstrom_random_date(PG_FUNCTION_ARGS)
 {
 	float8		ratio = (!PG_ARGISNULL(0) ? PG_GETARG_FLOAT8(0) : 0.0);
 	DateADT		lower;
 	DateADT		upper;
-	cl_ulong	v;
+	uint64_t	v;
 
 	if (!PG_ARGISNULL(1))
 		lower = PG_GETARG_DATEADT(1);
@@ -1038,15 +1525,15 @@ pgstrom_random_date(PG_FUNCTION_ARGS)
 
 	PG_RETURN_DATEADT(lower + v % (upper - lower));
 }
-PG_FUNCTION_INFO_V1(pgstrom_random_date);
 
-Datum
+PG_FUNCTION_INFO_V1(pgstrom_random_time);
+PUBLIC_FUNCTION(Datum)
 pgstrom_random_time(PG_FUNCTION_ARGS)
 {
 	float8		ratio = (!PG_ARGISNULL(0) ? PG_GETARG_FLOAT8(0) : 0.0);
 	TimeADT		lower = 0;
 	TimeADT		upper = HOURS_PER_DAY * USECS_PER_HOUR - 1;
-	cl_ulong	v;
+	uint64_t	v;
 
 	if (!PG_ARGISNULL(1))
 		lower = PG_GETARG_TIMEADT(1);
@@ -1062,16 +1549,16 @@ pgstrom_random_time(PG_FUNCTION_ARGS)
 
 	PG_RETURN_TIMEADT(lower + v % (upper - lower));
 }
-PG_FUNCTION_INFO_V1(pgstrom_random_time);
 
-Datum
+PG_FUNCTION_INFO_V1(pgstrom_random_timetz);
+PUBLIC_FUNCTION(Datum)
 pgstrom_random_timetz(PG_FUNCTION_ARGS)
 {
 	float8		ratio = (!PG_ARGISNULL(0) ? PG_GETARG_FLOAT8(0) : 0.0);
 	TimeADT		lower = 0;
 	TimeADT		upper = HOURS_PER_DAY * USECS_PER_HOUR - 1;
 	TimeTzADT  *temp;
-	cl_ulong	v;
+	uint64_t	v;
 
 	if (!PG_ARGISNULL(1))
 		lower = PG_GETARG_TIMEADT(1);
@@ -1092,15 +1579,15 @@ pgstrom_random_timetz(PG_FUNCTION_ARGS)
 	}
 	PG_RETURN_TIMETZADT_P(temp);
 }
-PG_FUNCTION_INFO_V1(pgstrom_random_timetz);
 
-Datum
+PG_FUNCTION_INFO_V1(pgstrom_random_timestamp);
+PUBLIC_FUNCTION(Datum)
 pgstrom_random_timestamp(PG_FUNCTION_ARGS)
 {
 	float8		ratio = (!PG_ARGISNULL(0) ? PG_GETARG_FLOAT8(0) : 0.0);
 	Timestamp	lower;
 	Timestamp	upper;
-	cl_ulong	v;
+	uint64_t	v;
 	struct pg_tm tm;
 
 	if (!PG_ARGISNULL(1))
@@ -1132,25 +1619,25 @@ pgstrom_random_timestamp(PG_FUNCTION_ARGS)
 
 	PG_RETURN_TIMESTAMP(lower + v % (upper - lower));
 }
-PG_FUNCTION_INFO_V1(pgstrom_random_timestamp);
 
-Datum
+PG_FUNCTION_INFO_V1(pgstrom_random_macaddr);
+PUBLIC_FUNCTION(Datum)
 pgstrom_random_macaddr(PG_FUNCTION_ARGS)
 {
 	float8		ratio = (!PG_ARGISNULL(0) ? PG_GETARG_FLOAT8(0) : 0.0);
 	macaddr	   *temp;
-	cl_ulong	lower;
-	cl_ulong	upper;
-	cl_ulong	v, x;
+	uint64_t	lower;
+	uint64_t	upper;
+	uint64_t	v, x;
 
 	if (PG_ARGISNULL(1))
 		lower = 0xabcd00000000UL;
 	else
 	{
 		temp = PG_GETARG_MACADDR_P(1);
-		lower = (((cl_ulong)temp->a << 40) | ((cl_ulong)temp->b << 32) |
-				 ((cl_ulong)temp->c << 24) | ((cl_ulong)temp->d << 16) |
-				 ((cl_ulong)temp->e <<  8) | ((cl_ulong)temp->f));
+		lower = (((uint64_t)temp->a << 40) | ((uint64_t)temp->b << 32) |
+				 ((uint64_t)temp->c << 24) | ((uint64_t)temp->d << 16) |
+				 ((uint64_t)temp->e <<  8) | ((uint64_t)temp->f));
 	}
 
 	if (PG_ARGISNULL(2))
@@ -1158,9 +1645,9 @@ pgstrom_random_macaddr(PG_FUNCTION_ARGS)
 	else
 	{
 		temp = PG_GETARG_MACADDR_P(2);
-		upper = (((cl_ulong)temp->a << 40) | ((cl_ulong)temp->b << 32) |
-				 ((cl_ulong)temp->c << 24) | ((cl_ulong)temp->d << 16) |
-				 ((cl_ulong)temp->e <<  8) | ((cl_ulong)temp->f));
+		upper = (((uint64_t)temp->a << 40) | ((uint64_t)temp->b << 32) |
+				 ((uint64_t)temp->c << 24) | ((uint64_t)temp->d << 16) |
+				 ((uint64_t)temp->e <<  8) | ((uint64_t)temp->f));
 	}
 
 	if (upper < lower)
@@ -1183,15 +1670,15 @@ pgstrom_random_macaddr(PG_FUNCTION_ARGS)
 	temp->f = (x      ) & 0x00ff;
 	PG_RETURN_MACADDR_P(temp);
 }
-PG_FUNCTION_INFO_V1(pgstrom_random_macaddr);
 
-Datum
+PG_FUNCTION_INFO_V1(pgstrom_random_inet);
+PUBLIC_FUNCTION(Datum)
 pgstrom_random_inet(PG_FUNCTION_ARGS)
 {
 	float8		ratio = (!PG_ARGISNULL(0) ? PG_GETARG_FLOAT8(0) : 0.0);
 	inet	   *temp;
 	int			i, j, bits;
-	cl_ulong	v;
+	uint64_t	v;
 
 	if (generate_null(ratio))
 		PG_RETURN_NULL();
@@ -1224,7 +1711,7 @@ pgstrom_random_inet(PG_FUNCTION_ARGS)
 			temp->inet_data.ipaddr[i--] = (v & 0xff);
 		else
 		{
-			cl_uint		mask = (1 << bits) - 1;
+			uint32_t		mask = (1 << bits) - 1;
 
 			temp->inet_data.ipaddr[i] &= ~(mask);
 			temp->inet_data.ipaddr[i] |= (v & mask);
@@ -1236,9 +1723,9 @@ pgstrom_random_inet(PG_FUNCTION_ARGS)
 	ip_bits(temp) = ip_maxbits(temp);
 	PG_RETURN_INET_P(temp);
 }
-PG_FUNCTION_INFO_V1(pgstrom_random_inet);
 
-Datum
+PG_FUNCTION_INFO_V1(pgstrom_random_text);
+PUBLIC_FUNCTION(Datum)
 pgstrom_random_text(PG_FUNCTION_ARGS)
 {
 	static const char *base32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
@@ -1246,7 +1733,7 @@ pgstrom_random_text(PG_FUNCTION_ARGS)
 	text	   *temp;
 	char	   *pos;
 	int			i, j, n;
-	cl_ulong	v;
+	uint64_t	v;
 
 	if (generate_null(ratio))
 		PG_RETURN_NULL();
@@ -1274,9 +1761,9 @@ pgstrom_random_text(PG_FUNCTION_ARGS)
 	}
 	PG_RETURN_TEXT_P(temp);
 }
-PG_FUNCTION_INFO_V1(pgstrom_random_text);
 
-Datum
+PG_FUNCTION_INFO_V1(pgstrom_random_text_length);
+PUBLIC_FUNCTION(Datum)
 pgstrom_random_text_length(PG_FUNCTION_ARGS)
 {
 	static const char *base64 =
@@ -1284,11 +1771,11 @@ pgstrom_random_text_length(PG_FUNCTION_ARGS)
 		"abcdefghijklmnopqrstuvwxyz"
 		"0123456789+/";
 	float8		ratio = (!PG_ARGISNULL(0) ? PG_GETARG_FLOAT8(0) : 0.0);
-	cl_int		maxlen;
+	int32_t		maxlen;
 	text	   *temp;
 	char	   *pos;
 	int			i, j, n;
-	cl_ulong	v = 0;
+	uint64_t	v = 0;
 
 	if (generate_null(ratio))
 		PG_RETURN_NULL();
@@ -1313,10 +1800,10 @@ pgstrom_random_text_length(PG_FUNCTION_ARGS)
 	}
 	PG_RETURN_TEXT_P(temp);
 }
-PG_FUNCTION_INFO_V1(pgstrom_random_text_length);
 
 static Datum
-simple_make_range(TypeCacheEntry *typcache, Datum x_val, Datum y_val)
+simple_make_range(PG_FUNCTION_ARGS,
+				  TypeCacheEntry *typcache, Datum x_val, Datum y_val)
 {
 	RangeBound	x, y;
 	RangeType  *range;
@@ -1333,12 +1820,13 @@ simple_make_range(TypeCacheEntry *typcache, Datum x_val, Datum y_val)
 	y.inclusive = generate_null(25.0);
 	y.lower = false;
 
-	range = make_range(typcache, &x, &y, false);
-
+	range = make_range(typcache, &x, &y, false,
+					   fcinfo->context);
 	return PointerGetDatum(range);
 }
 
-Datum
+PG_FUNCTION_INFO_V1(pgstrom_random_int4range);
+PUBLIC_FUNCTION(Datum)
 pgstrom_random_int4range(PG_FUNCTION_ARGS)
 {
 	float8		ratio = (!PG_ARGISNULL(0) ? PG_GETARG_FLOAT8(0) : 0.0);
@@ -1350,17 +1838,22 @@ pgstrom_random_int4range(PG_FUNCTION_ARGS)
 
 	if (generate_null(ratio))
 		PG_RETURN_NULL();
-	type_oid = get_type_oid("int4range", PG_CATALOG_NAMESPACE, false);
+	type_oid = GetSysCacheOid2(TYPENAMENSP,
+							   Anum_pg_type_oid,
+							   CStringGetDatum("int4range"),
+							   ObjectIdGetDatum(PG_CATALOG_NAMESPACE));
+	if (!OidIsValid(type_oid))
+		elog(ERROR, "type 'int4range' is not defined");
 	typcache = range_get_typcache(fcinfo, type_oid);
 	x = lower + __random() % (upper - lower);
 	y = lower + __random() % (upper - lower);
-	return simple_make_range(typcache,
+	return simple_make_range(fcinfo, typcache,
 							 Int32GetDatum(Min(x,y)),
 							 Int32GetDatum(Max(x,y)));
 }
-PG_FUNCTION_INFO_V1(pgstrom_random_int4range);
 
-Datum
+PG_FUNCTION_INFO_V1(pgstrom_random_int8range);
+PUBLIC_FUNCTION(Datum)
 pgstrom_random_int8range(PG_FUNCTION_ARGS)
 {
 	float8		ratio = (!PG_ARGISNULL(0) ? PG_GETARG_FLOAT8(0) : 0.0);
@@ -1372,19 +1865,24 @@ pgstrom_random_int8range(PG_FUNCTION_ARGS)
 
 	if (generate_null(ratio))
 		PG_RETURN_NULL();
-	type_oid = get_type_oid("int8range", PG_CATALOG_NAMESPACE, false);
+	type_oid = GetSysCacheOid2(TYPENAMENSP,
+							   Anum_pg_type_oid,
+							   CStringGetDatum("int8range"),
+							   ObjectIdGetDatum(PG_CATALOG_NAMESPACE));
+	if (!OidIsValid(type_oid))
+		elog(ERROR, "type 'int8range' is not defined");
 	typcache = range_get_typcache(fcinfo, type_oid);
 	v = (__random() << 31) | __random();
 	x = lower + v % (upper - lower);
 	v = (__random() << 31) | __random();
 	y = lower + v % (upper - lower);
-	return simple_make_range(typcache,
+	return simple_make_range(fcinfo, typcache,
 							 Int64GetDatum(Min(x,y)),
 							 Int64GetDatum(Max(x,y)));
 }
-PG_FUNCTION_INFO_V1(pgstrom_random_int8range);
 
-Datum
+PG_FUNCTION_INFO_V1(pgstrom_random_tsrange);
+PUBLIC_FUNCTION(Datum)
 pgstrom_random_tsrange(PG_FUNCTION_ARGS)
 {
 	float8		ratio = (!PG_ARGISNULL(0) ? PG_GETARG_FLOAT8(0) : 0.0);
@@ -1394,7 +1892,7 @@ pgstrom_random_tsrange(PG_FUNCTION_ARGS)
 	TypeCacheEntry *typcache;
 	Oid			type_oid;
 	Timestamp	x, y;
-	cl_ulong	v;
+	uint64_t	v;
 
 	if (generate_null(ratio))
 		PG_RETURN_NULL();
@@ -1419,20 +1917,24 @@ pgstrom_random_tsrange(PG_FUNCTION_ARGS)
 	}
 	if (upper < lower)
 		elog(ERROR, "%s: lower bound is larger than upper", __FUNCTION__);
-
-	type_oid = get_type_oid("tsrange", PG_CATALOG_NAMESPACE, false);
+	type_oid = GetSysCacheOid2(TYPENAMENSP,
+							   Anum_pg_type_oid,
+							   CStringGetDatum("tsrange"),
+							   ObjectIdGetDatum(PG_CATALOG_NAMESPACE));
+	if (!OidIsValid(type_oid))
+		elog(ERROR, "type 'tsrange' is not defined");
 	typcache = range_get_typcache(fcinfo, type_oid);
 	v = (__random() << 31) | __random();
 	x = lower + v % (upper - lower);
 	v = (__random() << 31) | __random();
 	y = lower + v % (upper - lower);
-	return simple_make_range(typcache,
+	return simple_make_range(fcinfo, typcache,
 							 TimestampGetDatum(Min(x,y)),
 							 TimestampGetDatum(Max(x,y)));	
 }
-PG_FUNCTION_INFO_V1(pgstrom_random_tsrange);
 
-Datum
+PG_FUNCTION_INFO_V1(pgstrom_random_tstzrange);
+PUBLIC_FUNCTION(Datum)
 pgstrom_random_tstzrange(PG_FUNCTION_ARGS)
 {
 	float8		ratio = (!PG_ARGISNULL(0) ? PG_GETARG_FLOAT8(0) : 0.0);
@@ -1442,7 +1944,7 @@ pgstrom_random_tstzrange(PG_FUNCTION_ARGS)
 	TypeCacheEntry *typcache;
 	Oid			type_oid;
 	Timestamp	x, y;
-	cl_ulong	v;
+	uint64_t	v;
 
 	if (generate_null(ratio))
 		PG_RETURN_NULL();
@@ -1467,20 +1969,24 @@ pgstrom_random_tstzrange(PG_FUNCTION_ARGS)
 	}
 	if (upper < lower)
 		elog(ERROR, "%s: lower bound is larger than upper", __FUNCTION__);
-
-	type_oid = get_type_oid("tstzrange", PG_CATALOG_NAMESPACE, false);
+	type_oid = GetSysCacheOid2(TYPENAMENSP,
+							   Anum_pg_type_oid,
+							   CStringGetDatum("tstzrange"),
+							   ObjectIdGetDatum(PG_CATALOG_NAMESPACE));
+	if (!OidIsValid(type_oid))
+		elog(ERROR, "type 'tstzrange' is not defined");
 	typcache = range_get_typcache(fcinfo, type_oid);
 	v = (__random() << 31) | __random();
 	x = lower + v % (upper - lower);
 	v = (__random() << 31) | __random();
 	y = lower + v % (upper - lower);
-	return simple_make_range(typcache,
+	return simple_make_range(fcinfo, typcache,
 							 TimestampTzGetDatum(Min(x,y)),
 							 TimestampTzGetDatum(Max(x,y)));	
 }
-PG_FUNCTION_INFO_V1(pgstrom_random_tstzrange);
 
-Datum
+PG_FUNCTION_INFO_V1(pgstrom_random_daterange);
+PUBLIC_FUNCTION(Datum)
 pgstrom_random_daterange(PG_FUNCTION_ARGS)
 {
 	float8		ratio = (!PG_ARGISNULL(0) ? PG_GETARG_FLOAT8(0) : 0.0);
@@ -1503,17 +2009,22 @@ pgstrom_random_daterange(PG_FUNCTION_ARGS)
 	if (upper < lower)
 		elog(ERROR, "%s: lower bound is larger than upper", __FUNCTION__);
 
-	type_oid = get_type_oid("daterange", PG_CATALOG_NAMESPACE, false);
+	type_oid = GetSysCacheOid2(TYPENAMENSP,
+							   Anum_pg_type_oid,
+							   CStringGetDatum("daterange"),
+							   ObjectIdGetDatum(PG_CATALOG_NAMESPACE));
+	if (!OidIsValid(type_oid))
+		elog(ERROR, "type 'daterange' is not defined");
 	typcache = range_get_typcache(fcinfo, type_oid);
 	x = lower + __random() % (upper - lower);
 	y = lower + __random() % (upper - lower);
-	return simple_make_range(typcache,
+	return simple_make_range(fcinfo, typcache,
 							 DateADTGetDatum(Min(x,y)),
 							 DateADTGetDatum(Max(x,y)));
 }
-PG_FUNCTION_INFO_V1(pgstrom_random_daterange);
 
-Datum
+PG_FUNCTION_INFO_V1(pgstrom_abort_if);
+PUBLIC_FUNCTION(Datum)
 pgstrom_abort_if(PG_FUNCTION_ARGS)
 {
 	bool		cond = PG_GETARG_BOOL(0);
@@ -1523,7 +2034,111 @@ pgstrom_abort_if(PG_FUNCTION_ARGS)
 
 	PG_RETURN_VOID();
 }
-PG_FUNCTION_INFO_V1(pgstrom_abort_if);
+
+/*
+ * pgstrom_fetch_token_by_(colon|semicolon|comma)
+ */
+static text *
+__fetch_token_by_delim(text *__str, text *__key, char delim)
+{
+	const char *str = VARDATA_ANY(__str);
+	const char *key = VARDATA_ANY(__key);
+	size_t		str_len = VARSIZE_ANY_EXHDR(__str);
+	size_t		key_len = VARSIZE_ANY_EXHDR(__key);
+	const char *end, *pos, *base;
+
+	/*
+	 * triming whitespaces of the key head/tail
+	 */
+	while (key_len > 0 && isspace(*key))
+	{
+		key++;
+		key_len--;
+	}
+	if (key_len == 0)
+		return NULL;
+	while (key_len > 0 && isspace(key[key_len-1]))
+		key_len--;
+	if (key_len == 0)
+		return NULL;
+	/*
+	 * split a token by the delimiter for each
+	 */
+	if (str_len == 0)
+		return NULL;
+	end = str + str_len - 1;
+	pos = base = str;
+	while (pos <= end)
+	{
+		if (*pos == delim || pos == end)
+		{
+			if (pos - base >= key_len && strncmp(base, key, key_len) == 0)
+			{
+				const char *__k = (base + key_len);
+
+				while (isspace(*__k) && __k < pos)
+					__k++;
+				if (__k < pos && *__k == '=')
+				{
+					size_t	len = (pos - __k) - 1;
+					text   *t = palloc(VARHDRSZ + len + 1);
+
+					if (len > 0)
+						memcpy(t->vl_dat, __k+1, len);
+					t->vl_dat[len] = '\0';
+					SET_VARSIZE(t, VARHDRSZ + len);
+					return t;
+				}
+			}
+			base = pos + 1;
+		}
+		else if (pos == base && isspace(*pos))
+		{
+			base++;
+		}
+		pos++;
+	}
+	return NULL;
+}
+
+PG_FUNCTION_INFO_V1(pgstrom_fetch_token_by_colon);
+PUBLIC_FUNCTION(Datum)
+pgstrom_fetch_token_by_colon(PG_FUNCTION_ARGS)
+{
+	text   *str = PG_GETARG_TEXT_PP(0);
+	text   *key = PG_GETARG_TEXT_PP(1);
+	text   *result = __fetch_token_by_delim(str, key, ':');
+
+	if (!result)
+		PG_RETURN_NULL();
+	PG_RETURN_POINTER(result);
+}
+
+PG_FUNCTION_INFO_V1(pgstrom_fetch_token_by_semicolon);
+PUBLIC_FUNCTION(Datum)
+pgstrom_fetch_token_by_semicolon(PG_FUNCTION_ARGS)
+{
+	text   *str = PG_GETARG_TEXT_PP(0);
+	text   *key = PG_GETARG_TEXT_PP(1);
+	text   *result = __fetch_token_by_delim(str, key, ';');
+
+	if (!result)
+		PG_RETURN_NULL();
+    PG_RETURN_POINTER(result);
+}
+
+PG_FUNCTION_INFO_V1(pgstrom_fetch_token_by_comma);
+PUBLIC_FUNCTION(Datum)
+pgstrom_fetch_token_by_comma(PG_FUNCTION_ARGS)
+{
+	text   *str = PG_GETARG_TEXT_PP(0);
+	text   *key = PG_GETARG_TEXT_PP(1);
+	text   *result = __fetch_token_by_delim(str, key, ',');
+
+	if (!result)
+		PG_RETURN_NULL();
+	PG_RETURN_POINTER(result);
+}
 
 /*
  * Simple wrapper for read(2) and write(2) to ensure full-buffer read and
@@ -1609,10 +2224,21 @@ __pwriteFile(int fdesc, const void *buffer, size_t nbytes, off_t f_pos)
 	return count;
 }
 
-/*
- * mmap/munmap wrapper that is automatically unmapped on regarding to
- * the resource-owner.
+/* ----------------------------------------------------------------
+ *
+ * shared memory and mmap/munmap routines
+ *
+ * ----------------------------------------------------------------
  */
+#define IS_POSIX_SHMEM		0x80000000U
+typedef struct
+{
+	uint32_t	shmem_handle;
+	int			shmem_fdesc;
+	char		shmem_name[MAXPGPATH];
+	ResourceOwner owner;
+} shmemEntry;
+
 typedef struct
 {
 	void	   *mmap_addr;
@@ -1621,7 +2247,42 @@ typedef struct
 	int			mmap_flags;
 	ResourceOwner owner;
 } mmapEntry;
+
+static HTAB	   *shmem_tracker_htab = NULL;
 static HTAB	   *mmap_tracker_htab = NULL;
+
+static void
+cleanup_shmem_chunks(ResourceReleasePhase phase,
+					 bool isCommit,
+					 bool isTopLevel,
+					 void *arg)
+{
+	if (phase == RESOURCE_RELEASE_AFTER_LOCKS &&
+		shmem_tracker_htab &&
+		hash_get_num_entries(shmem_tracker_htab) > 0)
+	{
+		HASH_SEQ_STATUS	seq;
+		shmemEntry	   *entry;
+
+		hash_seq_init(&seq, shmem_tracker_htab);
+		while ((entry = hash_seq_search(&seq)) != NULL)
+		{
+			if (entry->owner != CurrentResourceOwner)
+				continue;
+			if (isCommit)
+				elog(WARNING, "shared-memory '%s' leaks, and still alive",
+					 entry->shmem_name);
+			if (unlink(entry->shmem_name) != 0)
+				elog(WARNING, "failed on unlink('%s'): %m", entry->shmem_name);
+			if (close(entry->shmem_fdesc) != 0)
+				elog(WARNING, "failed on close('%s'): %m", entry->shmem_name);
+			hash_search(shmem_tracker_htab,
+						&entry->shmem_handle,
+						HASH_REMOVE,
+						NULL);
+		}
+	}
+}
 
 static void
 cleanup_mmap_chunks(ResourceReleasePhase phase,
@@ -1629,10 +2290,11 @@ cleanup_mmap_chunks(ResourceReleasePhase phase,
 					bool isTopLevel,
 					void *arg)
 {
-	if (mmap_tracker_htab &&
+	if (phase == RESOURCE_RELEASE_AFTER_LOCKS &&
+		mmap_tracker_htab &&
 		hash_get_num_entries(mmap_tracker_htab) > 0)
 	{
-		HASH_SEQ_STATUS	seq;
+		HASH_SEQ_STATUS seq;
 		mmapEntry	   *entry;
 
 		hash_seq_init(&seq, mmap_tracker_htab);
@@ -1656,14 +2318,118 @@ cleanup_mmap_chunks(ResourceReleasePhase phase,
 	}
 }
 
-void *
-__mmapFile(void *addr, size_t length,
-		   int prot, int flags, int fdesc, off_t offset)
+uint32_t
+__shmemCreate(void)
 {
-	void	   *mmap_addr;
-	size_t		mmap_size = TYPEALIGN(PAGE_SIZE, length);
-	mmapEntry  *entry;
+	static uint	my_random_seed = 0;
+	const char *shmem_dir = "/dev/shm";
+	int			fdesc;
+	uint32_t	handle;
+	char		namebuf[MAXPGPATH];
+	size_t		off = 0;
+
+	if (!shmem_tracker_htab)
+	{
+		HASHCTL		hctl;
+
+		my_random_seed = (uint)MyProcPid ^ 0xcafebabeU;
+
+		memset(&hctl, 0, sizeof(HASHCTL));
+		hctl.keysize   = sizeof(uint32_t);
+		hctl.entrysize = sizeof(shmemEntry);
+		shmem_tracker_htab = hash_create("shmem_tracker_htab",
+										 256,
+										 &hctl,
+										 HASH_ELEM | HASH_BLOBS);
+		RegisterResourceReleaseCallback(cleanup_shmem_chunks, 0);
+	}
+	off = snprintf(namebuf, sizeof(namebuf), "%s/", shmem_dir);
+	do {
+		handle = rand_r(&my_random_seed);
+		if (handle == 0)
+			continue;
+		/* to avoid hash conflict */
+		if (!shmem_dir)
+			handle |= IS_POSIX_SHMEM;
+		else
+			handle &= ~IS_POSIX_SHMEM;
+
+		snprintf(namebuf + off, sizeof(namebuf) - off,
+				 ".pgstrom_shmbuf_%u_%d",
+				 PostPortNumber, handle);
+		fdesc = open(namebuf, O_RDWR | O_CREAT | O_EXCL, 0600);
+		if (fdesc < 0 && errno != EEXIST)
+			elog(ERROR, "failed on open('%s'): %m", namebuf);
+	} while (fdesc < 0);
+
+	PG_TRY();
+	{
+		shmemEntry *entry;
+		bool		found;
+
+		entry = hash_search(shmem_tracker_htab,
+							&handle,
+							HASH_ENTER,
+							&found);
+		if (found)
+			elog(ERROR, "Bug? duplicated shmem entry");
+		entry->shmem_handle = handle;
+		entry->shmem_fdesc  = fdesc;
+		strcpy(entry->shmem_name, namebuf);
+		entry->owner = CurrentResourceOwner;
+	}
+	PG_CATCH();
+	{
+		if (close(fdesc) != 0)
+			elog(WARNING, "failed on close('%s'): %m", namebuf);
+		if (unlink(namebuf) != 0)
+			elog(WARNING, "failed on unlink('%s'): %m", namebuf);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	return handle;
+}
+
+void
+__shmemDrop(uint32_t shmem_handle)
+{
+	if (shmem_tracker_htab)
+	{
+		shmemEntry *entry;
+
+		entry = hash_search(shmem_tracker_htab,
+							&shmem_handle,
+							HASH_REMOVE,
+							NULL);
+		if (entry)
+		{
+			if (unlink(entry->shmem_name) != 0)
+				elog(WARNING, "failed on unlink('%s'): %m", entry->shmem_name);
+			if (close(entry->shmem_fdesc) != 0)
+				elog(WARNING, "failed on close('%s'): %m", entry->shmem_name);
+			return;
+		}
+	}
+	elog(ERROR, "failed on __shmemDrop - no such segment (%u)", shmem_handle);
+}
+
+void *
+__mmapShmem(uint32_t shmem_handle,
+			size_t   shmem_length)
+{
+	void	   *mmap_addr = MAP_FAILED;
+	size_t		mmap_size = TYPEALIGN(PAGE_SIZE, shmem_length);
+	int			mmap_prot = PROT_READ | PROT_WRITE;
+	int			mmap_flags = MAP_SHARED;
+	mmapEntry  *mmap_entry = NULL;
+	shmemEntry *shmem_entry = NULL;
+	int			fdesc = -1;
+	const char *shmem_dir = "/dev/shm";
+	const char *fname = NULL;
+	struct stat	stat_buf;
 	bool		found;
+	char		namebuf[MAXPGPATH];
 
 	if (!mmap_tracker_htab)
 	{
@@ -1672,35 +2438,83 @@ __mmapFile(void *addr, size_t length,
 		memset(&hctl, 0, sizeof(HASHCTL));
 		hctl.keysize = sizeof(void *);
 		hctl.entrysize = sizeof(mmapEntry);
-		hctl.hcxt = CacheMemoryContext;
 		mmap_tracker_htab = hash_create("mmap_tracker_htab",
 										256,
 										&hctl,
-										HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+										HASH_ELEM | HASH_BLOBS);
 		RegisterResourceReleaseCallback(cleanup_mmap_chunks, 0);
 	}
-	mmap_addr = mmap(addr, mmap_size, prot, flags, fdesc, offset);
-	if (mmap_addr == MAP_FAILED)
-		return MAP_FAILED;
+
+	if (shmem_tracker_htab)
+	{
+		shmem_entry = hash_search(shmem_tracker_htab,
+								  &shmem_handle,
+								  HASH_FIND,
+								  NULL);
+		if (shmem_entry)
+		{
+			size_t		len = strlen(shmem_dir);
+
+			if (strncmp(shmem_entry->shmem_name, shmem_dir, len) != 0 ||
+				shmem_entry->shmem_name[len] != '/')
+				elog(ERROR, "Bug? shmem_dir mismatch '%s'", shmem_dir);
+			fdesc = shmem_entry->shmem_fdesc;
+			fname = shmem_entry->shmem_name;
+		}
+	}
+	if (fdesc < 0)
+	{
+		snprintf(namebuf, sizeof(namebuf),
+				 "%s/.pgstrom_shmbuf_%u_%d",
+				 shmem_dir, PostPortNumber, shmem_handle);
+		fdesc = open(namebuf, O_RDWR, 0600);
+		if (fdesc < 0)
+			elog(ERROR, "failed on open('%s'): %m", namebuf);
+		fname = namebuf;
+	}
+
 	PG_TRY();
 	{
-		entry = hash_search(mmap_tracker_htab,
-							&mmap_addr,
-							HASH_ENTER,
-							&found);
+		if (fstat(fdesc, &stat_buf) != 0)
+			elog(ERROR, "failed on fstat('%s'): %m", fname);
+		if (stat_buf.st_size < mmap_size)
+		{
+			while (fallocate(fdesc, 0, 0, mmap_size) != 0)
+			{
+				if (errno != EINTR)
+					elog(ERROR, "failed on fallocate('%s', %lu): %m",
+						 fname, mmap_size);
+			}
+		}
+		mmap_addr = mmap(NULL, mmap_size, mmap_prot, mmap_flags, fdesc, 0);
+		if (mmap_addr == MAP_FAILED)
+			elog(ERROR, "failed on mmap(2): %m");
+
+		mmap_entry = hash_search(mmap_tracker_htab,
+								 &mmap_addr,
+								 HASH_ENTER,
+								 &found);
 		if (found)
 			elog(ERROR, "Bug? duplicated mmap entry");
-		Assert(entry->mmap_addr == mmap_addr);
-		entry->mmap_size = mmap_size;
-		entry->mmap_prot = prot;
-		entry->mmap_flags = flags;
-		entry->owner = CurrentResourceOwner;
+		Assert(mmap_entry->mmap_addr == mmap_addr);
+		mmap_entry->mmap_size  = mmap_size;
+		mmap_entry->mmap_prot  = mmap_prot;
+		mmap_entry->mmap_flags = mmap_flags;
+		mmap_entry->owner      = CurrentResourceOwner;
+
+		if (!shmem_entry)
+			close(fdesc);
 	}
 	PG_CATCH();
 	{
-		if (munmap(mmap_addr, mmap_size) != 0)
-			elog(WARNING, "failed on munmap(%p, %zu): %m",
-				 mmap_addr, mmap_size);
+		if (mmap_addr != MAP_FAILED)
+		{
+			if (munmap(mmap_addr, mmap_size) != 0)
+				elog(WARNING, "failed on munmap(%p, %zu) of '%s': %m",
+					 mmap_addr, mmap_size, fname);
+		}
+		if (!shmem_entry && close(fdesc) != 0)
+			elog(WARNING, "failed on close('%s'): %m", fname);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -1708,213 +2522,67 @@ __mmapFile(void *addr, size_t length,
 	return mmap_addr;
 }
 
-int
-__munmapFile(void *mmap_addr)
+bool
+__munmapShmem(void *mmap_addr)
 {
-	mmapEntry  *entry;
-	int			rv;
-
 	if (mmap_tracker_htab)
 	{
-		entry = hash_search(mmap_tracker_htab,
-							&mmap_addr, HASH_REMOVE, NULL);
+		mmapEntry  *entry
+			= hash_search(mmap_tracker_htab,
+						  &mmap_addr,
+						  HASH_REMOVE,
+						  NULL);
 		if (entry)
 		{
-			rv = munmap(entry->mmap_addr,
-						entry->mmap_size);
-			if (rv != 0)
-			{
-				int		errno_saved = errno;
-
+			if (munmap(entry->mmap_addr,
+					   entry->mmap_size) != 0)
 				elog(WARNING, "failed on munmap(%p, %zu): %m",
 					 entry->mmap_addr,
 					 entry->mmap_size);
-				errno = errno_saved;
-			}
-			return rv;
+			return true;
 		}
 	}
-	/* mmapEntry not found */
-	errno = EINVAL;
-	return -1;
+	elog(ERROR, "it looks addr=%p not memory-mapped", mmap_addr);
+	return false;
 }
 
-void *
-__mremapFile(void *mmap_addr, size_t new_size)
-{
-	mmapEntry  *entry = NULL;
-	void	   *addr;
-
-	if (mmap_tracker_htab)
-	{
-		entry = hash_search(mmap_tracker_htab,
-							&mmap_addr, HASH_FIND, NULL);
-	}
-	if (!entry)
-	{
-		errno = EINVAL;
-		return MAP_FAILED;
-	}
-	/* nothing to do */
-	if (new_size <= entry->mmap_size)
-		return entry->mmap_addr;
-	addr = mremap(entry->mmap_addr,
-				  entry->mmap_size,
-				  new_size,
-				  MREMAP_MAYMOVE);
-	if (addr == MAP_FAILED)
-		return MAP_FAILED;
-
-	entry->mmap_addr = addr;
-	entry->mmap_size = new_size;
-	return addr;
-}
-
-/*
- * dummy entry for deprecated functions
+/* ----------------------------------------------------------------
+ *
+ * SQL functions exist in the previous release (not supported now)
+ *
+ * ----------------------------------------------------------------
  */
-static void
-__pg_deprecated_function(PG_FUNCTION_ARGS, const char *cfunc_name)
+PG_FUNCTION_INFO_V1(pgstrom_gpucache_sync_trigger);
+PUBLIC_FUNCTION(Datum)
+pgstrom_gpucache_sync_trigger(PG_FUNCTION_ARGS)
 {
-	FmgrInfo   *flinfo = fcinfo->flinfo;
-
-	if (OidIsValid(flinfo->fn_oid))
-		elog(ERROR, "'%s' on behalf of %s is already deprecated",
-			 cfunc_name, format_procedure(flinfo->fn_oid));
-	elog(ERROR, "'%s' is already deprecated", cfunc_name);
+	elog(ERROR, "pgstrom.gpucache_sync_trigger is no longer supported");
 }
 
-#define PG_DEPRECATED_FUNCTION(cfunc_name)				\
-	Datum	cfunc_name(PG_FUNCTION_ARGS);				\
-	Datum	cfunc_name(PG_FUNCTION_ARGS)				\
-	{													\
-		__pg_deprecated_function(fcinfo, __FUNCTION__);	\
-		PG_RETURN_NULL();								\
-	}													\
-	PG_FUNCTION_INFO_V1(cfunc_name)
+PG_FUNCTION_INFO_V1(pgstrom_gpucache_apply_redo);
+PUBLIC_FUNCTION(Datum)
+pgstrom_gpucache_apply_redo(PG_FUNCTION_ARGS)
+{
+	elog(ERROR, "pgstrom.gpucache_apply_redo is no longer supported");
+}
 
-/* deprecated functions */
-/*
- * SQL functions for GPU attributes (deprecated)
- */
-PG_DEPRECATED_FUNCTION(pgstrom_gpu_device_name);
-PG_DEPRECATED_FUNCTION(pgstrom_gpu_global_memsize);
-PG_DEPRECATED_FUNCTION(pgstrom_gpu_max_blocksize);
-PG_DEPRECATED_FUNCTION(pgstrom_gpu_warp_size);
-PG_DEPRECATED_FUNCTION(pgstrom_gpu_max_shared_memory_perblock);
-PG_DEPRECATED_FUNCTION(pgstrom_gpu_num_registers_perblock);
-PG_DEPRECATED_FUNCTION(pgstrom_gpu_num_multiptocessors);
-PG_DEPRECATED_FUNCTION(pgstrom_gpu_num_cuda_cores);
-PG_DEPRECATED_FUNCTION(pgstrom_gpu_cc_major);
-PG_DEPRECATED_FUNCTION(pgstrom_gpu_cc_minor);
-PG_DEPRECATED_FUNCTION(pgstrom_gpu_pci_id);
+PG_FUNCTION_INFO_V1(pgstrom_gpucache_compaction);
+PUBLIC_FUNCTION(Datum)
+pgstrom_gpucache_compaction(PG_FUNCTION_ARGS)
+{
+	elog(ERROR, "pgstrom.gpucache_compaction is no longer supported");
+}
 
-/* deadcode/gstore_(fdw|buf).c */
-PG_DEPRECATED_FUNCTION(pgstrom_reggstore_in);
-PG_DEPRECATED_FUNCTION(pgstrom_reggstore_out);
-PG_DEPRECATED_FUNCTION(pgstrom_reggstore_recv);
-PG_DEPRECATED_FUNCTION(pgstrom_reggstore_send);
+PG_FUNCTION_INFO_V1(pgstrom_gpucache_recovery);
+PUBLIC_FUNCTION(Datum)
+pgstrom_gpucache_recovery(PG_FUNCTION_ARGS)
+{
+	elog(ERROR, "pgstrom.gpucache_recovery is no longer supported");
+}
 
-PG_DEPRECATED_FUNCTION(pgstrom_gstore_fdw_chunk_info);
-PG_DEPRECATED_FUNCTION(pgstrom_gstore_fdw_format);
-PG_DEPRECATED_FUNCTION(pgstrom_gstore_fdw_nitems);
-PG_DEPRECATED_FUNCTION(pgstrom_gstore_fdw_nattrs);
-PG_DEPRECATED_FUNCTION(pgstrom_gstore_fdw_rawsize);
-PG_DEPRECATED_FUNCTION(pgstrom_gstore_export_ipchandle);
-
-/* deadcode/largeobject.c */
-PG_DEPRECATED_FUNCTION(pgstrom_lo_import_gpu);
-PG_DEPRECATED_FUNCTION(pgstrom_lo_export_gpu);
-
-/* deadcode/pl_cuda_v2.c */
-PG_DEPRECATED_FUNCTION(plcuda_function_validator);
-PG_DEPRECATED_FUNCTION(plcuda_function_handler);
-PG_DEPRECATED_FUNCTION(pgsql_table_attr_numbers_by_names);
-PG_DEPRECATED_FUNCTION(pgsql_table_attr_number_by_name);
-PG_DEPRECATED_FUNCTION(pgsql_table_attr_types_by_names);
-PG_DEPRECATED_FUNCTION(pgsql_table_attr_type_by_name);
-PG_DEPRECATED_FUNCTION(pgsql_check_attrs_of_types);
-PG_DEPRECATED_FUNCTION(pgsql_check_attrs_of_type);
-PG_DEPRECATED_FUNCTION(pgsql_check_attr_of_type);
-
-/* arrow_fdw.c */
-PG_DEPRECATED_FUNCTION(pgstrom_arrow_fdw_export_cupy);
-PG_DEPRECATED_FUNCTION(pgstrom_arrow_fdw_export_cupy_pinned);
-PG_DEPRECATED_FUNCTION(pgstrom_arrow_fdw_unpin_gpu_buffer);
-PG_DEPRECATED_FUNCTION(pgstrom_arrow_fdw_put_gpu_buffer);
-
-/* deadcode/matrix.c */
-PG_DEPRECATED_FUNCTION(array_matrix_accum);
-PG_DEPRECATED_FUNCTION(array_matrix_accum_varbit);
-PG_DEPRECATED_FUNCTION(varbit_to_int4_array);
-PG_DEPRECATED_FUNCTION(int4_array_to_varbit);
-PG_DEPRECATED_FUNCTION(array_matrix_final_bool);
-PG_DEPRECATED_FUNCTION(array_matrix_final_int2);
-PG_DEPRECATED_FUNCTION(array_matrix_final_int4);
-PG_DEPRECATED_FUNCTION(array_matrix_final_int8);
-PG_DEPRECATED_FUNCTION(array_matrix_final_float4);
-PG_DEPRECATED_FUNCTION(array_matrix_final_float8);
-PG_DEPRECATED_FUNCTION(array_matrix_unnest);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_bool);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_int2);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_int4);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_int8);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_float4);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_float8);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_boolt);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_boolb);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_int2t);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_int2b);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_int4t);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_int4b);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_int8t);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_int8b);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_float4t);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_float4b);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_float8t);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_float8b);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_bool);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_int2);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_int4);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_int8);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_float4);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_float8);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_booll);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_boolr);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_int2l);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_int2r);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_int4l);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_int4r);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_int8l);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_int8r);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_float4l);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_float4r);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_float8l);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_float8r);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_accum);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_final_bool);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_final_int2);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_final_int4);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_final_int8);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_final_float4);
-PG_DEPRECATED_FUNCTION(array_matrix_rbind_final_float8);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_accum);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_final_bool);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_final_int2);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_final_int4);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_final_int8);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_final_float4);
-PG_DEPRECATED_FUNCTION(array_matrix_cbind_final_float8);
-PG_DEPRECATED_FUNCTION(array_matrix_transpose_bool);
-PG_DEPRECATED_FUNCTION(array_matrix_transpose_int2);
-PG_DEPRECATED_FUNCTION(array_matrix_transpose_int4);
-PG_DEPRECATED_FUNCTION(array_matrix_transpose_int8);
-PG_DEPRECATED_FUNCTION(array_matrix_transpose_float4);
-PG_DEPRECATED_FUNCTION(array_matrix_transpose_float8);
-PG_DEPRECATED_FUNCTION(float4_as_int4);		/* duplicated, see float2.c */
-PG_DEPRECATED_FUNCTION(int4_as_float4);		/* duplicated, see float2.c */
-PG_DEPRECATED_FUNCTION(float8_as_int8);		/* duplicated, see float2.c */
-PG_DEPRECATED_FUNCTION(int8_as_float8);		/* duplicated, see float2.c */
-PG_DEPRECATED_FUNCTION(array_matrix_validation);
-PG_DEPRECATED_FUNCTION(array_matrix_height);
-PG_DEPRECATED_FUNCTION(array_matrix_width);
+PG_FUNCTION_INFO_V1(pgstrom_gpucache_info);
+PUBLIC_FUNCTION(Datum)
+pgstrom_gpucache_info(PG_FUNCTION_ARGS)
+{
+	elog(ERROR, "pgstrom.gpucache_info is no longer supported");
+}

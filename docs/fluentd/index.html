@@ -1,47 +1,40 @@
 <!DOCTYPE html>
-<!--[if IE 8]><html class="no-js lt-ie9" lang="en" > <![endif]-->
-<!--[if gt IE 8]><!--> <html class="no-js" lang="en" > <!--<![endif]-->
+<html class="writer-html5" lang="en" >
 <head>
-  <meta charset="utf-8">
-  <meta http-equiv="X-UA-Compatible" content="IE=edge">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  
-  <meta name="author" content="PG-Strom Development Team">
-  
-  <link rel="shortcut icon" href="../img/favicon.ico">
-  <title>connect with Fluentd - PG-Strom Manual</title>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Lato:400,700|Roboto+Slab:400,700|Inconsolata:400,700" />
-
-  <link rel="stylesheet" href="../css/theme.css" />
-  <link rel="stylesheet" href="../css/theme_extra.css" />
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/10.5.0/styles/github.min.css" />
-  <link href="//fonts.googleapis.com/earlyaccess/notosansjp.css" rel="stylesheet" />
-  <link href="//fonts.googleapis.com/css?family=Open+Sans:600,800" rel="stylesheet" />
-  <link href="../custom.css" rel="stylesheet" />
-  
-  <script>
-    // Current page data
-    var mkdocs_page_name = "connect with Fluentd";
-    var mkdocs_page_input_path = "fluentd.md";
-    var mkdocs_page_url = null;
-  </script>
-  
-  <script src="../js/jquery-2.1.1.min.js" defer></script>
-  <script src="../js/modernizr-2.8.3.min.js" defer></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/10.5.0/highlight.min.js"></script>
-  <script>hljs.initHighlightingOnLoad();</script> 
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="author" content="PG-Strom Development Team" />
+      <link rel="shortcut icon" href="../img/favicon.ico" />
+    <title>connect with Fluentd - PG-Strom Manual</title>
+    <link rel="stylesheet" href="../css/theme.css" />
+    <link rel="stylesheet" href="../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+        <link href="//fonts.googleapis.com/earlyaccess/notosansjp.css" rel="stylesheet" />
+        <link href="//fonts.googleapis.com/css?family=Open+Sans:600,800" rel="stylesheet" />
+        <link href="../custom.css" rel="stylesheet" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "connect with Fluentd";
+        var mkdocs_page_input_path = "fluentd.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
 </head>
 
 <body class="wy-body-for-nav" role="document">
 
   <div class="wy-grid-for-nav">
-
-    
     <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
     <div class="wy-side-scroll">
       <div class="wy-side-nav-search">
-        <a href=".." class="icon icon-home"> PG-Strom Manual</a>
-        <div role="search">
+          <a href=".." class="icon icon-home"> PG-Strom Manual
+        </a><div role="search">
   <form id ="rtd-search-form" class="wy-form" action="../search.html" method="get">
     <input type="text" name="q" placeholder="Search docs" />
   </form>
@@ -49,39 +42,41 @@
 </div>
       </div>
 
-      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="main navigation">
-                <ul>
-                    <li class="toctree-l1"><a class="reference internal" href="..">Home</a>
-                    </li>
-                </ul>
-                <ul>
-                    <li class="toctree-l1"><a class="reference internal" href="../install/">Install</a>
-                    </li>
-                </ul>
-                <p class="caption"><span class="caption-text">Tutorial</span></p>
-                <ul>
-                    <li class="toctree-l1"><a class="reference internal" href="../operations/">Basic Operations</a>
-                    </li>
-                    <li class="toctree-l1"><a class="reference internal" href="../brin/">BRIN Index</a>
-                    </li>
-                    <li class="toctree-l1"><a class="reference internal" href="../partition/">Partitioning</a>
-                    </li>
-                    <li class="toctree-l1"><a class="reference internal" href="../postgis/">PostGIS</a>
-                    </li>
-                    <li class="toctree-l1"><a class="reference internal" href="../hll_count/">HyperLogLog</a>
-                    </li>
-                    <li class="toctree-l1"><a class="reference internal" href="../troubles/">Trouble Shooting</a>
-                    </li>
-                </ul>
-                <p class="caption"><span class="caption-text">Advanced Features</span></p>
-                <ul class="current">
-                    <li class="toctree-l1"><a class="reference internal" href="../ssd2gpu/">GPUDirect SQL</a>
-                    </li>
-                    <li class="toctree-l1"><a class="reference internal" href="../arrow_fdw/">Apache Arrow</a>
-                    </li>
-                    <li class="toctree-l1"><a class="reference internal" href="../gpucache/">GPU Cache</a>
-                    </li>
-                    <li class="toctree-l1 current"><a class="reference internal current" href="./">connect with Fluentd</a>
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../install/">Install</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Tutorial</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../operations/">Basic Operations</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../brin/">BRIN Index</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../partition/">Partitioning</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../postgis/">PostGIS</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../gpusort/">GPU-Sort</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../troubles/">Trouble Shooting</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Advanced Features</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../ssd2gpu/">GPUDirect SQL</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../arrow_fdw/">Apache Arrow</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../gpucache/">GPU Cache</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../pinned_buffer/">Pinned Inner Buffer</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">connect with Fluentd</a>
     <ul class="current">
     <li class="toctree-l2"><a class="reference internal" href="#overview">Overview</a>
     </li>
@@ -98,66 +93,63 @@
     <li class="toctree-l2"><a class="reference internal" href="#example">Example</a>
     </li>
     </ul>
-                    </li>
-                </ul>
-                <p class="caption"><span class="caption-text">References</span></p>
-                <ul>
-                    <li class="toctree-l1"><a class="reference internal" href="../ref_types/">Data Types</a>
-                    </li>
-                    <li class="toctree-l1"><a class="reference internal" href="../ref_devfuncs/">Functions and Operators</a>
-                    </li>
-                    <li class="toctree-l1"><a class="reference internal" href="../ref_sqlfuncs/">SQL Objects</a>
-                    </li>
-                    <li class="toctree-l1"><a class="reference internal" href="../ref_params/">GUC Parameters</a>
-                    </li>
-                </ul>
-                <p class="caption"><span class="caption-text">Release Note</span></p>
-                <ul>
-                    <li class="toctree-l1"><a class="reference internal" href="../release_v3.0/">PG-Strom v3.0</a>
-                    </li>
-                    <li class="toctree-l1"><a class="reference internal" href="../release_v2.3/">PG-Strom v2.3</a>
-                    </li>
-                    <li class="toctree-l1"><a class="reference internal" href="../release_v2.2/">PG-Strom v2.2</a>
-                    </li>
-                    <li class="toctree-l1"><a class="reference internal" href="../release_v2.0/">PG-Strom v2.0</a>
-                    </li>
-                </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">References</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../ref_types/">Data Types</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../ref_devfuncs/">Functions and Operators</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../ref_sqlfuncs/">SQL Objects</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../ref_params/">GUC Parameters</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Release Note</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../release_v6.1/">PG-Strom v6.1</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../release_v6.0/">PG-Strom v6.0</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../release_v5.2/">PG-Strom v5.2</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../release_v5.1/">PG-Strom v5.1</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../release_v5.0/">PG-Strom v5.0</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../release_v3.0/">PG-Strom v3.0</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../release_v2.3/">PG-Strom v2.3</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../release_v2.2/">PG-Strom v2.2</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../release_v2.0/">PG-Strom v2.0</a>
+                  </li>
+              </ul>
       </div>
     </div>
     </nav>
 
     <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
-
-      
-      <nav class="wy-nav-top" role="navigation" aria-label="top navigation">
-        <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
-        <a href="..">PG-Strom Manual</a>
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="..">PG-Strom Manual</a>
+        
       </nav>
-
-      
       <div class="wy-nav-content">
-        <div class="rst-content">
-          <div role="navigation" aria-label="breadcrumbs navigation">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
   <ul class="wy-breadcrumbs">
-    <li><a href="..">Docs</a> &raquo;</li>
-    
-      
-        
-          <li>Advanced Features &raquo;</li>
-        
-      
-    
-    <li>connect with Fluentd</li>
+    <li><a href=".." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Advanced Features</li>
+      <li class="breadcrumb-item active">connect with Fluentd</li>
     <li class="wy-breadcrumbs-aside">
-      
     </li>
   </ul>
-  
   <hr/>
 </div>
-
-          <div role="main">
-            <div class="section">
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
               
                 <h1 id="connect-with-fluentd">connect with Fluentd</h1>
 <p>This chapter introduces the cooperation with Fluentd via Apache Arrow data format for the efficient importing of IoT/M2M log data.</p>
@@ -173,7 +165,7 @@ Fluentd allows customization of the input/output and processing of log data by a
 <p>PG-Strom can handle two types of data formats: PostgreSQL Heap format (transactional row data) and Apache Arrow format (structured column data). The Apache Arrow format is suitable for workloads like those in the IoT/M2M, where huge amounts of data are generated time-by-time.</p>
 <h2 id="arrow-file-plugin">arrow-file plugin</h2>
 <p>This chapter describes the approach to write out the log data collected by Fluentd in Apache Arrow format, and to refere it with PG-Strom.
-We assume <code>td-agent</code> here, that is a stable version of Fluentd provided by Treasure Data.</p>
+We assume <code>fluentd</code> here, that is a stable version of Fluentd provided by Treasure Data.</p>
 <p>PG-Strom includes the <code>fluent-plugin-arrow-file</code> module. This allows Fluentd to write out the log data it collects as an Apache Arrow format file with a specified schema structure.
 Using PG-Strom's Arrow_Fdw, this Apache Arrow format file can be accessed as an foreign table.
 In addition, GPU-Direct SQL allows to load these files extremely fast, if the storage system is appropriately configured.</p>
@@ -194,27 +186,27 @@ The arrow-file plugin is categorized as Output plugin. It writes out a "chunk" o
 The arrow-file plugin writes to an Apache Arrow format file with the <code>tag</code> and <code>time</code> fields and each element of the <code>record</code> associative array as a column (some may be omitted).
 Therefore, the output destination file name and schema definition information (mapping of associative array elements to columns/types) are mandatory configuration parameters.</p>
 <h2 id="installation">Installation</h2>
-<p>Install the <code>td-agent</code> package for Linux distribution you are using.
-The <code>rake-compiler</code> module is required to install the arrow-file plugin, so please install it before.</p>
-<pre><code>$ curl -L https://toolbelt.treasuredata.com/sh/install-redhat-td-agent4.sh | sh
-
-$ sudo /opt/td-agent/bin/fluent-gem install rake-compiler
+<p>Install the <code>fluent-package</code> package for Linux distribution you are using.</p>
+<p>See the <a href="https://docs.fluentd.org/installation/install-fluent-package">Install fluent-package</a> for details.</p>
+<pre><code>$ curl -fsSL https://fluentd.cdn.cncf.io/sh/install-redhat-fluent-package6-lts.sh | sh
 </code></pre>
 <p>Next, download the source code for PG-Strom and build arrow-file plugin in the <code>fluentd</code> directory.</p>
 <pre><code>$ git clone https://github.com/heterodb/pg-strom.git
 $ cd pg-strom/fluentd
-$ make TD_AGENT=1 gem
-$ sudo make TD_AGENT=1 install
+$ make gem
+$ sudo make install
 </code></pre>
 <p>To confirm that the Fluentd plugin is installed, run the following command.</p>
-<pre><code>$ /opt/td-agent/bin/fluent-gem list | grep arrow
-fluent-plugin-arrow-file (0.2)
+<pre><code>$ /opt/fluent/bin/fluent-gem list | grep arrow
+fluent-plugin-arrow-file (0.5)
 </code></pre>
 <h2 id="configuration">Configuration</h2>
 <p>As mentioned above, the arrow-file plugin requires the output path of the file and the schema definition at least.</p>
-<p>In addition to this, in order to acquire the best performance for searching and aggregation processing, the single chunk of data inside the Apache Arrow file, called the Record Batch, needs to be reasonably large in size.
-The arrow-file plugin creates a Record Batch for each chunk passed from the Buffer plugin.
-Therefore, the buffer size of the Buffer plugin should be set with the size of the Record Batch in mind. By the default, the Buffer plugin is set to take a buffer size of 256MB.</p>
+<p>Due to the architecture of Fluentd's Write plugin, the arrow-file plugin writes data chunks passed from the Buffer plugin to a file as one Record Batch (this is called a Row Group in Parquet format, but it's roughly the same concept).
+When performing search and aggregation processing, a relatively larger Record Batch is easier to pull out high performance, but a size that does not fit into GPU memory is undesirable from the perspective of using PG-Strom.
+Since the arrow-file plugin creates a Record Batch for each data chunk passed from the Buffer plugin, the buffer size on the Buffer plugin side should be set accordingly. The default buffer size is set to 256MB. You should set the buffer size to around 256MB to 2GB as needed.</p>
+<p>Also, previous versions of the arrow-file plugin appended a Record Batch to an already written Arrow file each time a data chunk was passed from the Buffer plugin, but from v0.5 onwards, the structure is 1 file = 1 Record Batch (1 Row Group).
+This is because libarrow and libparquet do not support appending, and exclusive access is required when using the generated files.</p>
 <p>The configuration parameters for the arrow-file plugin are as follows:</p>
 <dl>
 <dt><code>path</code> [type: <code>String</code> ] (Required)</dt>
@@ -263,10 +255,9 @@ Therefore, the buffer size of the Buffer plugin should be set with the size of t
 </tr>
 </tbody>
 </table>
-<p>The placeholder is replaced when the chunk is written out. If an Apache Arrow format file of the same name exists, the Record Batch will be appended to it. If it does not exist, a new Apache Arrow format file is created and the first Record Batch is written out.</p>
-<p>However, if the size of the existing Apache Arrow file exceeds the <code>filesize_threshold</code> setting described below, rename the existing file and then create a new one.</p>
+<p>The format string is evaluated when writing out a data chunk, and a new Apache Arrow format file (or Apache Parquet format file) with the specified name is created, and a file containing one Record Batch (or Row Group) is written to it.
+If a file with the same name exists, an attempt will be made to create a file with a different name, for example by adding a sequence number to the end of the file.</p>
 <p>(Example) <code>path /tmp/arrow_logs/my_logs_%y%m%d.%p.log</code></p>
-<p>The output Apache Arrow file updates the footer area to point to all Record Batches each time a chunk is written out. Therefore, the generated Apache Arrow file can be read immediately. However, to avoid access conflicts, exclusive handling is required using <code>lockf(3)</code>.</p>
 <dl>
 <dt><code>schema_defs</code> [type: <code>String</code> ]  (Required)</dt>
 <dd>Specify the schema definition of the Apache Arrow format file output by <code>fluent-plugin-arrow-file</code>.</dd>
@@ -279,12 +270,14 @@ Therefore, the buffer size of the Buffer plugin should be set with the size of t
 <li><code>&lt;column_type&gt;</code> is the data type of the column. See the following table.</li>
 <li><code>&lt;column_attrs&gt;</code> is an additional attribute for columns. At this time, only the following attributes are supported.<ul>
 <li><code>stat_enabled</code> ... The statistics for the configured columns will be collected and the maximum/minimum values for each Record Batch will be set as custom metadata in the form of <code>max_values=...</code> and <code>min_values=...</code>.</li>
+<li><code>stat_disabled</code> ... Disables per-column statistics that are collected by default in Parquet format. Ignored by Apache format.</li>
+<li>Compression options: You can specify the compression algorithm for each column. One of the <code>snappy</code>, <code>gzip</code>, <code>brotli</code>, <code>zstd</code>, <code>lz4</code>, <code>lzo</code>, <code>bz2</code> or <code>none</code> (no compression) can be used.</li>
 </ul>
 </li>
 </ul>
 </li>
 </ul>
-<p>(Example) <code>schema_defs "ts=Timestamp;stat_enabled,dev_id=Uint32,temperature=Float32,humidity=Float32"</code></p>
+<p>(Example) <code>schema_defs "ts=Timestamp;stat_enabled,dev_id=Uint32,temperature=Float32;bz2,humidity=Float32"</code></p>
 <p><strong><em>Data types supported by the arrow-file plugin</em></strong></p>
 <table>
 <thead>
@@ -343,20 +336,31 @@ Therefore, the buffer size of the Buffer plugin should be set with the size of t
 <dt><code>tag_column</code> [type: <code>String</code> / default: unspecified]</dt>
 <dd>Specify a column name to set the tag value of the log passed from Fluentd (not from <code>record</code>).</dd>
 <dd>This parameter is usually a string type such as <code>utf8</code>.</dd>
-<dt><code>filesize_threshold</code> [type: <code>Integer</code> / default: 10000]</dt>
-<dd>Specify the threshold for switching the output destination file in MB.</dd>
-<dd>By default, the output destination is switched when the file size exceeds about 10GB.</dd>
+<dt><code>format</code> [type: <code>String</code> / default: <code>arrow</code>]</dt>
+<dd>Specify the file format to be written by the <code>fluent-plugin-arrow-file</code>.</dd>
+<dd>
+<dl>
+<dt><code>arrow</code> means Apache Arrow format, and <code>parquet</code> means Apache Parquet format.</dt>
+<dt>@ja</dt>
+<dt><code>compression</code> [type: <code>String</code> / default: <code>zstd</code>]</dt>
+<dd>Apache Parquet形式で使用する圧縮アルゴリズムを指定します。列単位での圧縮オプションがない場合は、こちらで指定した圧縮アルゴリズムが適用されます。</dd>
+<dd>選択可能なアルゴリズムは<code>snappy</code>、<code>gzip</code>、<code>brotli</code>、<code>zstd</code>、<code>lz4</code>、<code>lzo</code>、<code>bz2</code>、<code>none</code>（無圧縮）のいずれかです。</dd>
+</dl>
+</dd>
+<dt><code>compression</code> [type: <code>String</code> / default: <code>zstd</code>]</dt>
+<dd>Specifies the compression algorithm to use for Apache Parquet format. If no specific compression option is given on per-column configuration, the compression algorithm specified here will be applied.</dd>
+<dd>One of the <code>snappy</code>, <code>gzip</code>, <code>brotli</code>, <code>zstd</code>, <code>lz4</code>, <code>lzo</code>, <code>bz2</code> or <code>none</code>(uncompressed) can be used.</dd>
 </dl>
 <h2 id="example">Example</h2>
 <p>As a simple example, this chapter shows a configuration for monitoring the log of a local Apache Httpd server, parsing it field by field, and writing it to an Apache Arrow format file.</p>
 <p>By setting <code>&lt;source&gt;</code>, <code>/var/log/httpd/access_log</code> will be the data source. Then, the <code>apache2</code> Parse plugin will cut out the fields: host, user, time, method, path, code, size, referer, agent.</p>
 <p>The fields are then passed to the arrow-file plugin as an associative array. In <code>schema_defs</code> in <code>&lt;match&gt;</code>, the column definitions of the Apache Arrow file corresponding to the fields are set.
 For simplicity of explanation, the chunk size is set to a maximum of 4MB / 200 lines in the <code>&lt;buffer&gt;</code> tag, and it is set to pass to the Output plugin in 10 seconds at most.</p>
-<p><strong><em>Example configuration of <code>/etc/td-agent/td-agent.conf</code></em></strong></p>
+<p><strong><em>Example configuration of <code>/etc/fluent/fluentd.conf</code></em></strong></p>
 <pre><code>&lt;source&gt;
   @type tail
   path /var/log/httpd/access_log
-  pos_file /var/log/td-agent/httpd_access.pos
+  pos_file /var/log/fluent/httpd_access.pos
   tag httpd
   format apache2
   &lt;parse&gt;
@@ -378,8 +382,8 @@ For simplicity of explanation, the chunk size is set to a maximum of 4MB / 200 l
   &lt;/buffer&gt;
 &lt;/match&gt;
 </code></pre>
-<p>Start the <code>td-agent</code> service.</p>
-<pre><code>$ sudo systemctl start td-agent
+<p>Start the <code>fluentd</code> service.</p>
+<pre><code>$ sudo systemctl start fluentd
 </code></pre>
 <p>See the following output. The placeholder for <code>/tmp/mytest%Y%m%d.%p.arrow</code> set in <code>path</code> is replaced and the Apache Httpd log is written to <code>/tmp/mytest20220124.3206341.arrow</code>.</p>
 <pre><code>$ arrow2csv /tmp/mytest20220124.3206341.arrow --head --offset 300 --limit 10
@@ -422,29 +426,21 @@ postgres=# EXPLAIN SELECT ts, host, path FROM mytest WHERE code = 404;
 In the example above, the log with HTTP status code 404 is searched and one record is found.</p>
               
             </div>
-          </div>
-          <footer>
-  
-    <div class="rst-footer-buttons" role="navigation" aria-label="footer navigation">
-      
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../pinned_buffer/" class="btn btn-neutral float-left" title="Pinned Inner Buffer"><span class="icon icon-circle-arrow-left"></span> Previous</a>
         <a href="../ref_types/" class="btn btn-neutral float-right" title="Data Types">Next <span class="icon icon-circle-arrow-right"></span></a>
-      
-      
-        <a href="../gpucache/" class="btn btn-neutral" title="GPU Cache"><span class="icon icon-circle-arrow-left"></span> Previous</a>
-      
     </div>
-  
 
   <hr/>
 
   <div role="contentinfo">
     <!-- Copyright etc -->
-    
   </div>
 
-  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/snide/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
 </footer>
-      
+          
         </div>
       </div>
 
@@ -452,25 +448,26 @@ In the example above, the log with HTTP status code 404 is searched and one reco
 
   </div>
 
-  <div class="rst-versions" role="note" aria-label="versions">
+  <div class="rst-versions" role="note" aria-label="Versions">
   <span class="rst-current-version" data-toggle="rst-current-version">
     
     
-      <span><a href="../gpucache/" style="color: #fcfcfc">&laquo; Previous</a></span>
+      <span><a href="../pinned_buffer/" style="color: #fcfcfc">&laquo; Previous</a></span>
     
     
       <span><a href="../ref_types/" style="color: #fcfcfc">Next &raquo;</a></span>
     
   </span>
 </div>
-    <script>var base_url = '..';</script>
-    <script src="../js/theme_extra.js" defer></script>
-    <script src="../js/theme.js" defer></script>
-      <script src="../search/main.js" defer></script>
-    <script defer>
-        window.onload = function () {
+    <script src="../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "..";</script>
+    <script src="../js/theme_extra.js"></script>
+    <script src="../js/theme.js"></script>
+      <script src="../search/main.js"></script>
+    <script>
+        jQuery(function () {
             SphinxRtdTheme.Navigation.enable(true);
-        };
+        });
     </script>
 
 </body>

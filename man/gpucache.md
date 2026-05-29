@@ -33,12 +33,12 @@ Nevertheless, you can process search/analytical SQL workloads on data already lo
 ![GPU Cache Usage](./img/gpucache_usage.png)
 
 @ja{
-GPUキャッシュの典型的な利用シーンとしては、自動車や携帯電話といったモバイルデバイスの位置情報（現在位置）を時々刻々収集し、[GPU版PostGIS](../postgis/)などを用いて他のデータと突き合わせるといったケースが考えられます。
+GPUキャッシュの典型的な利用シーンとしては、自動車や携帯電話といったモバイルデバイスの位置情報（現在位置）を時々刻々収集し、[GPU版PostGIS](postgis.md)などを用いて他のデータと突き合わせるといったケースが考えられます。
 多数のデバイスから送出される位置情報の更新は極めて更新ヘビーなワークロードですが、一方で、最新の位置情報に基づいて検索/分析クエリを実行する必要もあるため、これら更新データを遅滞なくGPU側へ適用する必要があります。
 データサイズには制約がありますが、GPUキャッシュは高頻度の更新と、高性能な検索/分析クエリの実行を両立する一つのオプションです。
 }
 @en{
-A typical use case of GPU Cache is to join location data, such as the current position of a mobile device like a car or a cell phone, collected in real time with other data using [GPU-PostGIS](../postgis/).
+A typical use case of GPU Cache is to join location data, such as the current position of a mobile device like a car or a cell phone, collected in real time with other data using [GPU-PostGIS](postgis.md).
 The workload of updating location information sent out by many devices is extremely heavy. However, it also needs to be applied on the GPU side without delay in order to perform search/analysis queries based on the latest location information.
 Although the size is limited, GPU Cache is one option to achieve both high frequency updates and high-performance search/analysis query execution.
 }
@@ -110,54 +110,6 @@ Below is an example to configure GPU Cache on the `dpoints` table.
                   execute function pgstrom.gpucache_sync_trigger();
 =# alter table dpoints_even enable always trigger row_sync;
 ```
-
-@ja{
-!!! Note
-    PostgreSQL v12.x 以前のバージョンにおける追加設定
-    
-    PostgreSQL v12および以前のバージョンでGPUキャッシュを利用する場合、上記のトリガに加えて、
-    `pgstrom.gpucache_sync_trigger()`関数を実行するBEFORE TRUNCATEの構文トリガの設定が必要です。
-    
-    レプリケーションのスレーブ側でGPUキャッシュを実行する場合、同様に、このトリガの発行モードが
-    `ALWAYS`である事が必要です。
-    
-    PostgreSQL v13ではObject Access Hookが拡張され、拡張モジュールはトリガ設定なしで
-    TRUNCATEの実行を捕捉できるようになりました。
-    しかしそれ以前のバージョンでは、TRUNCATEを捕捉してGPUキャッシュの一貫性を保つには、
-    BEFORE TRUNCATEの構文トリガが必要です。
-}
-@en{
-!!! Note
-    Additional configuration at PostgreSQL v12 or prior.
-    
-    In case when GPU Cache is used at PostgreSQL v12 or prior, you need to configure
-    an additional BEFORE TRUNCATE statement trigger that executes `pgstrom.gpucache_sync_trigger()` function.
-    If you want to use the GPU Cache on the replication slave, 
-
-    If you use GPU Cache at the PostgreSQL v12 or prior, in a similar way, invocation mode of this trigger must have `ALWAYS`.
-    
-    PostgreSQL v13 enhanced its object-access-hook mechanism, so allows extension modules
-    to capture execution of TRUNCATE without triggers configuration.
-    On the other hand, the prior version still needs the BEFORE TRUNCATE statement trigger to keep consistency
-    of GPU Cache by capture of TRUNCATE.
-}
-
-@ja{
-以下は、PostgreSQL v12以前でGPUキャッシュを`dpoints`テーブルに設定する例です。
-}
-@en{
-Below is an example to configure GPU Cache on the `dpoints` table at PostgreSQL v12 or prior.
-}
-    
-```
-=# create trigger row_sync after insert or update or delete on dpoints_even for row
-                  execute function pgstrom.gpucache_sync_trigger();
-=# create trigger stmt_sync before truncate on dpoints_even for statement
-                  execute function pgstrom.gpucache_sync_trigger();
-=# alter table dpoints_even enable always trigger row_sync;
-=# alter table dpoints_even enable always trigger stmt_sync;
-```
-
 
 @ja:###GPUキャッシュのカスタマイズ
 @en:###GPU Cache Customize

@@ -126,7 +126,9 @@ OPTIONS (file '/path/to/logdata.arrow');
 @en:###Foreign table options
 
 @ja{
-Arrow_Fdwは以下のオプションに対応しています。現状、全てのオプションは外部テーブルに対して指定するものです。
+Arrow_Fdwは以下のオプションに対応しています。
+
+####外部テーブルに対するオプション
 
 `file=PATHNAME`
 :   外部テーブルにマップするArrowファイルを1個指定します。
@@ -143,11 +145,39 @@ Arrow_Fdwは以下のオプションに対応しています。現状、全て�
 `parallel_workers=N_WORKERS`
 :   この外部テーブルの並列スキャンに使用する並列ワーカープロセスの数を指定します。一般的なテーブルにおける`parallel_workers`ストレージパラメータと同等の意味を持ちます。
 
-`writable=(true|false)`
-:   この外部テーブルに対する`INSERT`文の実行を許可します。詳細は『書き込み可能Arrow_Fdw』の節を参照してください。
+`pattern=PATTERN`
+:   `file`、`files`、または`dir`オプションで指定されたファイルのうち、ワイルドカードを含む`PATTERN`にマッチしたものだけを外部テーブルにマップします。
+:   ワイルドカードには以下のものを利用することができます。
+:   - `?` ... 任意の1文字にマッチする。
+:   - `*` ... 任意の0文字以上の文字列にマッチする。
+:   - `${KEY}` ... 任意の0文字以上の文字列にマッチする。
+:   - `@\{KEY}` ... 任意の0文字以上の数値列にマッチする。
+:   
+:   このオプションには面白い使い方があり、ワイルドカードの`${KEY}`や`@\{KEY}`でマッチしたファイル名の一部分を、仮想列として参照することができます。詳しくは、'''Arrow_Fdwの仮想列'''を参照してください。
+
+####カラムに対するオプション
+
+`field=FIELD`
+:   そのカラムにマップするArrowファイルのフィールド名を指定します。
+:   デフォルトでは、この外部テーブルの列名と同じフィールドのうち、最も最初に出現したフィールドをマップします。
+
+`virtual=KEY`
+:   そのカラムが仮想列である事を指定します。`KEY`はテーブルオプションの`pattern`オプションで指定されたパターン中のワイルドカードのキー名を指定します。
+:   仮想列はファイル名パターンのうち`KEY`にマッチした部分をクエリで参照することができます。
+
+`virtual_metadata=KEY`
+:   そのカラムが仮想列である事を指定します。`KEY`はArrowファイルのCustomMetadataフィールドに埋め込まれたKEY-VALUEペアを指定します。指定したKEY-VALUEペアが見つからない場合、このカラムはNULL値を返します。
+:   ArrowファイルのCustomMetadataには、スキーマ（PostgreSQLのテーブルに相当）に埋め込まれるものと、フィールド（PostgreSQLの列に相当）に埋め込まれるものの二種類があります。
+:   例えば、`lo_orderdate.max_values`のように、KEY値の前に`.`文字で区切られたフィールド名を記述する事で、フィールドに埋め込まれたCustomMetadataを参照する事が出来ます。フィールド名がない場合は、スキーマに埋め込まれたKEY-VALUEペアであるとして扱われます。
+
+`virtual_metadata_split=KEY`
+:   そのカラムが仮想列である事を指定します。`KEY`はArrowファイルのCustomMetadataフィールドに埋め込まれたKEY-VALUEペアを指定します。指定したKEY-VALUEペアが見つからない場合、このカラムはNULL値を返します。
+:    `virtual_metadata`との違いは、CustomMetadataフィールドの値をデリミタ（`,`）で区切り、それを個々のRecord Batchに先頭から順に当てはめて行くことです。例えば、指定したCustomMetadataの値が`Tokyo,Osaka,Kyoto,Yokohama`であった場合、RecordBatch-0から読み出した行では`'Tokyo'`が、RecordBatch-1から読み出した行では`'Osaka'`が、RecordBatch-2から読み出した行では`'Osaka'`がこの仮想列の値として表示されます。
 }
 @en{
-Arrow_Fdw supports the options below. Right now, all the options are for foreign tables.
+Arrow_Fdw supports the options below.
+
+####Foreign Table Options
 
 `file=PATHNAME`
 :   It maps an Arrow file specified on the foreign table.
@@ -164,8 +194,34 @@ Arrow_Fdw supports the options below. Right now, all the options are for foreign
 `parallel_workers=N_WORKERS`
 :   It tells the number of workers that should be used to assist a parallel scan of this foreign table; equivalent to `parallel_workers` storage parameter at normal tables.
 
-`writable=(true|false)`
-:   It allows execution of `INSERT` command on the foreign table. See the section of "Writable Arrow_Fdw"
+`pattern=PATTERN`
+:   Maps only files specified by the `file`, `files`, or `dir` option that match the `PATTERN`, including wildcards, to the foreign table.
+:   The following wildcards can be used:
+:   - `?` ... matches any 1 character.
+:   - `*` ... matches any string of 0 or more characters.
+:   - `${KEY}` ... matches any string of 0 or more characters.
+:   - `@\{KEY}` ... matches any numeric string of 0 or more characters.
+:   
+:   An interesting use of this option is to refer to a portion of a file name matched by the wildcard `${KEY}` or `@\{KEY}` as a virtual column. For more information, see the '''Arrow_Fdw virtual column''' section below.
+
+####Foreign Column Options
+
+`field=FIELD`
+:   It specifies the field name of the Arrow file to map to that column.
+:   In the default, Arrow_Fdw maps the first occurrence of a field that has the same column name as this foreign table's column name.
+
+`virtual=KEY`
+:   It configures the column is a virtual column. `KEY` specifies the wildcard key name in the pattern specified by the `pattern` option of the foreign table option.
+:   A virtual column allows to refer to the part of the file name pattern that matches `KEY` in a query.
+
+`virtual_metadata=KEY`
+:   It specifies that the column is a virtual column. `KEY` specifies a KEY-VALUE pair embedded in the CustomMetadata field of the Arrow file. If the specified KEY-VALUE pair is not found, the column returns a NULL value.
+:   There are two types of CustomMetadata in Arrow files: embedded in the schema (corresponding to a PostgreSQL table) and embedded in the field (corresponding to a PostgreSQL column).
+:   For example, you can reference CustomMetadata embedded in a field by writing the field name separated by the `.` character before the KEY value, such as `lo_orderdate.max_values`. If there is no field name, it will be treated as a KEY-VALUE pair embedded in the schema.
+
+`virtual_metadata_split=KEY`
+:   It specifies that the column is a virtual column. `KEY` specifies the KEY-VALUE pair embedded in the CustomMetadata field of the Arrow file. If the specified KEY-VALUE pair is not found, this column returns a NULL value.
+:   The difference from `virtual_metadata` is that the values of the CustomMetadata field are separated by a delimiter(`,`) and applied to each Record Batch in order from the beginning. For example, if the specified CustomMetadata value is `Tokyo,Osaka,Kyoto,Yokohama`, the row read from RecordBatch-0 will display `'Tokyo'`, the row read from RecordBatch-1 will display `'Osaka'`, and the row read from RecordBatch-2 will display `'Osaka'` as the value of this virtual column.
 }
 
 @ja:###データ型の対応
@@ -183,7 +239,10 @@ Arrow形式のデータ型と、PostgreSQLのデータ型は以下のように�
 :   `precision`属性の値に応じて、それぞれ`float2`、`float4`、`float8`のいずれかに対応。
 :   `float2`はPG-Stromによる独自拡張
 
-`Binary`
+`Utf8`, `LargeUtf8`
+:   `text`型に対応
+
+`Binary`, `LargeBinary`
 :   `bytea`型に対応
 
 `Decimal`
@@ -201,7 +260,7 @@ Arrow形式のデータ型と、PostgreSQLのデータ型は以下のように�
 `Interval`
 :   `interval`型に対応
 
-`List`
+`List`, `LargeList`
 :   要素型の1次元配列型として表現される。
 
 `Struct`
@@ -211,7 +270,7 @@ Arrow形式のデータ型と、PostgreSQLのデータ型は以下のように�
 :   `byteWidth`属性の値に応じて `char(n)` として表現される。
 :   メタデータ `pg_type=TYPENAME` が指定されている場合、該当するデータ型を割り当てる場合がある。現時点では、`inet`および`macaddr`型。
 
-`Union`、`Map`、`Duration`、`LargeBinary`、`LargeUtf8`、`LargeList`
+`Union`、`Map`、`Duration`
 :   現時点ではPostgreSQLデータ型への対応はなし。
 }
 @en{
@@ -226,7 +285,10 @@ Arrow data types are mapped on PostgreSQL data types as follows.
 :   mapped to either of `float2`, `float4` or `float8` according to the `precision` attribute.
 :   `float2` is an enhanced data type by PG-Strom.
 
-`Binary`
+`Utf8`, `LargeUtf8`
+:   mapped to `text` data type
+
+`Binary`, `LargeBinary`
 :   mapped to `bytea` data type
 
 `Decimal`
@@ -244,7 +306,7 @@ Arrow data types are mapped on PostgreSQL data types as follows.
 `Interval`
 :   mapped to `interval` data type.
 
-`List`
+`List`, `LargeList`
 :   mapped to 1-dimensional array of the element data type.
 
 `Struct`
@@ -254,7 +316,7 @@ Arrow data types are mapped on PostgreSQL data types as follows.
 :   mapped to `char(n)` data type according to the `byteWidth` attribute.
 :   If `pg_type=TYPENAME` is configured, PG-Strom may assign the configured data type. Right now, `inet` and `macaddr` are supported.
 
-`Union`, `Map`, `Duration`, `LargeBinary`, `LargeUtf8`, `LargeList`
+`Union`, `Map`, `Duration`
 :   Right now, PG-Strom cannot map these Arrow data types onto any of PostgreSQL data types.
 }
 
@@ -264,57 +326,51 @@ Arrow data types are mapped on PostgreSQL data types as follows.
 @ja{
 `EXPLAIN`コマンドを用いて、Arrow形式ファイルの読み出しに関する情報を出力する事ができます。
 
-以下の例は、約309GBの大きさを持つArrow形式ファイルをマップしたflineorder外部テーブルを含むクエリ実行計画の出力です。
+以下の例は、約503GBの大きさを持つArrow形式ファイルをマップしたf_lineorder外部テーブルを含むクエリ実行計画の出力です。
 }
 @en{
 `EXPLAIN` command show us information about Arrow files reading.
 
-The example below is an output of query execution plan that includes flineorder foreign table that mapps an Arrow file of 309GB.
+The example below is an output of query execution plan that includes f_lineorder foreign table that mapps an Arrow file of 503GB.
 }
 
 ```
 =# EXPLAIN
     SELECT sum(lo_extendedprice*lo_discount) as revenue
-      FROM flineorder,date1
+      FROM f_lineorder,date1
      WHERE lo_orderdate = d_datekey
        AND d_year = 1993
        AND lo_discount between 1 and 3
        AND lo_quantity < 25;
-                                             QUERY PLAN
------------------------------------------------------------------------------------------------------
- Aggregate  (cost=12632759.02..12632759.03 rows=1 width=32)
-   ->  Custom Scan (GpuPreAgg)  (cost=12632754.43..12632757.49 rows=204 width=8)
-         Reduction: NoGroup
-         Combined GpuJoin: enabled
-         GPU Preference: GPU0 (Tesla V100-PCIE-16GB)
-         ->  Custom Scan (GpuJoin) on flineorder  (cost=9952.15..12638126.98 rows=572635 width=12)
-               Outer Scan: flineorder  (cost=9877.70..12649677.69 rows=4010017 width=16)
-               Outer Scan Filter: ((lo_discount >= 1) AND (lo_discount <= 3) AND (lo_quantity < 25))
-               Depth 1: GpuHashJoin  (nrows 4010017...572635)
-                        HashKeys: flineorder.lo_orderdate
-                        JoinQuals: (flineorder.lo_orderdate = date1.d_datekey)
-                        KDS-Hash (size: 66.06KB)
-               GPU Preference: GPU0 (Tesla V100-PCIE-16GB)
-               NVMe-Strom: enabled
-               referenced: lo_orderdate, lo_quantity, lo_extendedprice, lo_discount
-               files0: /opt/nvme/lineorder_s401.arrow (size: 309.23GB)
-               ->  Seq Scan on date1  (cost=0.00..78.95 rows=365 width=4)
-                     Filter: (d_year = 1993)
-(18 rows)
+                                        QUERY PLAN
+--------------------------------------------------------------------------------
+ Aggregate  (cost=14535261.08..14535261.09 rows=1 width=8)
+   ->  Custom Scan (GpuPreAgg) on f_lineorder  (cost=14535261.06..14535261.07 rows=1 width=32)
+         GPU Projection: pgstrom.psum(((f_lineorder.lo_extendedprice * f_lineorder.lo_discount))::bigint)
+         GPU Scan Quals: ((f_lineorder.lo_discount >= 1) AND (f_lineorder.lo_discount <= 3) AND (f_lineorder.lo_quantity < 25)) [rows: 5999990000 -> 9999983]
+         GPU Join Quals [1]: (f_lineorder.lo_orderdate = date1.d_datekey) ... [nrows: 9999983 -> 1428010]
+         GPU Outer Hash [1]: f_lineorder.lo_orderdate
+         GPU Inner Hash [1]: date1.d_datekey
+         referenced: lo_orderdate, lo_quantity, lo_extendedprice, lo_discount
+         file0: /opt/nvme/f_lineorder_s999.arrow (read: 89.41GB, size: 502.92GB)
+         GPU-Direct SQL: enabled (GPU-0)
+         ->  Seq Scan on date1  (cost=0.00..78.95 rows=365 width=4)
+               Filter: (d_year = 1993)
+(12 rows)
 ```
 
 @ja{
-これを見るとCustom Scan (GpuJoin)が`flineorder`外部テーブルをスキャンしている事がわかります。 `file0`には外部テーブルの背後にあるファイル名`/opt/nvme/lineorder_s401.arrow`とそのサイズが表示されます。複数のファイルがマップされている場合には、`file1`、`file2`、... と各ファイル毎に表示されます。 `referenced`には実際に参照されている列の一覧が列挙されており、このクエリにおいては`lo_orderdate`、`lo_quantity`、`lo_extendedprice`および`lo_discount`列が参照されている事がわかります。
+これを見るとCustom Scan (GpuPreAgg)が`f_lineorder`外部テーブルをスキャンしている事がわかります。 `file0`には外部テーブルの背後にあるファイル名`/opt/nvme/f_lineorder_s999.arrow`とそのサイズが表示されます。複数のファイルがマップされている場合には、`file1`、`file2`、... と各ファイル毎に表示されます。 `referenced`には実際に参照されている列の一覧が列挙されており、このクエリにおいては`lo_orderdate`、`lo_quantity`、`lo_extendedprice`および`lo_discount`列が参照されている事がわかります。
 }
 @en{
-According to the `EXPLAIN` output, we can see Custom Scan (GpuJoin) scans `flineorder` foreign table. `file0` item shows the filename (`/opt/nvme/lineorder_s401.arrow`) on behalf of the foreign table and its size. If multiple files are mapped, any files are individually shown, like `file1`, `file2`, ... The `referenced` item shows the list of referenced columns. We can see this query touches `lo_orderdate`, `lo_quantity`, `lo_extendedprice` and `lo_discount` columns.
+According to the `EXPLAIN` output, we can see Custom Scan (GpuPreAgg) scans `f_lineorder` foreign table. `file0` item shows the filename (`/opt/nvme/lineorder_s999.arrow`) on behalf of the foreign table and its size. If multiple files are mapped, any files are individually shown, like `file1`, `file2`, ... The `referenced` item shows the list of referenced columns. We can see this query touches `lo_orderdate`, `lo_quantity`, `lo_extendedprice` and `lo_discount` columns.
 }
 
 @ja{
-また、`GPU Preference: GPU0 (Tesla V100-PCIE-16GB)`および`NVMe-Strom: enabled`の表示がある事から、`flineorder`のスキャンにはSSD-to-GPUダイレクトSQL機構が用いられることが分かります。
+また、`GPU-Direct SQL: enabled (GPU-0)`の表示がある事から、`f_lineorder`のスキャンにはGPU-Direct SQL機構が用いられることが分かります。
 }
 @en{
-In addition, `GPU Preference: GPU0 (Tesla V100-PCIE-16GB)` and `NVMe-Strom: enabled` shows us the scan on `flineorder` uses SSD-to-GPU Direct SQL mechanism.
+In addition, `GPU-Direct SQL: enabled (GPU-0)` shows us the scan on `f_lineorder` uses GPU-Direct SQL mechanism.
 }
 
 @ja{
@@ -327,50 +383,236 @@ VERBOSE option outputs more detailed information.
 ```
 =# EXPLAIN VERBOSE
     SELECT sum(lo_extendedprice*lo_discount) as revenue
-      FROM flineorder,date1
+      FROM f_lineorder,date1
      WHERE lo_orderdate = d_datekey
        AND d_year = 1993
        AND lo_discount between 1 and 3
        AND lo_quantity < 25;
-                              QUERY PLAN
+                                        QUERY PLAN
 --------------------------------------------------------------------------------
- Aggregate  (cost=12632759.02..12632759.03 rows=1 width=32)
-   Output: sum((pgstrom.psum((flineorder.lo_extendedprice * flineorder.lo_discount))))
-   ->  Custom Scan (GpuPreAgg)  (cost=12632754.43..12632757.49 rows=204 width=8)
-         Output: (pgstrom.psum((flineorder.lo_extendedprice * flineorder.lo_discount)))
-         Reduction: NoGroup
-         GPU Projection: flineorder.lo_extendedprice, flineorder.lo_discount, pgstrom.psum((flineorder.lo_extendedprice * flineorder.lo_discount))
-         Combined GpuJoin: enabled
-         GPU Preference: GPU0 (Tesla V100-PCIE-16GB)
-         ->  Custom Scan (GpuJoin) on public.flineorder  (cost=9952.15..12638126.98 rows=572635 width=12)
-               Output: flineorder.lo_extendedprice, flineorder.lo_discount
-               GPU Projection: flineorder.lo_extendedprice::bigint, flineorder.lo_discount::integer
-               Outer Scan: public.flineorder  (cost=9877.70..12649677.69 rows=4010017 width=16)
-               Outer Scan Filter: ((flineorder.lo_discount >= 1) AND (flineorder.lo_discount <= 3) AND (flineorder.lo_quantity < 25))
-               Depth 1: GpuHashJoin  (nrows 4010017...572635)
-                        HashKeys: flineorder.lo_orderdate
-                        JoinQuals: (flineorder.lo_orderdate = date1.d_datekey)
-                        KDS-Hash (size: 66.06KB)
-               GPU Preference: GPU0 (Tesla V100-PCIE-16GB)
-               NVMe-Strom: enabled
-               referenced: lo_orderdate, lo_quantity, lo_extendedprice, lo_discount
-               files0: /opt/nvme/lineorder_s401.arrow (size: 309.23GB)
-                 lo_orderpriority: 33.61GB
-                 lo_extendedprice: 17.93GB
-                 lo_ordertotalprice: 17.93GB
-                 lo_revenue: 17.93GB
-               ->  Seq Scan on public.date1  (cost=0.00..78.95 rows=365 width=4)
-                     Output: date1.d_datekey
-                     Filter: (date1.d_year = 1993)
+ Aggregate  (cost=14535261.08..14535261.09 rows=1 width=8)
+   Output: pgstrom.sum_int((pgstrom.psum(((f_lineorder.lo_extendedprice * f_lineorder.lo_discount))::bigint)))
+   ->  Custom Scan (GpuPreAgg) on public.f_lineorder  (cost=14535261.06..14535261.07 rows=1 width=32)
+         Output: (pgstrom.psum(((f_lineorder.lo_extendedprice * f_lineorder.lo_discount))::bigint))
+         GPU Projection: pgstrom.psum(((f_lineorder.lo_extendedprice * f_lineorder.lo_discount))::bigint)
+         GPU Scan Quals: ((f_lineorder.lo_discount >= 1) AND (f_lineorder.lo_discount <= 3) AND (f_lineorder.lo_quantity < 25)) [rows: 5999990000 -> 9999983]
+         GPU Join Quals [1]: (f_lineorder.lo_orderdate = date1.d_datekey) ... [nrows: 9999983 -> 1428010]
+         GPU Outer Hash [1]: f_lineorder.lo_orderdate
+         GPU Inner Hash [1]: date1.d_datekey
+         referenced: lo_orderdate, lo_quantity, lo_extendedprice, lo_discount
+         file0: /opt/nvme/f_lineorder_s999.arrow (read: 89.41GB, size: 502.92GB)
+           lo_orderdate: 22.35GB
+           lo_quantity: 22.35GB
+           lo_extendedprice: 22.35GB
+           lo_discount: 22.35GB
+         GPU-Direct SQL: enabled (GPU-0)
+         KVars-Slot: <slot=0, type='int4', expr='f_lineorder.lo_discount'>, <slot=1, type='int4', expr='f_lineorder.lo_quantity'>, <slot=2, type='int8', expr='(f_lineorder.lo_extendedprice * f_lineorder.lo_discount)'>, <slot=3, type='int4', expr='f_lineorder.lo_extendedprice'>, <slot=4, type='int4', expr='f_lineorder.lo_orderdate'>, <slot=5, type='int4', expr='date1.d_datekey'>
+         KVecs-Buffer: nbytes: 51200, ndims: 3, items=[kvec0=<0x0000-27ff, type='int4', expr='lo_discount'>, kvec1=<0x2800-4fff, type='int4', expr='lo_quantity'>, kvec2=<0x5000-77ff, type='int4', expr='lo_extendedprice'>, kvec3=<0x7800-9fff, type='int4', expr='lo_orderdate'>, kvec4=<0xa000-c7ff, type='int4', expr='d_datekey'>]
+         LoadVars OpCode: {Packed items[0]={LoadVars(depth=0): kvars=[<slot=4, type='int4' resno=6(lo_orderdate)>, <slot=1, type='int4' resno=9(lo_quantity)>, <slot=3, type='int4' resno=10(lo_extendedprice)>, <slot=0, type='int4' resno=12(lo_discount)>]}, items[1]={LoadVars(depth=1): kvars=[<slot=5, type='int4' resno=1(d_datekey)>]}}
+         MoveVars OpCode: {Packed items[0]={MoveVars(depth=0): items=[<slot=0, offset=0x0000-27ff, type='int4', expr='lo_discount'>, <slot=3, offset=0x5000-77ff, type='int4', expr='lo_extendedprice'>, <slot=4, offset=0x7800-9fff, type='int4', expr='lo_orderdate'>]}}, items[1]={MoveVars(depth=1): items=[<offset=0x0000-27ff, type='int4', expr='lo_discount'>, <offset=0x5000-77ff, type='int4', expr='lo_extendedprice'>]}}}
+         Scan Quals OpCode: {Bool::AND args=[{Func(bool)::int4ge args=[{Var(int4): slot=0, expr='lo_discount'}, {Const(int4): value='1'}]}, {Func(bool)::int4le args=[{Var(int4): slot=0, expr='lo_discount'}, {Const(int4): value='3'}]}, {Func(bool)::int4lt args=[{Var(int4): slot=1, expr='lo_quantity'}, {Const(int4): value='25'}]}]}
+         Join Quals OpCode: {Packed items[1]={JoinQuals:  {Func(bool)::int4eq args=[{Var(int4): kvec=0x7800-a000, expr='lo_orderdate'}, {Var(int4): slot=5, expr='d_datekey'}]}}}
+         Join HashValue OpCode: {Packed items[1]={HashValue arg={Var(int4): kvec=0x7800-a000, expr='lo_orderdate'}}}
+         Partial Aggregation OpCode: {AggFuncs <psum::int[slot=2, expr='(lo_extendedprice * lo_discount)']> arg={SaveExpr: <slot=2, type='int8'> arg={Func(int8)::int8 arg={Func(int4)::int4mul args=[{Var(int4): kvec=0x5000-7800, expr='lo_extendedprice'}, {Var(int4): kvec=0x0000-2800, expr='lo_discount'}]}}}}
+         Partial Function BufSz: 16
+         ->  Seq Scan on public.date1  (cost=0.00..78.95 rows=365 width=4)
+               Output: date1.d_datekey
+               Filter: (date1.d_year = 1993)
 (28 rows)
 ```
 
 @ja{
-被参照列をロードする際に読み出すべき列データの大きさを、列ごとに表示しています。 `lo_orderdate`、`lo_quantity`、`lo_extendedprice`および`lo_discount`列のロードには合計で87.4GBの読み出しが必要で、これはファイルサイズ309.2GBの28.3%に相当します。
+被参照列をロードする際に読み出すべき列データの大きさを、列ごとに表示しています。 `lo_orderdate`、`lo_quantity`、`lo_extendedprice`および`lo_discount`列のロードには合計で89.41GBの読み出しが必要で、これはファイルサイズ502.93GBの17.8%に相当します。
 }
 @en{
-The verbose output additionally displays amount of column-data to be loaded on reference of columns. The load of `lo_orderdate`, `lo_quantity`, `lo_extendedprice` and `lo_discount` columns needs to read 87.4GB in total. It is 28.3% towards the filesize (309.2GB).
+The verbose output additionally displays amount of column-data to be loaded on reference of columns. The load of `lo_orderdate`, `lo_quantity`, `lo_extendedprice` and `lo_discount` columns needs to read 89.41GB in total. It is 17.8% towards the filesize (502.93GB).
 }
+
+@ja:##Arrow_Fdwの仮想列
+@en:##Arrow_Fdw Virtual Column
+
+@ja{
+Arrow_Fdwはスキーマ構造に互換性のある複数のApache Arrowを一個の外部テーブルにマッピングすることができます。例えば、外部テーブルオプションに`dir '/opt/arrow/mydata'`を指定すると、そのディレクトリ配下に存在する全てのファイルをマッピングするようになります。
+
+トランザクショナルなデータベースの内容をApache Arrowファイルに変換するときに年月や特定のカテゴリ毎に分けてファイル化し、それらを反映したファイル名を付けて保存する事はしばしば行われています。
+
+例えば、以下の例をご覧ください。トランザクショナルなテーブルである`lineorder`を`lo_orderdate`の年単位、および`lo_shipmode`のカテゴリ毎にArrowファイルへと変換しています。
+}
+@en{
+Arrow_Fdw allows to map multiple Apache Arrow files with compatible schema structures to a single foreign table. For example, if `dir '/opt/arrow/mydata' is configured for foreign table option, all files under that directory will be mapped.
+
+When you are converting the contents of a transactional database into an Apache Arrow file, we often dump them to separate files by year and month or specific categories, and its file names reflects these properties.
+
+The example below shows an example to convert the transactional table `lineorder` into Arrow files by year of `lo_orderdate` and by category of `lo_shipmode`.
+}
+
+```
+$ for s in RAIL AIR TRUCK SHIP FOB MAIL;
+  do
+    for y in 1993 1994 1995 1996 1997;
+    do
+      pg2arrow -d ssbm -c "SELECT * FROM lineorder_small \
+                            WHERE lo_orderdate between ${y}0101 and ${y}1231 \
+                              AND lo_shipmode = '${s}'" \
+               -o /opt/arrow/mydata/f_lineorder_${y}_${s}.arrow
+    done
+  done
+$ ls /opt/arrow/mydata/
+f_lineorder_1993_AIR.arrow    f_lineorder_1995_RAIL.arrow
+f_lineorder_1993_FOB.arrow    f_lineorder_1995_SHIP.arrow
+f_lineorder_1993_MAIL.arrow   f_lineorder_1995_TRUCK.arrow
+f_lineorder_1993_RAIL.arrow   f_lineorder_1996_AIR.arrow
+f_lineorder_1993_SHIP.arrow   f_lineorder_1996_FOB.arrow
+f_lineorder_1993_TRUCK.arrow  f_lineorder_1996_MAIL.arrow
+f_lineorder_1994_AIR.arrow    f_lineorder_1996_RAIL.arrow
+f_lineorder_1994_FOB.arrow    f_lineorder_1996_SHIP.arrow
+f_lineorder_1994_MAIL.arrow   f_lineorder_1996_TRUCK.arrow
+f_lineorder_1994_RAIL.arrow   f_lineorder_1997_AIR.arrow
+f_lineorder_1994_SHIP.arrow   f_lineorder_1997_FOB.arrow
+f_lineorder_1994_TRUCK.arrow  f_lineorder_1997_MAIL.arrow
+f_lineorder_1995_AIR.arrow    f_lineorder_1997_RAIL.arrow
+f_lineorder_1995_FOB.arrow    f_lineorder_1997_SHIP.arrow
+f_lineorder_1995_MAIL.arrow   f_lineorder_1997_TRUCK.arrow
+```
+
+@ja{
+これらのApache Arrowファイルは全て同じスキーマ構造を持っており、`dir`オプションを用いて1個の外部テーブルにマッピングできます。
+また、データの生成時に絞り込みを行っているため、ファイル名に1995を含むファイルには`lo_orderdate`が19950101～19951231の範囲のレコードしか含まれておらず、ファイル名に`RAIL`を含むファイルには`lo_shipmode`が`RAIL`のレコードしか含まれていません。
+
+つまり、これら複数のArrowファイルをマップしたArrow_Fdw外部テーブルを定義したとしても、ファイル名に1995を含むファイルからデータを読み出している時には、`lo_orderdate`の値が19950101～19951231の範囲であることが事前に分かっており、それを利用した最適化が可能です。
+
+Arrow_Fdwでは、外部テーブルオプション`pattern`を使用する事でファイル名の一部を列として参照する事ができます。これを仮想列と呼び、以下のように設定します。
+}
+@en{
+All these Apache Arrow files have the same schema structure and can be mapped to a single foreign table using the `dir` option.
+
+Also, the Arrow file that has '1995' token in the file name only contains records with `lo_orderdate` in the range 19950101 to 19951231. The Arrow file that has 'RAIL' token in the file name only contains records with `lo_shipmode` of `RAIL`.
+
+In other words, even if you define the Arrow_Fdw foreign  table that maps these multiple Arrow files, when reading data from a file whose file name includes 1995, it is assumed that the value of `lo_orderdate` is in the range of 19950101 to 19951231. It is possible for the optimizer to utilize this knowledge.
+
+In Arrow_Fdw, you can refer to part of the file name as a column by using the foreign table option `pattern`. This is called a virtual column and is configured as follows.
+}
+
+```
+=# IMPORT FOREIGN SCHEMA f_lineorder
+     FROM SERVER arrow_fdw INTO public
+  OPTIONS (dir '/opt/arrow/mydata', pattern 'f_lineorder_@\{year}_${shipping}.arrow');
+IMPORT FOREIGN SCHEMA
+
+=# \d f_lineorder
+                             Foreign table "public.f_lineorder"
+       Column       |     Type      | Collation | Nullable | Default |     FDW options
+--------------------+---------------+-----------+----------+---------+----------------------
+ lo_orderkey        | numeric       |           |          |         |
+ lo_linenumber      | integer       |           |          |         |
+ lo_custkey         | numeric       |           |          |         |
+ lo_partkey         | integer       |           |          |         |
+ lo_suppkey         | numeric       |           |          |         |
+ lo_orderdate       | integer       |           |          |         |
+ lo_orderpriority   | character(15) |           |          |         |
+ lo_shippriority    | character(1)  |           |          |         |
+ lo_quantity        | numeric       |           |          |         |
+ lo_extendedprice   | numeric       |           |          |         |
+ lo_ordertotalprice | numeric       |           |          |         |
+ lo_discount        | numeric       |           |          |         |
+ lo_revenue         | numeric       |           |          |         |
+ lo_supplycost      | numeric       |           |          |         |
+ lo_tax             | numeric       |           |          |         |
+ lo_commit_date     | character(8)  |           |          |         |
+ lo_shipmode        | character(10) |           |          |         |
+ year               | bigint        |           |          |         | (virtual 'year')
+ shipping           | text          |           |          |         | (virtual 'shipping')
+Server: arrow_fdw
+FDW options: (dir '/opt/arrow/mydata', pattern 'f_lineorder_@\{year}_${shipping}.arrow')
+```
+
+@ja{
+この外部テーブルオプション`pattern`には2つのワイルドカードが含まれています。
+0文字以上の数字列にマッチする`@\{year}`と、0文字以上の文字列にマッチする`${shipping}`です。
+ファイル名のうち、この部分にマッチしたパターンは、それぞれ列オプションの`virtual`で指定した部分で参照することができます。
+この場合、`IMPORT FOREIGN SCHEMA`が自動的に列定義を加え、Arrowファイル自体に含まれているフィールドに加えて、ワイルドカード`@\{year}`を参照する仮想列`year`（数値列であるため`bigint`データ型）と、`${shipping}`を参照する仮想列`shipping`を追加しています。
+
+これらの仮想列に対応するフィールドはArrowファイルには存在しませんが、例えば、ファイル`f_lineorder_1994_AIR.arrow`から読みだした行を処理するときには`year`列の値は1994に、`shipping`列の値は'AIR'になるわけです。
+}
+@en{
+This foreign table option `pattern` contains two wildcards.
+`@\{year}` matches a numeric string larger than or equal to 0 characters, and `${shipping}` matches a string larger than or equal to 0 characters.
+The patterns that match this part of the file name can be referenced in the part specified by the `virtual` column option.
+
+In this case, `IMPORT FOREIGN SCHEMA` automatically adds column definitions, in addition to the fields contained in the Arrow file itself, as well as the virtual column `year` (a `bigint` column) that references the wildcard `@\{year}`, and the virtual column `shipping` that references the wildcard `${shipping}`.
+}
+
+```
+=# SELECT lo_orderkey, lo_orderdate, lo_shipmode, year, shipping
+     FROM f_lineorder
+    WHERE year = 1995 AND shipping = 'AIR'
+    LIMIT 10;
+ lo_orderkey | lo_orderdate | lo_shipmode | year | shipping
+-------------+--------------+-------------+------+----------
+      637892 |     19950512 | AIR         | 1995 | AIR
+      638243 |     19950930 | AIR         | 1995 | AIR
+      638273 |     19951214 | AIR         | 1995 | AIR
+      637443 |     19950805 | AIR         | 1995 | AIR
+      637444 |     19950803 | AIR         | 1995 | AIR
+      637510 |     19950831 | AIR         | 1995 | AIR
+      637504 |     19950726 | AIR         | 1995 | AIR
+      637863 |     19950802 | AIR         | 1995 | AIR
+      637892 |     19950512 | AIR         | 1995 | AIR
+      637987 |     19950211 | AIR         | 1995 | AIR
+(10 rows)
+```
+
+@ja{
+これは言い換えれば、Arrow_Fdw外部テーブルがマップしたArrowファイルを実際に読む前に、仮想列がどのような値になっているのかを知る事ができるという事です。この特徴を使えば、あるArrowファイルの読み出しの前に、検索条件から1件もマッチしない事が明らかである場合には、ファイルの読み出し自体をスキップする事が可能であるという事になります。
+
+以下のクエリとその`EXPLAIN ANALYZE`出力をご覧ください。
+
+この集計クエリは`f_lineorder`外部テーブルを読み出し、いくつかの条件で絞り込んだ後、`lo_extendedprice * lo_discount`の合計値を集計します。
+その時、`WHERE year = 1994`という条件句が付加されています。これは実質的には`WHERE lo_orderdate BETWEEN 19940101 AND 19942131`と同じですが、`year`は仮想列であるため、Arrowファイルを読み出す前にマッチする行が存在するかどうかを判定する事ができます。
+
+実際、`Stats-Hint:`行を見ると、`(year = 1994)`という条件によって12個のRecord-Batchがロードされたものの、48個のRecord-Batchはスキップされています。これは単純ですがI/Oの負荷を軽減する手段として極めて有効です。
+}
+@en{
+In other words, you can know what values the virtual columns have before reading the Arrow file mapped by the Arrow_Fdw foreign table. By this feature, if it is obvious that there is no match at all from the search conditions before reading a certain Arrow file, it is possible to skip reading the file itself.
+
+See the query and its `EXPLAIN ANALYZE` output below.
+
+This aggregation query reads the `f_lineorder` foreign table, filters it by some conditions, and then aggregates the total value of `lo_extendedprice * lo_discount`.
+At that time, the conditional clause `WHERE year = 1994` is added. This is effectively the same as `WHERE lo_orderdate BETWEEN 19940101 AND 19942131`, but since `year` is a virtual column, you can determine whether a matching row exists before reading the Arrow files.
+
+In fact, looking at the `Stats-Hint:` line, 12 Record-Batches were loaded due to the condition `(year = 1994)`, but 48 Record-Batches were skipped. This is a simple but extremely effective means of reducing I/O load.
+}
+
+```
+=# EXPLAIN ANALYZE
+   SELECT sum(lo_extendedprice*lo_discount) as revenue
+     FROM f_lineorder
+    WHERE year = 1994
+      AND lo_discount between 1 and 3
+      AND lo_quantity < 25;
+                                               QUERY PLAN
+--------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=421987.07..421987.08 rows=1 width=32) (actual time=82.914..82.915 rows=1 loops=1)
+   ->  Custom Scan (GpuPreAgg) on f_lineorder  (cost=421987.05..421987.06 rows=1 width=32)      \
+                                               (actual time=82.901..82.903 rows=2 loops=1)
+         GPU Projection: pgstrom.psum(((lo_extendedprice * lo_discount))::double precision)
+         GPU Scan Quals: ((year = 1994) AND (lo_discount <= '3'::numeric) AND                   \
+                          (lo_quantity < '25'::numeric) AND                                     \
+                          (lo_discount >= '1'::numeric)) [plan: 65062080 -> 542, exec: 13001908 -> 1701726]
+         referenced: lo_quantity, lo_extendedprice, lo_discount, year
+         Stats-Hint: (year = 1994)  [loaded: 12, skipped: 48]
+         file0: /opt/arrow/mydata/f_lineorder_1996_MAIL.arrow (read: 99.53MB, size: 427.16MB)
+         file1: /opt/arrow/mydata/f_lineorder_1996_SHIP.arrow (read: 99.52MB, size: 427.13MB)
+         file2: /opt/arrow/mydata/f_lineorder_1994_FOB.arrow (read: 99.18MB, size: 425.67MB)
+              :                :                                       :             :
+         file27: /opt/arrow/mydata/f_lineorder_1997_MAIL.arrow (read: 99.23MB, size: 425.87MB)
+         file28: /opt/arrow/mydata/f_lineorder_1995_MAIL.arrow (read: 99.16MB, size: 425.58MB)
+         file29: /opt/arrow/mydata/f_lineorder_1993_TRUCK.arrow (read: 99.24MB, size: 425.91MB)
+         GPU-Direct SQL: enabled (N=2,GPU0,1; direct=76195, ntuples=13001908)
+ Planning Time: 2.402 ms
+ Execution Time: 83.857 ms
+(39 rows)
+```
 
 @ja:##Arrowファイルの作成方法
 @en:##How to make Arrow files
@@ -427,36 +669,40 @@ On the other hand, `pg2arrow` command, developed by PG-Strom Development Team, e
 }
 
 ```
-$ ./pg2arrow --help
+$ pg2arrow --help
 Usage:
-  pg2arrow [OPTION]... [DBNAME [USERNAME]]
+  pg2arrow [OPTION] [database] [username]
 
 General options:
-  -d, --dbname=DBNAME     database name to connect to
-  -c, --command=COMMAND   SQL command to run
-  -f, --file=FILENAME     SQL command from file
-      (-c and -f are exclusive, either of them must be specified)
-  -o, --output=FILENAME   result file in Apache Arrow format
-      --append=FILENAME   result file to be appended
-
-      --output and --append are exclusive to use at the same time.
-      If neither of them are specified, it creates a temporary file.)
+  -d, --dbname=DBNAME   Database name to connect to
+  -c, --command=COMMAND SQL command to run
+  -t, --table=TABLENAME Equivalent to '-c SELECT * FROM TABLENAME'
+      (-c and -t are exclusive, either of them must be given)
+      --inner-join=SUB_COMMAND
+      --outer-join=SUB_COMMAND
+  -o, --output=FILENAME result file in Apache Arrow format
+      --append=FILENAME result Apache Arrow file to be appended
+      (--output and --append are exclusive. If neither of them
+       are given, it creates a temporary file.)
+  -S, --stat[=COLUMNS] embeds min/max statistics for each record batch
+                       COLUMNS is a comma-separated list of the target
+                       columns if partially enabled.
 
 Arrow format options:
   -s, --segment-size=SIZE size of record batch for each
-      (default: 256MB)
 
 Connection options:
-  -h, --host=HOSTNAME     database server host
-  -p, --port=PORT         database server port
-  -U, --username=USERNAME database user name
-  -w, --no-password       never prompt for password
-  -W, --password          force password prompt
+  -h, --host=HOSTNAME  database server host
+  -p, --port=PORT      database server port
+  -u, --user=USERNAME  database user name
+  -w, --no-password    never prompt for password
+  -W, --password       force password prompt
 
 Other options:
-      --dump=FILENAME     dump information of arrow file
-      --progress          shows progress of the job
-      --set=NAME:VALUE    GUC option to set before SQL execution
+      --dump=FILENAME  dump information of arrow file
+      --progress       shows progress of the job
+      --set=NAME:VALUE config option to set before SQL execution
+      --help           shows this message
 
 Report bugs to <pgstrom@heterodb.com>.
 ```
@@ -472,8 +718,6 @@ The `-h` or `-U` option specifies the connection parameters of PostgreSQL, like 
 @en{
 `--append` option is available, instead of `-o|--output` option. It means appending data to existing Apache Arrow file. In this case, the target Apache Arrow file must have fully identical schema definition towards the specified SQL command.
 }
-
-
 @ja{
 以下の例は、テーブル`t0`に格納されたデータを全て読込み、ファイル`/tmp/t0.arrow`へと書き出すというものです。
 }
@@ -496,113 +740,6 @@ Although it is an option for developers, `--dump <filename>` prints schema defin
 @en{
 `--progress` option enables to show progress of the task. It is useful when a huge table is transformed to Apache Arrow format.
 }
-
-@ja:###書き込み可能Arrow_Fdw
-@en:###Writable Arrow_Fdw
-@ja{
-`writable`オプションを付加したArrow_Fdw外部テーブルに対しては、`INSERT`構文によりデータを追記する事が可能です。また、`pgstrom.arrow_fdw_truncate()`関数を用いて外部テーブル全体、すなわちその背後にあるApache Arrowファイルの内容を消去する事が可能です。一方、`UPDATE`および`DELETE`構文に関してはサポートされていません。
-}
-@en{
-Arrow_Fdw foreign tables that have `writable` option allow to append data using `INSERT` command, and to erase entire contents of the foreign table (that is Apache Arrow file on behalf of the foreign table) using `pgstrom.arrow_fdw_truncate()` function. On the other hand, `UPDATE` and `DELETE` commands are not supported.
-}
-
-@ja{
-Arrow_Fdw外部テーブルに`writable`オプションを付与する場合、`file`または`files`オプションで指定するパス名は1個だけが許容されます。複数個のパス名を指定することはできません。また、`dir`オプションと併用する事もできません。
-外部テーブルを定義した時点で、指定したパスに実際にApache Arrowファイルが存在している必要はありませんが、その場合、PostgreSQLは当該パスにファイルを新規作成する権限が必要です。
-}
-@en{
-In case of `writable` option was enabled on Arrow_Fdw foreign tables, it accepts only one pathname specified by the `file` or `files` option. You cannot specify multiple pathnames, and exclusive to the `dir` option.
-It does not require that the Apache Arrow file actually exists on the specified path at the foreign table declaration time, on the other hands, PostgreSQL server needs to have permission to create a new file on the path.
-}
-
-![Writable Arrow_Fdw](./img/arrow_writable.png)
-
-@ja{
-上の図は Apache Arrow 形式ファイルの内部レイアウトを示したものです。ヘッダやフッタなどのメタデータのほか、辞書圧縮用の辞書情報であるDictionaryBatchや、ユーザデータを保持するRecordBatchと呼ばれる領域を複数個持つことができます。
-
-RecordBatchとは、ある一定の行数ごとに列データをまとめた記録単位です。例えば、`x`、`y`、`z`というフィールドを持つApache Arrowファイルにおいて、RecordBatch[0]が2,500行を含んでいる場合、RecordBatch[0]にはそれぞれ2,500個の`x`、`y`、`z`フィールドの値が列形式で格納され、続いてRecordBatch[1]が4,000行を含んでいる場合、同様にRecordBatch[1]には4,000行分の`x`、`y`、`z`フィールドの値が列形式で格納されます。したがって、Apache Arrowファイルにデータを追記するという事は、RecordBatchを追加するという事になります。
-
-Apache Arrow形式ファイルの内部で、Dictionary BatchやRecord Batchに対するファイルオフセット情報は、最後のRecord Batchの次の領域であるフッタ領域に保持されています。したがって、`INSERT`構文でデータを追記する時には(k+1)番目のRecord Batchで現在のフッタ領域を上書きし、その後、新たにフッタ領域を再作成するという手順を踏みます。
-このような構造を持っているため、新たに追加するRecord Batchは一度の`INSERT`コマンドで挿入された行数を持ちます。したがって、`INSERT`で数行だけ挿入するといった使い方では、ファイルの利用効率は最悪となってしまいます。Arrow_Fdwにデータを挿入する際は、一回の`INSERT`コマンドで可能な限り大量のレコードを投入するようにしてください。
-}
-@en{
-The diagram above introduces the internal layout of Apache Arrow files. In addition to the metadata like header or footer, it can have multiple DictionayBatch (dictionary data for dictionary compression) and RecordBatch (user data) chunks.
-
-RecordBatch is a unit of columnar data that have a particular number of rows. For example, on the Apache Arrow file that have `x`, `y` and `z` fields, when RecordBatch[0] contains 2,500 rows, it means 2,500 items of `x`, `y` and `z` fields are located at the RecordBatch[0] in columnar format. Also, when RecordBatch[1] contains 4,000 rows, it also means 4,000 items of `x`, `y` and `z` fields are located at the RecordBatch[1] in columnar format. Therefore, appending user data to Apache Arrow file is addition of a new RecordBatch.
-
-On Apache Arrow files, the file offset information towards DictionaryBatch and RecordBatch are internally held by the Footer chunk, which is next to the last RecordBatch. So, we can overwrite the original Footer chunk by the (k+1)th RecordBatch when `INSERT` command appends new data, then reconstruct a new Footer.
-Due to the data format, the newly appended RecordBatch has rows processed by the single `INSERT` command. So, it makes the file usage worst efficiency if an `INSERT` command added only a few rows. We recommend to insert as many rows as possible by a single `INSERT` command, when you add data to Arrow_Fdw foreign table.
-}
-
-@ja{
-Arrow_Fdw外部テーブルへの書き込みはPostgreSQLのトランザクション制御に従います。トランザクションがcommitされるまでは、他の並行トランザクションから追記した内容を参照する事はできず、また未コミットの追記データはrollbackする事が可能です。
-実装上の理由により、Arrow_Fdw外部テーブルへの書き込みは`ShareRowExclusiveLock`を獲得します（通常のPostgreSQLテーブルに対する`INSERT`や`UPDATE`が獲得するのは`RowExclusiveLock`）。これは、特定のArrow_Fdw外部テーブルへの書き込みを行う事ができるのは、同時に1トランザクションのみである事を意味します。
-Arrow_Fdw外部テーブルの期待する書き込みワークロードはバルクロードが中心であるため、通常これは大きな問題ではありませんが、多数の並行トランザクションからArrow_Fdwテーブルへの書き込みを行いたい場合は、一時テーブルの利用を検討してください。
-}
-@en{
-Write operations to Arrow_Fdw follows transaction control of PostgreSQL. No concurrent transactions can reference the rows newly appended until its commit, and user can rollback the pending written data, which is uncommited.
-Due to the implementation reason, writes to Arrow_Fdw foreign table acquires `ShareRowExclusiveLock`, although `INSERT` or `UPDATE` on regular PostgreSQL tables acquire `RowExclusiveLock`. It means only 1 transaction can write to a particular Arrow_Fdw foreign table concurrently.
-It is not a problem usually because the workloads Arrow_Fdw expects are mostly bulk data loading. When you design many concurrent transaction try to write Arrow_Fdw foreign table, we recomment to use a temporary table for many small writes.
-}
-
-```
-postgres=# CREATE FOREIGN TABLE ftest (x int)
-           SERVER arrow_fdw
-           OPTIONS (file '/dev/shm/ftest.arrow', writable 'true');
-CREATE FOREIGN TABLE
-postgres=# INSERT INTO ftest (SELECT * FROM generate_series(1,100));
-INSERT 0 100
-postgres=# BEGIN;
-BEGIN
-postgres=# INSERT INTO ftest (SELECT * FROM generate_series(1,50));
-INSERT 0 50
-postgres=# SELECT count(*) FROM ftest;
- count
--------
-   150
-(1 row)
-
-@ja:-- トランザクションをロールバックすると、上記の追記は取り消されます。
-@en:-- By the transaction rollback, the above INSERT shall be reverted.
-
-postgres=# ROLLBACK;
-ROLLBACK
-postgres=# SELECT count(*) FROM ftest;
- count
--------
-   100
-(1 row)
-```
-
-@ja{
-現在のところ、PostgreSQLは外部テーブルに対する`TRUNCATE`文の実行をサポートしていません。
-その代替としてArrow_Fdwには`pgstrom.arrow_fdw_truncate(regclass)`関数が用意されており、これを用いてArrow_Fdwの背後に存在するApache Arrowファイルの内容を消去する事ができます。
-}
-@en{
-Right now, PostgreSQL does not support `TRUNCATE` statement on foreign tables.
-As an alternative, Arrow_Fdw provide `pgstrom.arrow_fdw_truncate(regclass)` function that eliminates all the contents of Apache Arrow file on behalf of the foreign table.
-}
-
-```
-postgres=# SELECT count(*) FROM ftest;
- count
--------
-   100
-(1 row)
-
-postgres=# SELECT pgstrom.arrow_fdw_truncate('ftest');
- arrow_fdw_truncate
---------------------
-
-(1 row)
-
-postgres=# SELECT count(*) FROM ftest;
- count
--------
-     0
-(1 row)
-```
-
 
 @ja:##先進的な使い方
 @en:##Advanced Usage
@@ -657,14 +794,10 @@ The example below defines a partitioned table that mixes a normal PostgreSQL tab
 }
 
 @ja{
-書き込みが可能なPostgreSQLテーブルをデフォルトパーティションとして指定しておく[^2]事で、一定期間の経過後、DB運用を継続しながら過去のログデータだけをArrow_Fdw外部テーブルへ移す事が可能です。
-
-[^2]: PostgreSQL v11以降で対応
+書き込みが可能なPostgreSQLテーブルをデフォルトパーティションとして指定しておく事で、一定期間の経過後、DB運用を継続しながら過去のログデータだけをArrow_Fdw外部テーブルへ移す事が可能です。
 }
 @en{
-The normal PostgreSQL table, is read-writable, is specified as default partition[^2], so DBA can migrate only past log-data into Arrow_Fdw foreign table under the database system operations.
-
-[^2]: Supported at PostgreSQL v11 or later. 
+The normal PostgreSQL table, is read-writable, is specified as default partition, so DBA can migrate only past log-data into Arrow_Fdw foreign table under the database system operations.
 }
 
 ```

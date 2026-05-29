@@ -3,8 +3,8 @@
  *
  * Macro definitions to keep compatibility of PostgreSQL internal APIs.
  * --
- * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2021 (C) PG-Strom Developers Team
+ * Copyright 2011-2026 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2026 (C) PG-Strom Developers Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the PostgreSQL License.
@@ -13,374 +13,177 @@
 #define PG_COMPAT_H
 
 /*
- * MEMO: PostgreSQL v11 declares all the type OIDs, but some of types
- * has no label definition in the older version.
+ * MEMO: PostgreSQL v16 adds escontext arguments on the various internal
+ * functions. it should be ignored at the PostgreSQL v15
  */
-#if PG_VERSION_NUM < 110000
-//#define INT4RANGEOID	3904
-#define INT8RANGEOID	3926
-#define NUMRANGEOID		3906
-#define TSRANGEOID		3908
-#define TSTZRANGEOID	3910
-#define DATERANGEOID	3912
+#if  PG_VERSION_NUM < 160000
+#define make_range(a,b,c,d,e)		make_range(a,b,c,d)
 #endif
 
 /*
- * MEMO: tupleDesc was re-defined at PG11. Newer version has flexible-
- * length of FormData_pg_attribute on the tail
+ * MEMO: PostgreSQL v16 changed layout and field name of SMgrRelationData
+ * So, it affects to some internal APIs.
  */
-#if PG_VERSION_NUM < 110000
-#define tupleDescAttr(tdesc,colidx)		((tdesc)->attrs[(colidx)])
+#if PG_VERSION_NUM < 160000
+#define	smgr_relpath(smgr,forknum)		relpath((smgr)->smgr_rnode,(forknum))
+#define smgr_init_buffer_tag(tag,smgr,fork_num,block_num)	\
+	INIT_BUFFERTAG((*tag),(smgr)->smgr_rnode.node,(fork_num),(block_num))
 #else
-#define tupleDescAttr(tdesc,colidx)		(&(tdesc)->attrs[(colidx)])
-#endif
-
-/*
- * MEMO: PG12 re-defines 'oid' as a regular column, not a system column.
- * Thus, we don't need to have special treatment for OID, on the other
- * hand, widespread APIs were affected by this change.
- */
-#if PG_VERSION_NUM < 120000
-#define tupleDescHasOid(tdesc)		((tdesc)->tdhasoid)
-#define PgClassTupleGetOid(tuple)	HeapTupleGetOid(tuple)
-#define PgProcTupleGetOid(tuple)	HeapTupleGetOid(tuple)
-#define PgTypeTupleGetOid(tuple)	HeapTupleGetOid(tuple)
-#define PgTriggerTupleGetOid(tuple)	HeapTupleGetOid(tuple)
-#define PgExtensionTupleGetOid(tuple) HeapTupleGetOid(tuple)
-#define CreateTemplateTupleDesc(a)	CreateTemplateTupleDesc((a), false)
-#define ExecCleanTypeFromTL(a)		ExecCleanTypeFromTL((a),false)
-#define SystemAttributeDefinition(a)			\
-	SystemAttributeDefinition((a),true)
-/* also, 'oid' attribute numbers */
-#define Anum_pg_class_oid			ObjectIdAttributeNumber
-#define Anum_pg_proc_oid			ObjectIdAttributeNumber
-#define Anum_pg_type_oid			ObjectIdAttributeNumber
-#define Anum_pg_trigger_oid			ObjectIdAttributeNumber
-#define Anum_pg_extension_oid		ObjectIdAttributeNumber
+#if PG_VERSION_NUM < 180000
+#define smgr_relpath(smgr,forknum)		relpath((smgr)->smgr_rlocator,(forknum))
 #else
-#define tupleDescHasOid(tdesc)		(false)
-#define PgClassTupleGetOid(tuple)	(((Form_pg_class)GETSTRUCT(tuple))->oid)
-#define PgProcTupleGetOid(tuple)	(((Form_pg_proc)GETSTRUCT(tuple))->oid)
-#define PgTypeTupleGetOid(tuple)	(((Form_pg_type)GETSTRUCT(tuple))->oid)
-#define PgTriggerTupleGetOid(tuple)	(((Form_pg_trigger)GETSTRUCT(tuple))->oid)
-#define PgExtensionTupleGetOid(tuple) (((Form_pg_extension)GETSTRUCT(tuple))->oid)
+#define smgr_relpath(smgr,forknum)		pstrdup(relpath((smgr)->smgr_rlocator,(forknum)).str)
+#endif
+#define smgr_init_buffer_tag(tag,smgr,fork_num,block_num)				\
+	InitBufferTag((tag),&(smgr)->smgr_rlocator.locator,(fork_num),(block_num))
 #endif
 
 /*
- * MEMO: PG13 added 'Datum attoptions' argument to InsertPgAttributeTuple
+ * MEMO: PostgreSQL v16 replaced pg_XXXX_aclcheck() APIs by object_aclcheck.
+ * We put a thin compatibility layer here.
  */
-#if PG_VERSION_NUM < 130000
-#define InsertPgAttributeTuple(a,b,c,d)	InsertPgAttributeTuple((a),(b),(d))
+#if PG_VERSION_NUM >= 160000
+#define pg_type_aclcheck(a,b,c)		object_aclcheck(TypeRelationId,(a),(b),(c))
+#define pg_proc_aclcheck(a,b,c)		object_aclcheck(ProcedureRelationId,(a),(b),(c))
 #endif
 
 /*
- * MEMO: Naming convension of data access macro on some data types
- * were confused before PG11
- */
-#if PG_VERSION_NUM < 110000
-#define DatumGetRangeTypeP(x)		DatumGetRangeType(x)
-#define DatumGetRangeTypePCopy(x)	DatumGetRangeTypeCopy(x)
-#define PG_GETARG_RANGE_P(x)		PG_GETARG_RANGE(x)
-#define PG_RETURN_RANGE_P(x)		PG_RETURN_RANGE(x)
-
-#define PG_GETARG_ANY_ARRAY_P(x)	PG_GETARG_ANY_ARRAY(x)
-#endif
-
-/*
- * MEMO: PG11 adds 'max_workers' argument to the compute_parallel_worker().
- */
-#if PG_VERSION_NUM < 110000
-#define compute_parallel_worker(a,b,c,d)		\
-	compute_parallel_worker((a),(b),(c))
-#endif
-
-/*
- * MEMO: PG11 allows to display unit of numerical values if text-format
- * Just omit 'unit' if PG10 or older
- */
-#if PG_VERSION_NUM < 110000
-#define ExplainPropertyInteger(qlabel,unit,value,es)		\
-	ExplainPropertyLong((qlabel),(value),(es))
-#define ExplainPropertyFloat(qlabel,unit,value,ndigits,es)	\
-	ExplainPropertyFloat((qlabel),(value),(ndigits),(es))
-#endif
-
-/*
- * MEMO: Bugfix at 10.4, 9.6.9 changed internal interface of
- * extract_actual_join_clauses(). Newer version requires 'relids' bitmap
- * of the join-relation.
+ * MEMO: PostgreSQL v16 removed the 7th 'jointype' argument that has been
+ * redundant because same value is also stored in the SpecialJoinInfo.
  *
- * PG96: 0c141fcaa7dd806752986401b25de8f665ceb3fe
- * PG10: 68fab04f7c2a07c5308e3d2957198ccd7a80ebc5
+ * MEMO: PostgreSQL v18 changed build_child_join_rel() prototype for better
+ * memory usage.
+ *
+ * git: 513f4472a4a0d294ca64123627ce7b48ce0ee7c1
  */
-#if ((PG_MAJOR_VERSION == 906 && PG_MINOR_VERSION < 9) ||	\
-	 (PG_MAJOR_VERSION == 1000 && PG_MINOR_VERSION < 4))
-#define extract_actual_join_clauses(a,b,c,d)	\
-	extract_actual_join_clauses((a),(c),(d))
+#if PG_VERSION_NUM < 160000
+#define build_child_join_rel(a,b,c,d,e,f,g,h)	\
+	build_child_join_rel((a),(b),(c),(d),(e),(f),(f)->jointype)
+#elif PG_VERSION_NUM < 180000
+#define build_child_join_rel(a,b,c,d,e,f,g,h)	\
+	build_child_join_rel((a),(b),(c),(d),(e),(f))
 #endif
 
 /*
- * MEMO: PG11 adds PathNameOpenFilePerm and removed creation permission
- * flags from the PathNameOpenFile.
+ * MEMO: PostgreSQL v16 removed 'IsBackgroundWorker' variable, and
+ * AmBackgroundWorkerProcess() is used instead.
  */
-#if PG_VERSION_NUM < 110000
-#define PathNameOpenFilePerm(a,b,c)	PathNameOpenFile((FileName)(a),(b),(c))
-#define PathNameOpenFile(a,b)		PathNameOpenFile((FileName)(a),(b),0600)
+#if PG_VERSION_NUM < 170000
+#define AmBackgroundWorkerProcess()		(IsBackgroundWorker)
 #endif
 
 /*
- * MEMO: PG11 adds 'missing_ok' flag on the get_attname(), however,
- * it deprecates get_relid_attribute_name() that raises an ereport
- * if attname is missing.
+ * MEMO: PostgreSQL v16 defined function pointer type for expression
+ * tree walker/mutator
  */
-#if PG_VERSION_NUM < 110000
-#define get_attname(a,b,missing_ok)				\
-	((missing_ok) ? get_attname((a),(b)) : get_relid_attribute_name((a),(b)))
+#if PG_VERSION_NUM < 160000
+typedef bool (*tree_walker_callback) (Node *node, void *context);
+typedef Node *(*tree_mutator_callback) (Node *node, void *context);
 #endif
 
 /*
- * MEMO: PG11.2, changed ABI of GenerateTypeDependencies()
- *
- * PG11: 1b55acb2cf48341822261bf9c36785be5ee275db
- * PG10: 2d83863ea2739dc559ed490c284f5c1817db4752
- * PG96: d431dff1af8c220490b84dd978aa3a508f71d415
- *
- * then, PG13 modified ABI of GenerateTypeDependencies
- *
- * then, PG13.5 added 'makeExtensionDep' argument.
+ * MEMO: PostgreSQL v17 removed 'snapshot' argument from the
+ * brinRevmapInitialize().
  */
-#if PG_VERSION_NUM < 110002
-#define GenerateTypeDependencies(tup,cat,a,b,c,d,e,f,g)					\
-	do {																\
-		Form_pg_type __type = (Form_pg_type)GETSTRUCT(tup);				\
-																		\
-		GenerateTypeDependencies(__type->typnamespace,	/* typeNamespace */	\
-								 PgTypeTupleGetOid(tup),/* typeObjectId */ \
-								 __type->typrelid,		/* relationOid */ \
-								 (c),					/* relationKind */ \
-								 __type->typowner,		/* owner */		\
-								 __type->typinput,		/* inputProcedure  */ \
-								 __type->typoutput,		/* outputProcedure */ \
-								 __type->typreceive,	/* receiveProcedure */ \
-								 __type->typsend,		/* sendProcedure */	\
-								 __type->typmodin,		/* typmodinProcedure */	\
-								 __type->typmodout,		/* typmodoutProcedure */ \
-								 __type->typanalyze,	/* analyzeProcedure */ \
-								 __type->typelem,		/* elementType */ \
-								 (d),					/* isImplicitArray */ \
-								 __type->typbasetype,	/* baseType */	\
-								 __type->typcollation,	/* typeCollation */	\
-								 (a),					/* defaultExpr */ \
-								 (g));					/* rebuild */	\
-	} while(0)
-#elif PG_VERSION_NUM < 130000
-#define GenerateTypeDependencies(tup,cat,a,b,c,d,e,f,g)		\
-	GenerateTypeDependencies(PgTypeTupleGetOid(tup),		\
-							 (Form_pg_type)GETSTRUCT(tup),	\
-							 (a),(b),(c),(d),(e),(g))
-#elif PG_VERSION_NUM < 130005
-#define GenerateTypeDependencies(tup,cat,a,b,c,d,e,f,g)		\
-	GenerateTypeDependencies((tup),(cat),(a),(b),(c),(d),(e),(g))
+#if PG_VERSION_NUM < 170000
+#define brinRevmapInitialize(a,b)				\
+	brinRevmapInitialize((a),(b), estate->es_snapshot)
+#define brinGetTupleForHeapBlock(a,b,c,d,e,f)	\
+	brinGetTupleForHeapBlock((a),(b),(c),(d),(e),(f), estate->es_snapshot)
 #endif
 
 /*
- * MEMO: PG11.3 and PG10.8 added is_dummy_rel() instead of old IS_DUMMY_REL().
- *
- * PG11: 925f46ffb82f0b25c94e7997caff732eaf14367d
- * PG10: 19ff710aaa5f131a15da97484da5a669a3448864
+ * MEMO: PostgreSQL v17 adds 'runCondition' to the create_windowagg_path().
+ * It had been attached from WindowClause later on the Path -> Plan
+ * tranformation phase. (So, WindowAggPath does not have 'runCondition').
  */
-#if ((PG_MAJOR_VERSION == 1100 && PG_MINOR_VERSION < 3) || \
-	 (PG_MAJOR_VERSION == 1000 && PG_MINOR_VERSION < 8) || \
-	 (PG_MAJOR_VERSION <  1000))
-#define is_dummy_rel(r)			IS_DUMMY_REL(r)
-#endif
-
-/*
- * MEMO: PG12 adopted storage access method (a.k.a pluggable storage layer).
- * It affects widespread APIs we had used in PG11 or older.
- */
-#if PG_VERSION_NUM < 120000
-typedef HeapScanDesc					TableScanDesc;
-typedef HeapScanDescData				TableScanDescData;
-typedef ParallelHeapScanDesc			ParallelTableScanDesc;
-typedef ParallelHeapScanDescData		ParallelTableScanDescData;
-
-#define table_open(a,b)					heap_open(a,b)
-#define table_openrv(a,b)				heap_openrv(a,b)
-#define table_close(a,b)				heap_close(a,b)
-#define table_beginscan(a,b,c,d)		heap_beginscan(a,b,c,d)
-#define table_beginscan_parallel(a,b)	heap_beginscan_parallel(a,b)
-
-#define table_endscan(a)				heap_endscan(a)
-#define table_rescan(a,b)				heap_rescan(a,b)
-
-#define table_parallelscan_estimate(a,b)		\
-	heap_parallelscan_estimate(b)
-#define table_parallelscan_initialize(a,b,c)	\
-	heap_parallelscan_initialize(b,a,c)
-#define table_parallelscan_reinitialize(a,b)	\
-	heap_parallelscan_reinitialize(b)
-
-/*
- * PG12 and newer required TupleTableSlot to have TupleTableSlotOps,
- * for better support of pluggable storage engines. It affects to
- * the widespread relevant APIs.
- *
- * PG10 or older didn't assign TupleDesc at ExecInitScanTupleSlot(),
- * so we had to call ExecAssignScanType() additionally.
- */
-#if PG_VERSION_NUM < 110000
-#define ExecInitScanTupleSlot(estate,ss,tdesc,tts_ops)	\
-	do {												\
-		ExecInitScanTupleSlot((estate),(ss));			\
-		ExecAssignScanType((ss),(tdesc));				\
-	} while(0)
+#if PG_VERSION_NUM < 170000
+#define create_windowagg_path(a,b,c,d,e,f,g,h,i)	\
+	create_windowagg_path((a),(b),(c),(d),(e),(g),(h),(i))
+#define __windowAggPathGetRunCondition(wpath)	((wpath)->winclause->runCondition)
 #else
-#define ExecInitScanTupleSlot(estate,ss,tdesc,tts_ops)	\
-	ExecInitScanTupleSlot((estate),(ss),(tdesc))
+#define __windowAggPathGetRunCondition(wpath)	((wpath)->runCondition)
 #endif
 
-#define MakeSingleTupleTableSlot(tdesc,tts_ops)			\
-	MakeSingleTupleTableSlot((tdesc))
-#define ExecForceStoreHeapTuple(tuple,slot,shouldFree)	\
-	ExecStoreTuple((tuple),(slot),InvalidBuffer,(shouldFree))
-static inline HeapTuple
-ExecFetchSlotHeapTuple(TupleTableSlot *slot,
-					   bool materialize, bool *shouldFree)
+/*
+ * MEMO: PostgreSQL v17 adds 'fdw_restrictinfo' but we don't use it.
+ *
+ * MEMO: PostgreSQL v18 adds 'disabled_nodes' to shows number of disabled node
+ * in the plan tree, and it affects to create_xxxx() constructor APIs.
+ *
+ * git: 161320b4b960ee4fe918959be6529ae9b106ea5a
+ */
+#if PG_VERSION_NUM < 170000
+#define create_foreignscan_path(a,b,c,d,e,f,g,h,i,j,k,l)					\
+	create_foreignscan_path((a),(b),(c),(d),(f),(g),(h),(i),(j),(l))
+#elif PG_VERSION_NUM < 180000
+#define create_foreignscan_path(a,b,c,d,e,f,g,h,i,j,k,l)					\
+	create_foreignscan_path((a),(b),(c),(d),(f),(g),(h),(i),(j),(k),(l))
+#endif
+
+/*
+ * MEMO: PostgreSQL v18 adds the 4th argument 'extra' to inform extra bytes
+ * for heap_form_minimal_tuple(), but PG-Strom does not use this option.
+ */
+#if PG_VERSION_NUM < 180000
+#define heap_form_minimal_tuple(a,b,c,d)	heap_form_minimal_tuple((a),(b),(c))
+#endif
+
+/*
+ * MEMO: PostgreSQL v18 removed lc_collate_is_c() that is a checker function
+ * to determine the collation is simple enough.
+ *
+ * git: 06421b08436414b42cd169501005f15adee986f1
+ */
+#if PG_VERSION_NUM < 180000
+#define __collate_is_c(coll_oid)	lc_collate_is_c(coll_oid)
+#else
+#define __collate_is_c(coll_oid)	(pg_newlocale_from_collation(coll_oid)->collate_is_c)
+#endif
+
+/*
+ * MEMO: PostgreSQL v18 changed PathKey's field layout to use CompareType
+ * to record the sort direction instead of hardcoding btree strategy numbers.
+ *
+ * git: 8123e91f5aeb26c6e4cf583bb61c99281485af83
+ */
+#if PG_VERSION_NUM < 180000
+#define __PathKeyUseNullsFirstCompare(pk)	((pk)->pk_nulls_first)
+#define __PathKeyUseLessThanCompare(pk)		((pk)->pk_strategy == BTLessStrategyNumber)
+#define __PathKeyUseGreaterThanCompare(pk)	((pk)->pk_strategy == BTGreaterStrategyNumber)
+#else
+#define __PathKeyUseNullsFirstCompare(pk)	((pk)->pk_nulls_first)
+#define __PathKeyUseLessThanCompare(pk)		((pk)->pk_cmptype == COMPARE_LT)
+#define __PathKeyUseGreaterThanCompare(pk)	((pk)->pk_cmptype == COMPARE_GT)
+#endif
+
+/*
+ * MEMO: PostgreSQL v18 changed TupleDesc's layout for CompactAttribute array.
+ * It points some payloads using tupdesc->natts, thus, it is not legal to change
+ * natts after the construction, unlike v17 or before.
+ *
+ * git: 5983a4cffc31640fda6643f10146a5b72b203eaa
+ */
+#if PG_VERSION_NUM < 180000
+static inline TupleDesc
+CreateTupleDescTruncatedCopy(TupleDesc __tupdesc, int natts)
 {
-	Assert(!materialize && !shouldFree);
-	return ExecFetchSlotTuple(slot);
-}
-#endif	/* < PG12 */
+	TupleDesc	tupdesc = CreateTupleDescCopy(__tupdesc);
 
-/*
- * PG12 adds RELKIND_HAS_STORAGE macro to determine the relation kind
- * that usually has physical storage.
- */
-#if PG_VERSION_NUM < 120000
-#define RELATION_HAS_STORAGE(rel)							\
-	(RelationGetForm(rel)->relkind == RELKIND_RELATION ||	\
-	 RelationGetForm(rel)->relkind == RELKIND_INDEX ||		\
-	 RelationGetForm(rel)->relkind == RELKIND_SEQUENCE ||	\
-	 RelationGetForm(rel)->relkind == RELKIND_TOASTVALUE || \
-	 RelationGetForm(rel)->relkind == RELKIND_MATVIEW)
-#else
-#define RELATION_HAS_STORAGE(rel)				\
-	RELKIND_HAS_STORAGE(RelationGetForm(rel)->relkind)
-#endif
-
-/*
- * At PG13, 6f38d4dac381b5b8bead302a0b4f81761042cd25 changed
- * declaration of CheckForSerializableConflictOut(), and its role
- * was inherited to HeapCheckForSerializableConflictOut().
- */
-#if PG_VERSION_NUM < 130000
-#define HeapCheckForSerializableConflictOut(a,b,c,d,e)	\
-	CheckForSerializableConflictOut(a,b,c,d,e)
-#endif
-
-/*
- * PG12 (commit: 1ef6bd2954c4ec63ff8a2c9c4ebc38251d7ef5c5) don't
- * require return slots for nodes without projection.
- * Instead of the ps_ResultTupleSlot->tts_tupleDescriptor,
- * ps_ResultTupleDesc is now reliable source to determine the tuple
- * definition. For the compatibility to PG11 or older, we use the
- * access macro below.
- */
-#if PG_VERSION_NUM < 120000
-#define planStateResultTupleDesc(ps)			\
-	((ps)->ps_ResultTupleSlot->tts_tupleDescriptor)
-#else
-#define planStateResultTupleDesc(ps)	((ps)->ps_ResultTupleDesc)
-#endif
-
-/*
- * PG12 added 'pathkey' argument of create_append_path().
- * It shall be ignored on the older versions.
- */
-#if PG_VERSION_NUM < 120000
-#define create_append_path(a,b,c,d,e,f,g,h,i,j)	\
-	create_append_path((a),(b),(c),(d),(f),(g),(h),(i),(j))
-#endif
-
-/*
- * PG11 added 'flags' argument for BackgroundWorkerInitializeConnection
- */
-#if PG_VERSION_NUM < 110000
-#define BackgroundWorkerInitializeConnection(dbname,username,flags)	\
-	BackgroundWorkerInitializeConnection((dbname),(username))
-#endif
-
-/*
- * PG12 deprecated get_func_cost(), instead of add_function_cost()
- */
-#if PG_VERSION_NUM < 120000
-static inline void
-add_function_cost(PlannerInfo *root, Oid funcid, Node *node,
-				  QualCost *cost)
-{
-	cost->per_tuple += get_func_cost(funcid) * cpu_operator_cost;
+	tupdesc->natts = natts;
+	return tupdesc;
 }
 #endif
 
 /*
- * PG13 changed varnoold/varoattno field names of Var-node,
- * to varnosyn/varattnosyn. Be careful to use these names.
- * 9ce77d75c5ab094637cc4a446296dc3be6e3c221
+ * MEMO: CUDA 13.0 changed the following APIs. The existing _v2 APIs were renamed
+ * to the primary one, and legacy interfaces were deprecated.
+ * - cuMemPrefetchAsync
+ * - cuMemAdvise
  */
-#if PG_VERSION_NUM < 130000
-#define varnosyn		varnoold
-#define varattnosyn		varoattno
-#endif
-
-/*
- * MEMO: EventTriggerData->tag was declared as 'const char *' in PG12 or older.
- * Then, PG13 re-defined this field as CommandTag enum.
- * This field is used to check which context call the event-trigger function,
- * and usually not performance intensive. So, we continue to use cstring
- * comparion for the tag identification, like:
- *
- * if (strcmp(GetCommandTagName(trigdata->tag), "CREATE FOREIGN TABLE") == 0)
- *            :
- */
-#if PG_VERSION_NUM < 130000
-#define GetCommandTagName(tag)		(tag)
-#endif
-
-/*
- * PG13 replaced set_deparse_context_planstate by set_deparse_context_plan.
- * As literal, it allows to construct a deparse context by Plan-node,
- * however, we have no way to reference PlanState from Plan of course.
- * So, exceptionally, we continue to use the old API here, because PlanState
- * has its Plan node.
- */
-#if PG_VERSION_NUM >= 130000
-#define set_deparse_context_planstate(deparse_cxt,planstate,ancestors)	\
-	set_deparse_context_plan((deparse_cxt),((PlanState *)(planstate))->plan,ancestors)
-#endif
-
-/*
- * PG14 changed API to pick up var-nodes from the expression.
- */
-#if PG_VERSION_NUM < 140000
-#define pull_varnos_of_level(a,b,c)		pull_varnos_of_level((b),(c))
-#define pull_varnos(a,b)				pull_varnos(b)
-#endif
-
-/*
- * PG15 enforced RequestAddinShmemSpace() must be called on shmem_request_hook
- */
-#if PG_VERSION_NUM < 150000
-typedef void (*shmem_request_hook_type) (void);
-extern shmem_request_hook_type	shmem_request_hook;
-#endif
-
-/*
- * PG15 requires CustomPath CUSTOMPATH_SUPPORT_PROJECTION if it supports
- * projection.
- */
-#if PG_VERSION_NUM < 150000
-#define CUSTOMPATH_SUPPORT_PROJECTION		0x0004
+#if CUDA_VERSION < 13000
+#define cuMemPrefetchAsync(a,b,c,d,e)	cuMemPrefetchAsync_v2((a),(b),(c),(d),(e))
+#define cuMemAdvise(a,b,c,d)			cuMemAdvise_v2((a),(b),(c),(d))
 #endif
 
 #endif	/* PG_COMPAT_H */
